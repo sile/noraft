@@ -60,6 +60,8 @@ pub enum Action {
     ///
     /// Additionally, if an AppendEntriesRPC contains too many entries to be sent in a single message,
     /// they can be safely truncated using [`LogEntries::truncate()`](crate::LogEntries::truncate) before sending the message.
+    /// And after sending a part of entries, the sent prefix can be dropped by
+    /// calling [`Message::strip_append_entries_prefix()`](crate::Message::strip_append_entries_prefix).
     SendMessage(NodeId, Message),
 
     /// Install a snapshot on a specific node.
