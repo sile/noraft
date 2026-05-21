@@ -11,7 +11,7 @@ jobs:
         toolchain: [stable, beta, nightly]
     steps:
       - name: Checkout sources
-        uses: actions/checkout@v6
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - run: rustup update ${{ matrix.toolchain }}
       - run: rustup default ${{ matrix.toolchain }}
       - run: cargo check --all
@@ -24,7 +24,7 @@ jobs:
         toolchain: [stable]
     steps:
       - name: Checkout sources
-        uses: actions/checkout@v6
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - run: rustup update ${{ matrix.toolchain }}
       - run: rustup default ${{ matrix.toolchain }}
       - run: cargo test --all
@@ -37,7 +37,7 @@ jobs:
         toolchain: [stable]
     steps:
       - name: Checkout sources
-        uses: actions/checkout@v6
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - run: rustup update ${{ matrix.toolchain }}
       - run: rustup default ${{ matrix.toolchain }}
       - run: rustup component add rustfmt clippy
