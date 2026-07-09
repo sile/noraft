@@ -1,5 +1,5 @@
 use crate::{Term, config::ClusterConfig};
-use std::collections::BTreeMap;
+use alloc::collections::BTreeMap;
 
 /// In-memory representation of a [`Node`][crate::Node] local log.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -526,7 +526,7 @@ impl LogEntries {
     }
 }
 
-impl std::iter::Extend<LogEntry> for LogEntries {
+impl core::iter::Extend<LogEntry> for LogEntries {
     fn extend<T: IntoIterator<Item = LogEntry>>(&mut self, iter: T) {
         for entry in iter {
             self.push(entry);
@@ -572,7 +572,7 @@ impl From<LogIndex> for u64 {
     }
 }
 
-impl std::ops::Add for LogIndex {
+impl core::ops::Add for LogIndex {
     type Output = Self;
 
     fn add(self, rhs: Self) -> Self::Output {
@@ -580,13 +580,13 @@ impl std::ops::Add for LogIndex {
     }
 }
 
-impl std::ops::AddAssign for LogIndex {
+impl core::ops::AddAssign for LogIndex {
     fn add_assign(&mut self, rhs: Self) {
         self.0 += rhs.0;
     }
 }
 
-impl std::ops::Sub for LogIndex {
+impl core::ops::Sub for LogIndex {
     type Output = Self;
 
     fn sub(self, rhs: Self) -> Self::Output {
@@ -594,7 +594,7 @@ impl std::ops::Sub for LogIndex {
     }
 }
 
-impl std::ops::SubAssign for LogIndex {
+impl core::ops::SubAssign for LogIndex {
     fn sub_assign(&mut self, rhs: Self) {
         self.0 -= rhs.0;
     }
@@ -699,7 +699,8 @@ impl CommitStatus {
 mod tests {
     use super::*;
     use crate::NodeId;
-    use std::collections::BTreeSet;
+    use alloc::collections::BTreeSet;
+    use alloc::{vec, vec::Vec};
 
     #[test]
     fn log_entries_append() {
@@ -859,11 +860,11 @@ mod tests {
 
     #[test]
     fn log_position_cmp() {
-        assert_eq!(pos(5, 5).cmp(&pos(5, 5)), std::cmp::Ordering::Equal);
-        assert_eq!(pos(7, 3).cmp(&pos(5, 5)), std::cmp::Ordering::Greater);
-        assert_eq!(pos(3, 7).cmp(&pos(5, 5)), std::cmp::Ordering::Less);
-        assert_eq!(pos(5, 7).cmp(&pos(5, 5)), std::cmp::Ordering::Greater);
-        assert_eq!(pos(5, 3).cmp(&pos(5, 5)), std::cmp::Ordering::Less);
+        assert_eq!(pos(5, 5).cmp(&pos(5, 5)), core::cmp::Ordering::Equal);
+        assert_eq!(pos(7, 3).cmp(&pos(5, 5)), core::cmp::Ordering::Greater);
+        assert_eq!(pos(3, 7).cmp(&pos(5, 5)), core::cmp::Ordering::Less);
+        assert_eq!(pos(5, 7).cmp(&pos(5, 5)), core::cmp::Ordering::Greater);
+        assert_eq!(pos(5, 3).cmp(&pos(5, 5)), core::cmp::Ordering::Less);
     }
 
     #[test]

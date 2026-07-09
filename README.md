@@ -7,9 +7,9 @@ noraft
 ![License](https://img.shields.io/crates/l/noraft)
 
 
-noraft: Minimal, feature-complete Raft for Rust - no I/O, no dependencies.
+noraft: Minimal, feature-complete no_std Raft for Rust - no I/O, no dependencies.
 
-`noraft` is a minimal but feature-complete, sans I/O implementation of the [Raft] distributed consensus algorithm.
+`noraft` is a minimal but feature-complete, `no_std`, sans I/O implementation of the [Raft] distributed consensus algorithm.
 
 [Raft]: https://raft.github.io/
 

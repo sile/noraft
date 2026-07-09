@@ -6,7 +6,7 @@ use crate::{
     message::Message,
     quorum::Quorum,
 };
-use std::collections::{BTreeMap, BTreeSet};
+use alloc::collections::{BTreeMap, BTreeSet};
 
 /// Node identifier ([`u64`]).
 ///
@@ -42,7 +42,7 @@ impl From<NodeId> for u64 {
     }
 }
 
-impl std::ops::Add for NodeId {
+impl core::ops::Add for NodeId {
     type Output = Self;
 
     fn add(self, rhs: Self) -> Self::Output {
@@ -50,13 +50,13 @@ impl std::ops::Add for NodeId {
     }
 }
 
-impl std::ops::AddAssign for NodeId {
+impl core::ops::AddAssign for NodeId {
     fn add_assign(&mut self, rhs: Self) {
         self.0 += rhs.0;
     }
 }
 
-impl std::ops::Sub for NodeId {
+impl core::ops::Sub for NodeId {
     type Output = Self;
 
     fn sub(self, rhs: Self) -> Self::Output {
@@ -64,7 +64,7 @@ impl std::ops::Sub for NodeId {
     }
 }
 
-impl std::ops::SubAssign for NodeId {
+impl core::ops::SubAssign for NodeId {
     fn sub_assign(&mut self, rhs: Self) {
         self.0 -= rhs.0;
     }
@@ -250,7 +250,7 @@ impl Node {
         self.actions
             .set(Action::AppendLogEntries(LogEntries::from_iter(
                 LogPosition::ZERO,
-                std::iter::once(entry.clone()),
+                core::iter::once(entry.clone()),
             )));
         self.log.entries_mut().push(entry.clone());
 
@@ -381,7 +381,7 @@ impl Node {
         }
 
         self.role = RoleState::Candidate {
-            granted_votes: std::iter::once(self.id).collect(),
+            granted_votes: core::iter::once(self.id).collect(),
         };
 
         self.actions
@@ -501,7 +501,7 @@ impl Node {
                 self.current_term,
                 self.id,
                 self.commit_index,
-                LogEntries::from_iter(old_last_position, std::iter::once(entry)),
+                LogEntries::from_iter(old_last_position, core::iter::once(entry)),
             );
             self.actions.set(Action::BroadcastMessage(call));
         }
@@ -599,7 +599,7 @@ impl Node {
         debug_assert!(self.log.latest_config().is_joint_consensus());
 
         let mut new_config = self.log.latest_config().clone();
-        new_config.voters = std::mem::take(&mut new_config.new_voters);
+        new_config.voters = core::mem::take(&mut new_config.new_voters);
         debug_assert!(!new_config.voters.is_empty());
 
         self.propose(LogEntry::ClusterConfig(new_config));
@@ -713,7 +713,7 @@ impl Node {
         self.actions
             .set(Action::AppendLogEntries(LogEntries::from_iter(
                 self.log.last_position(),
-                std::iter::once(entry.clone()),
+                core::iter::once(entry.clone()),
             )));
         self.log.entries_mut().push(entry.clone());
 

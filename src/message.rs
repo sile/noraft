@@ -249,6 +249,7 @@ mod tests {
     use crate::{LogEntry, Term};
 
     use super::*;
+    use alloc::{vec, vec::Vec};
 
     #[test]
     fn strip_append_entries_prefix_for_append_entries_call() {

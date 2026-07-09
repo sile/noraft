@@ -1,4 +1,4 @@
-//! noraft: Minimal, feature-complete Raft for Rust - no I/O, no dependencies.
+//! noraft: Minimal, feature-complete no_std Raft for Rust - no I/O, no dependencies.
 //!
 //! [Raft]: https://raft.github.io/
 //!
@@ -63,8 +63,14 @@
 //! # fn is_election_timeout_expired() -> bool { true }
 //! # fn try_receive_message() -> Option<noraft::Message> { None }
 //! ```
+#![no_std]
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
+
+extern crate alloc;
+
+#[cfg(test)]
+extern crate std;
 
 mod action;
 mod config;
@@ -116,7 +122,7 @@ impl From<Term> for u64 {
     }
 }
 
-impl std::ops::Add for Term {
+impl core::ops::Add for Term {
     type Output = Self;
 
     fn add(self, rhs: Self) -> Self::Output {
@@ -124,13 +130,13 @@ impl std::ops::Add for Term {
     }
 }
 
-impl std::ops::AddAssign for Term {
+impl core::ops::AddAssign for Term {
     fn add_assign(&mut self, rhs: Self) {
         self.0 += rhs.0;
     }
 }
 
-impl std::ops::Sub for Term {
+impl core::ops::Sub for Term {
     type Output = Self;
 
     fn sub(self, rhs: Self) -> Self::Output {
@@ -138,7 +144,7 @@ impl std::ops::Sub for Term {
     }
 }
 
-impl std::ops::SubAssign for Term {
+impl core::ops::SubAssign for Term {
     fn sub_assign(&mut self, rhs: Self) {
         self.0 -= rhs.0;
     }
