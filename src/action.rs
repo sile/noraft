@@ -1,5 +1,5 @@
 use crate::{log::LogEntries, message::Message, node::NodeId};
-use std::collections::{BTreeMap, BTreeSet};
+use alloc::collections::{BTreeMap, BTreeSet};
 
 /// [`Action`] represents the I/O operations for [`Node`](crate::Node) that crate users need to execute.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -231,11 +231,11 @@ mod tests {
         // AppendLogEntries
         actions.set(Action::AppendLogEntries(LogEntries::from_iter(
             pos(2, 3),
-            std::iter::once(LogEntry::Command),
+            core::iter::once(LogEntry::Command),
         )));
         actions.set(Action::AppendLogEntries(LogEntries::from_iter(
             pos(2, 4),
-            std::iter::once(LogEntry::Command),
+            core::iter::once(LogEntry::Command),
         )));
         assert_eq!(
             actions.next(),

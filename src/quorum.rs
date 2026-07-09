@@ -1,5 +1,5 @@
 use crate::{config::ClusterConfig, log::LogIndex, node::NodeId};
-use std::collections::BTreeSet;
+use alloc::collections::BTreeSet;
 
 #[derive(Debug, Clone)]
 pub struct Quorum {

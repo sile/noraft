@@ -1,11 +1,9 @@
 use crate::node::NodeId;
-use std::{
-    collections::{
-        BTreeSet,
-        btree_set::{Iter, Union},
-    },
-    iter::Peekable,
+use alloc::collections::{
+    BTreeSet,
+    btree_set::{Iter, Union},
 };
+use core::iter::Peekable;
 
 /// Cluster configuration (membership).
 ///
@@ -180,6 +178,7 @@ impl Iterator for UniqueNodes<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::{vec, vec::Vec};
 
     #[test]
     fn unique_nodes() {
