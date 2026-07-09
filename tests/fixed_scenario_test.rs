@@ -1,6 +1,6 @@
 use noraft::{
-    Action, Actions, ClusterConfig, LogEntries, LogEntry, LogIndex, LogPosition, Message, Node,
-    NodeGeneration, NodeId, Role, Term,
+    Action, Actions, ClusterConfig, Log, LogEntries, LogEntry, LogIndex, LogPosition, Message,
+    Node, NodeGeneration, NodeId, Role, Term,
 };
 use std::ops::{Deref, DerefMut};
 
@@ -187,6 +187,55 @@ fn disruptive_request_vote_is_processed_without_prefilter() {
             }
         ) if *destination == id(2) && *term == t(3)
     )));
+}
+
+#[test]
+fn high_term_candidate_with_stale_log_is_rejected() {
+    // Follower's log ends at (term=5, index=4): committed term-5 entries.
+    // Candidate has a higher current term (7) but its last log is (term=3, index=100) —
+    // longer by index but staler by term. Per Raft §5.4.1 the follower must reject.
+    let entries = LogEntries::from_iter(
+        LogPosition::ZERO,
+        [
+            LogEntry::Term(t(1)),
+            LogEntry::Command,
+            LogEntry::Term(t(5)),
+            LogEntry::Command,
+        ],
+    );
+    assert_eq!(entries.last_position(), log_pos(t(5), i(4)));
+
+    let log = Log::new(ClusterConfig::new(), entries);
+    let mut node = Node::restart(id(0), NodeGeneration::new(1), t(5), None, log);
+    assert_action!(node, set_election_timeout());
+    assert_no_action!(node);
+
+    let stale_but_long = log_pos(t(3), i(100));
+    let msg = request_vote_call(t(7), id(1), stale_but_long);
+
+    node.handle_message(&msg);
+
+    // Term must still bump (high term always wins that race), but the candidate
+    // must NOT receive a vote because its log is staler by term.
+    assert_eq!(node.current_term(), t(7));
+    assert_eq!(node.role(), Role::Follower);
+    assert_eq!(node.voted_for(), None);
+    let sent_vote = node.actions_mut().any(|a| {
+        matches!(
+            a,
+            Action::SendMessage(
+                _,
+                Message::RequestVoteReply {
+                    vote_granted: true,
+                    ..
+                }
+            ),
+        )
+    });
+    assert!(
+        !sent_vote,
+        "follower must not vote for a stale-log candidate"
+    );
 }
 
 #[test]

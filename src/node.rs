@@ -898,7 +898,7 @@ impl Node {
             return;
         }
 
-        if self.log.last_position().index > last_position.index {
+        if self.log.last_position() > last_position {
             return;
         }
 
