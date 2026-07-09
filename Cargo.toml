@@ -2,7 +2,6 @@
 name = "noraft"
 version = "0.4.1"
 edition = "2024"
-authors = ["Takeru Ohta <phjgt308@gmail.com>"]
 license = "MIT"
 description = "Minimal, feature-complete Raft for Rust - no I/O, no dependencies"
 homepage = "https://github.com/sile/noraft"
