@@ -971,16 +971,18 @@ impl Node {
             return;
         }
 
-        if !self.role().is_follower() {
+        if self.role().is_leader() {
+            // A same-term leader conflict cannot happen in a correct Raft execution.
             return;
         }
 
-        if self.voted_for.is_none() {
-            self.set_voted_for(Some(from));
+        if !self.role().is_follower() {
+            // A candidate recognizes the sender as the legitimate leader for this term.
+            self.role = RoleState::Follower;
         }
 
         if self.voted_for != Some(from) {
-            return;
+            self.set_voted_for(Some(from));
         }
 
         let no_divergence = self.append_log_entries_from_leader(entries);
