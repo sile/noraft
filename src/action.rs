@@ -62,6 +62,13 @@ pub enum Action {
     /// they can be safely truncated using [`LogEntries::truncate()`](crate::LogEntries::truncate) before sending the message.
     /// And after sending a part of entries, the sent prefix can be dropped by
     /// calling [`Message::strip_append_entries_prefix()`](crate::Message::strip_append_entries_prefix).
+    ///
+    /// [`Node`](crate::Node) does not track whether a previously issued message was actually sent,
+    /// queued, or discarded by the integration layer. If the integration layer keeps per-peer
+    /// transport state, it may use that state to drop an AppendEntries prefix that is already queued
+    /// or in flight for the same peer. This is only an optimization: keeping duplicate entries is
+    /// always safe, and can be better when message loss is common because the duplicate message can
+    /// repair the follower without waiting for another retry.
     SendMessage(NodeId, Message),
 
     /// Install a snapshot on a specific node.

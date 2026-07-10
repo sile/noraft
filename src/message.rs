@@ -104,6 +104,11 @@ impl Message {
     ///
     /// If `sent_count` is `0`, this method has no effect.
     /// If `sent_count` is greater than or equal to the number of entries, all entries are dropped.
+    ///
+    /// Besides splitting a large message, the integration layer can use this method to avoid
+    /// sending an AppendEntries prefix that it knows is already queued or in flight for the same
+    /// peer. If that earlier message is lost, the stripped message may fail and a later retry will
+    /// repair the follower.
     pub fn strip_append_entries_prefix(&mut self, sent_count: usize) -> bool {
         let Self::AppendEntriesCall { entries, .. } = self else {
             return false;
