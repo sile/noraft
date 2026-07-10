@@ -899,6 +899,10 @@ impl Node {
         }
 
         if self.log.last_position() > last_position {
+            // Deny the vote without sending an explicit false reply. A negative reply in
+            // the candidate's current term would not change the candidate's state in this
+            // implementation; the candidate will retry after its election timeout if it
+            // cannot collect a majority.
             return;
         }
 
@@ -907,7 +911,8 @@ impl Node {
         }
 
         if self.voted_for != Some(from) {
-            // This node is either a candidate, a leader, or has already voted for another node.
+            // Deny the vote without sending an explicit false reply. This node is either a
+            // candidate, a leader, or has already voted for another node in this term.
             return;
         }
         debug_assert!(self.role().is_follower());
