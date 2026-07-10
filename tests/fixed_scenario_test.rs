@@ -294,6 +294,124 @@ fn election() {
 }
 
 #[test]
+fn candidate_accepts_same_term_append_entries_from_leader() {
+    let voters = [id(0), id(1), id(2)];
+    let config = joint(&voters, &[]);
+    let prefix = LogEntries::from_iter(
+        LogPosition::ZERO,
+        [
+            cluster_config_entry(config),
+            term_entry(t(2)),
+            LogEntry::Command,
+        ],
+    );
+
+    let mut leader = TestNode {
+        inner: Node::restart(
+            id(0),
+            NodeGeneration::new(1),
+            t(3),
+            None,
+            Log::new(ClusterConfig::new(), prefix.clone()),
+        ),
+        actions: Actions::default(),
+    };
+    assert_action!(leader, set_election_timeout());
+    assert_no_action!(leader);
+
+    let _call = leader.asserted_follower_election_timeout();
+    let vote_reply = request_vote_reply(leader.current_term(), id(2), true);
+    let append_entries =
+        leader.asserted_handle_request_vote_reply_majority_vote_granted(&vote_reply);
+    assert_eq!(leader.role(), Role::Leader);
+
+    let mut candidate = TestNode {
+        inner: Node::restart(
+            id(1),
+            NodeGeneration::new(1),
+            t(3),
+            None,
+            Log::new(ClusterConfig::new(), prefix),
+        ),
+        actions: Actions::default(),
+    };
+    assert_action!(candidate, set_election_timeout());
+    assert_no_action!(candidate);
+
+    let _call = candidate.asserted_follower_election_timeout();
+    assert_eq!(candidate.role(), Role::Candidate);
+    assert_eq!(candidate.current_term(), leader.current_term());
+
+    let _reply = candidate.asserted_handle_append_entries_call_success(&append_entries);
+
+    assert_eq!(candidate.role(), Role::Follower);
+    assert_eq!(candidate.voted_for(), Some(leader.id()));
+    assert_eq!(
+        candidate.log().last_position(),
+        leader.log().last_position()
+    );
+}
+
+#[test]
+fn follower_accepts_same_term_append_entries_after_voting_for_another_candidate() {
+    let voters = [id(0), id(1), id(2), id(3), id(4)];
+    let config = joint(&voters, &[]);
+    let prefix = LogEntries::from_iter(
+        LogPosition::ZERO,
+        [
+            cluster_config_entry(config),
+            term_entry(t(2)),
+            LogEntry::Command,
+        ],
+    );
+
+    let mut leader = TestNode {
+        inner: Node::restart(
+            id(0),
+            NodeGeneration::new(1),
+            t(3),
+            None,
+            Log::new(ClusterConfig::new(), prefix.clone()),
+        ),
+        actions: Actions::default(),
+    };
+    assert_action!(leader, set_election_timeout());
+    assert_no_action!(leader);
+
+    let _call = leader.asserted_follower_election_timeout();
+    let first_vote_reply = request_vote_reply(leader.current_term(), id(1), true);
+    leader.handle_message(&first_vote_reply);
+    assert_eq!(leader.role(), Role::Candidate);
+    assert_no_action!(leader);
+
+    let vote_reply = request_vote_reply(leader.current_term(), id(2), true);
+    let append_entries =
+        leader.asserted_handle_request_vote_reply_majority_vote_granted(&vote_reply);
+    assert_eq!(leader.role(), Role::Leader);
+
+    let mut follower = TestNode {
+        inner: Node::restart(
+            id(3),
+            NodeGeneration::new(1),
+            leader.current_term(),
+            Some(id(4)),
+            Log::new(ClusterConfig::new(), prefix),
+        ),
+        actions: Actions::default(),
+    };
+    assert_action!(follower, set_election_timeout());
+    assert_no_action!(follower);
+    assert_eq!(follower.role(), Role::Follower);
+    assert_ne!(follower.voted_for(), Some(leader.id()));
+
+    let _reply = follower.asserted_handle_append_entries_call_success(&append_entries);
+
+    assert_eq!(follower.role(), Role::Follower);
+    assert_eq!(follower.voted_for(), Some(leader.id()));
+    assert_eq!(follower.log().last_position(), leader.log().last_position());
+}
+
+#[test]
 fn restart() {
     let mut cluster = ThreeNodeCluster::new();
     cluster.init_cluster();
