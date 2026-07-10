@@ -354,7 +354,7 @@ fn candidate_accepts_same_term_append_entries_from_leader() {
 
 #[test]
 fn follower_accepts_same_term_append_entries_after_voting_for_another_candidate() {
-    let voters = [id(0), id(1), id(2)];
+    let voters = [id(0), id(1), id(2), id(3), id(4)];
     let config = joint(&voters, &[]);
     let prefix = LogEntries::from_iter(
         LogPosition::ZERO,
@@ -379,6 +379,11 @@ fn follower_accepts_same_term_append_entries_after_voting_for_another_candidate(
     assert_no_action!(leader);
 
     let _call = leader.asserted_follower_election_timeout();
+    let first_vote_reply = request_vote_reply(leader.current_term(), id(1), true);
+    leader.handle_message(&first_vote_reply);
+    assert_eq!(leader.role(), Role::Candidate);
+    assert_no_action!(leader);
+
     let vote_reply = request_vote_reply(leader.current_term(), id(2), true);
     let append_entries =
         leader.asserted_handle_request_vote_reply_majority_vote_granted(&vote_reply);
@@ -386,10 +391,10 @@ fn follower_accepts_same_term_append_entries_after_voting_for_another_candidate(
 
     let mut follower = TestNode {
         inner: Node::restart(
-            id(1),
+            id(3),
             NodeGeneration::new(1),
             leader.current_term(),
-            Some(id(2)),
+            Some(id(4)),
             Log::new(ClusterConfig::new(), prefix),
         ),
         actions: Actions::default(),
