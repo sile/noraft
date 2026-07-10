@@ -379,6 +379,91 @@ fn truncate_log() {
 }
 
 #[test]
+fn same_index_different_term_tail_is_truncated_before_replication() {
+    let voters = [id(0), id(1), id(2)];
+    let config = joint(&voters, &[]);
+
+    let leader_prefix = LogEntries::from_iter(
+        LogPosition::ZERO,
+        [
+            cluster_config_entry(config.clone()),
+            term_entry(t(2)),
+            LogEntry::Command,
+        ],
+    );
+    let leader_log = Log::new(ClusterConfig::new(), leader_prefix);
+    let mut leader = TestNode {
+        inner: Node::restart(id(0), NodeGeneration::new(1), t(3), None, leader_log),
+        actions: Actions::default(),
+    };
+    assert_action!(leader, set_election_timeout());
+    assert_no_action!(leader);
+
+    let _call = leader.asserted_follower_election_timeout();
+    assert_eq!(leader.current_term(), t(4));
+    let vote_reply = request_vote_reply(leader.current_term(), id(2), true);
+    let _initial_append =
+        leader.asserted_handle_request_vote_reply_majority_vote_granted(&vote_reply);
+    assert_eq!(leader.role(), Role::Leader);
+    assert_eq!(leader.log().last_position(), log_pos(t(4), i(4)));
+
+    let divergent_log = Log::new(
+        ClusterConfig::new(),
+        LogEntries::from_iter(
+            LogPosition::ZERO,
+            [
+                cluster_config_entry(config),
+                term_entry(t(2)),
+                LogEntry::Command,
+                term_entry(t(3)),
+            ],
+        ),
+    );
+    let mut follower = TestNode {
+        inner: Node::restart(id(1), NodeGeneration::new(1), t(3), None, divergent_log),
+        actions: Actions::default(),
+    };
+    assert_action!(follower, set_election_timeout());
+    assert_no_action!(follower);
+    assert_eq!(follower.log().last_position(), log_pos(t(3), i(4)));
+
+    let divergent_reply = Message::AppendEntriesReply {
+        from: follower.id(),
+        term: leader.current_term(),
+        generation: follower.generation(),
+        last_position: follower.log().last_position(),
+    };
+    let truncate_call = leader.asserted_handle_append_entries_reply_failure(&divergent_reply);
+    let Message::AppendEntriesCall { entries, .. } = &truncate_call else {
+        panic!("Expected AppendEntriesCall");
+    };
+    assert!(entries.is_empty());
+    assert_eq!(entries.prev_position(), log_pos(t(4), i(4)));
+    assert_eq!(entries.last_position(), log_pos(t(4), i(4)));
+
+    let truncated_reply = follower.asserted_handle_append_entries_call_failure(&truncate_call);
+    assert_eq!(follower.log().last_position(), log_pos(t(2), i(3)));
+
+    leader.handle_message(&truncated_reply);
+    let Some(repair_call) = leader.actions_mut().send_messages.remove(&follower.id()) else {
+        panic!("Expected repair AppendEntriesCall");
+    };
+    assert_no_action!(leader);
+    let Message::AppendEntriesCall { entries, .. } = &repair_call else {
+        panic!("Expected AppendEntriesCall");
+    };
+    assert_eq!(entries.prev_position(), log_pos(t(2), i(3)));
+    assert_eq!(entries.last_position(), log_pos(t(4), i(4)));
+    assert_eq!(entries.iter().collect::<Vec<_>>(), [term_entry(t(4))]);
+
+    let repaired_reply = follower.asserted_handle_append_entries_call_success(&repair_call);
+    assert_eq!(follower.log().last_position(), leader.log().last_position());
+
+    leader.asserted_handle_append_entries_reply_success(&repaired_reply, true, false);
+    assert_eq!(leader.commit_index(), i(4));
+}
+
+#[test]
 fn snapshot() {
     let mut cluster = ThreeNodeCluster::new();
     cluster.init_cluster();
