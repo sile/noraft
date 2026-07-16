@@ -27,6 +27,35 @@ fn single_node_start() {
 }
 
 #[test]
+fn solo_voter_with_non_voter_yields_log_append_before_committed_broadcast() {
+    let mut leader = TestNode::asserted_start(id(0), &[id(0)]);
+    let mut config = leader.config().clone();
+    config.non_voters.insert(id(1));
+
+    let position = leader.propose_config(config);
+
+    assert_ne!(position, LogPosition::INVALID);
+    assert_eq!(leader.commit_index(), position.index);
+
+    let actions: Vec<_> = leader.actions_mut().collect();
+    let [
+        Action::SetElectionTimeout,
+        Action::AppendLogEntries(log_entries),
+        Action::BroadcastMessage(Message::AppendEntriesCall {
+            commit_index,
+            entries,
+            ..
+        }),
+    ] = actions.as_slice()
+    else {
+        panic!("unexpected actions: {actions:?}");
+    };
+    assert_eq!(log_entries.last_position(), position);
+    assert_eq!(*commit_index, position.index);
+    assert_eq!(entries.last_position(), position);
+}
+
+#[test]
 fn create_two_nodes_cluster() {
     let initial_voters = [id(0), id(1)];
     let mut node0 = TestNode::asserted_start(id(0), &initial_voters);
