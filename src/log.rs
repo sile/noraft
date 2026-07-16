@@ -532,8 +532,9 @@ impl LogEntries {
         }
 
         // Rebase pending append entries to the installed snapshot. If the
-        // snapshot position is incompatible with this pending suffix, the suffix
-        // cannot be safely kept.
+        // snapshot position is incompatible with this pending suffix, it belongs
+        // to a different log branch at the snapshot boundary and must not be
+        // restored after the snapshot.
         *self = self
             .since(last_included_position)
             .unwrap_or_else(|| Self::new(last_included_position));
