@@ -531,13 +531,13 @@ impl LogEntries {
             return;
         }
 
-        if self.prev_position().index < last_included_position.index {
-            *self = Self::new(last_included_position);
-        } else {
-            *self = self
-                .since(last_included_position)
-                .expect("Node::handle_snapshot_installed() guarantees that this never happens");
-        }
+        // Rebase pending append entries to the installed snapshot. If the
+        // snapshot position is incompatible with this pending suffix, it belongs
+        // to a different log branch at the snapshot boundary and must not be
+        // restored after the snapshot.
+        *self = self
+            .since(last_included_position)
+            .unwrap_or_else(|| Self::new(last_included_position));
     }
 }
 
@@ -807,6 +807,42 @@ mod tests {
         );
 
         assert_eq!(entries.since(pos(0, 3)), None); // Term mismatch
+    }
+
+    #[test]
+    fn log_entries_handle_snapshot_installed_keeps_suffix_after_snapshot_position() {
+        let mut entries = entries(
+            pos(1, 2),
+            &[
+                LogEntry::Command,
+                LogEntry::Command,
+                LogEntry::Term(Term::new(2)),
+                LogEntry::Command,
+            ],
+        );
+
+        entries.handle_snapshot_installed(pos(1, 4));
+
+        assert_eq!(entries.prev_position(), pos(1, 4));
+        assert_eq!(entries.last_position(), pos(2, 6));
+        assert_eq!(
+            entries.iter_with_positions().collect::<Vec<_>>(),
+            vec![
+                (pos(2, 5), LogEntry::Term(Term::new(2))),
+                (pos(2, 6), LogEntry::Command),
+            ]
+        );
+    }
+
+    #[test]
+    fn log_entries_handle_snapshot_installed_discards_incompatible_suffix() {
+        let mut entries = entries(pos(1, 2), &[LogEntry::Command, LogEntry::Command]);
+
+        entries.handle_snapshot_installed(pos(2, 3));
+
+        assert!(entries.is_empty());
+        assert_eq!(entries.prev_position(), pos(2, 3));
+        assert_eq!(entries.last_position(), pos(2, 3));
     }
 
     #[test]
