@@ -62,6 +62,63 @@ fn create_two_nodes_cluster() {
 }
 
 #[test]
+fn leader_commits_after_shrinking_to_self_only_voter() {
+    let initial_voters = [id(0), id(1)];
+    let mut leader = TestNode::asserted_start(id(0), &initial_voters);
+    let mut follower = TestNode::asserted_start(id(1), &[]);
+
+    leader.handle_election_timeout();
+    assert_eq!(leader.role(), Role::Candidate);
+    assert_action!(leader, set_election_timeout());
+    assert_action!(leader, save_current_term());
+    assert_action!(leader, save_voted_for());
+
+    let Some(Action::BroadcastMessage(call @ Message::RequestVoteCall { .. })) =
+        leader.actions_mut().next()
+    else {
+        panic!("Expected RequestVoteCall message");
+    };
+    assert_no_action!(leader);
+
+    let reply = follower.asserted_handle_request_vote_call_success(&call);
+    let call = leader.asserted_handle_request_vote_reply_majority_vote_granted(&reply);
+    let reply = follower.asserted_handle_append_entries_call_failure(&call);
+    let call = leader.asserted_handle_append_entries_reply_failure(&reply);
+    let reply = follower.asserted_handle_append_entries_call_success(&call);
+    leader.asserted_handle_append_entries_reply_success(&reply, true, false);
+    assert_eq!(leader.config(), follower.config());
+
+    let joint_config = leader.config().to_joint_consensus(&[], &[follower.id()]);
+    let call = leader.asserted_change_cluster_config(joint_config);
+    let reply = follower.asserted_handle_append_entries_call_success(&call);
+
+    let final_config_prev_position = leader.log().last_position();
+    leader.handle_message(&reply);
+
+    assert_eq!(leader.config().voters, [leader.id()].into_iter().collect());
+    assert!(!leader.config().is_joint_consensus());
+    assert_eq!(leader.commit_index(), leader.log().last_position().index);
+    assert_action!(
+        leader,
+        append_log_entry(
+            final_config_prev_position,
+            cluster_config_entry(leader.config().clone())
+        )
+    );
+    assert_action!(leader, set_election_timeout());
+    assert_no_action!(leader);
+
+    let position = leader.propose_command();
+    assert_eq!(leader.commit_index(), position.index);
+    assert_action!(
+        leader,
+        append_log_entry(log_prev(position), LogEntry::Command)
+    );
+    assert_action!(leader, set_election_timeout());
+    assert_no_action!(leader);
+}
+
+#[test]
 fn create_three_nodes_cluster() {
     let mut cluster = ThreeNodeCluster::new();
     cluster.init_cluster();
