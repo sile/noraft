@@ -182,7 +182,10 @@ impl LogEntries {
 
     /// Returns the number of entries in this [`LogEntries`] instance.
     pub fn len(&self) -> usize {
-        self.last_position.index.get() as usize - self.prev_position.index.get() as usize
+        let len = self.last_position.index.get() - self.prev_position.index.get();
+        // Keeping more entries than `usize::MAX` is outside the supported
+        // in-memory representation, even when the absolute log index is higher.
+        usize::try_from(len).expect("log entries length exceeds usize::MAX")
     }
 
     /// Returns [`true`] if the log entries is empty (i.e., the previous and last positions are the same).
@@ -427,10 +430,11 @@ impl LogEntries {
     /// assert_eq!(entries.get_entry(noraft::LogIndex::new(1)), None);
     /// ```
     pub fn truncate(&mut self, len: usize) {
-        let last_index = LogIndex::new(self.prev_position.index.get() + len as u64);
-        if self.last_position.index <= last_index {
+        if self.len() <= len {
             return;
         }
+
+        let last_index = LogIndex::new(self.prev_position.index.get() + len as u64);
         let Some(last_term) = self.get_term(last_index) else {
             unreachable!();
         };
@@ -772,6 +776,47 @@ mod tests {
         assert_eq!(entries.get_entry(i(2)), Some(LogEntry::Command));
         assert_eq!(entries.get_entry(i(3)), Some(LogEntry::Term(Term::new(3))));
         assert_eq!(entries.get_entry(i(4)), Some(LogEntry::Command));
+    }
+
+    #[test]
+    fn log_entries_truncate_with_large_len_has_no_effect() {
+        let mut entries = entries(
+            pos(1, 5),
+            &[
+                LogEntry::Command,
+                LogEntry::Term(Term::new(2)),
+                LogEntry::Command,
+            ],
+        );
+        let original = entries.clone();
+
+        entries.truncate(usize::MAX);
+
+        assert_eq!(entries, original);
+    }
+
+    #[test]
+    fn log_entries_truncate_after_high_index_snapshot() {
+        let snapshot_index = u64::from(u32::MAX);
+        let mut entries = entries(
+            pos(1, snapshot_index),
+            &[
+                LogEntry::Command,
+                LogEntry::Term(Term::new(2)),
+                LogEntry::Command,
+            ],
+        );
+
+        assert_eq!(entries.len(), 3);
+
+        entries.truncate(1);
+
+        assert_eq!(entries.prev_position(), pos(1, snapshot_index));
+        assert_eq!(entries.last_position(), pos(1, snapshot_index + 1));
+        assert_eq!(
+            entries.iter_with_positions().collect::<Vec<_>>(),
+            vec![(pos(1, snapshot_index + 1), LogEntry::Command)]
+        );
     }
 
     #[test]
