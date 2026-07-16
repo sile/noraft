@@ -56,6 +56,48 @@ fn solo_voter_with_non_voter_yields_log_append_before_committed_broadcast() {
 }
 
 #[test]
+fn snapshot_preserves_pending_append_suffix_after_snapshot_position() {
+    let mut leader = TestNode::asserted_start(id(0), &[id(0)]);
+
+    let first_position = leader.propose_command();
+    let second_position = leader.propose_command();
+    assert_eq!(leader.commit_index(), second_position.index);
+    assert_eq!(
+        leader.actions().append_log_entries.as_ref(),
+        Some(&LogEntries::from_iter(
+            log_prev(first_position),
+            [LogEntry::Command, LogEntry::Command]
+        ))
+    );
+
+    let snapshot_config = leader.config().clone();
+    assert!(leader.handle_snapshot_installed(first_position, snapshot_config));
+
+    assert_eq!(leader.log().entries().prev_position(), first_position);
+    assert_eq!(leader.log().entries().last_position(), second_position);
+    assert_eq!(
+        leader.actions().append_log_entries.as_ref(),
+        Some(&LogEntries::from_iter(first_position, [LogEntry::Command]))
+    );
+}
+
+#[test]
+fn snapshot_discards_incompatible_pending_append_entries() {
+    let mut follower = Node::start(id(0));
+    assert_no_action!(follower);
+    follower.actions_mut().append_log_entries = Some(LogEntries::from_iter(
+        log_pos(t(10), i(2)),
+        [LogEntry::Command],
+    ));
+
+    let snapshot_position = log_pos(t(12), i(2));
+    assert!(follower.handle_snapshot_installed(snapshot_position, ClusterConfig::new()));
+
+    assert_eq!(follower.log().entries().prev_position(), snapshot_position);
+    assert!(follower.actions().append_log_entries.is_none());
+}
+
+#[test]
 fn create_two_nodes_cluster() {
     let initial_voters = [id(0), id(1)];
     let mut node0 = TestNode::asserted_start(id(0), &initial_voters);
