@@ -64,7 +64,7 @@ while node.get_commit_status(commit_position).is_in_progress() {
 
     // If a message is received, handle it.
     while let Some(message) = try_receive_message() {
-        node.handle_message(&message);
+        node.handle_message(&message).expect("message handling should succeed");
     }
 }
 
@@ -73,4 +73,3 @@ let commit_position = node.propose_command();
 
 // Execute actions as before.
 ```
-

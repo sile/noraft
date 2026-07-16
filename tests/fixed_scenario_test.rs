@@ -1,6 +1,6 @@
 use noraft::{
-    Action, Actions, ClusterConfig, Log, LogEntries, LogEntry, LogIndex, LogPosition, Message,
-    Node, NodeGeneration, NodeId, Role, Term,
+    Action, Actions, ClusterConfig, Error, Log, LogEntries, LogEntry, LogIndex, LogPosition,
+    Message, Node, NodeGeneration, NodeId, Role, Term,
 };
 use std::ops::{Deref, DerefMut};
 
@@ -98,6 +98,40 @@ fn snapshot_discards_incompatible_pending_append_entries() {
 }
 
 #[test]
+fn local_snapshot_mismatch_returns_error() {
+    fn assert_error_trait<E: core::error::Error>() {}
+    assert_error_trait::<Error>();
+    assert_eq!(
+        Error::LocalSnapshotMismatch.to_string(),
+        "local snapshot position conflicts with leader log"
+    );
+
+    let snapshot_position = log_pos(t(1), i(5));
+    let log = Log::new(
+        ClusterConfig::new(),
+        LogEntries::from_iter(snapshot_position, [LogEntry::Command]),
+    );
+    let mut follower = Node::restart(id(0), NodeGeneration::new(1), t(2), Some(id(1)), log);
+    assert_action!(follower, set_election_timeout());
+    assert_no_action!(follower);
+
+    let original_log = follower.log().clone();
+    let call = Message::AppendEntriesCall {
+        from: id(1),
+        term: t(2),
+        commit_index: i(5),
+        entries: LogEntries::from_iter(log_pos(t(2), i(5)), [LogEntry::Command]),
+    };
+
+    assert_eq!(
+        follower.handle_message(&call),
+        Err(Error::LocalSnapshotMismatch)
+    );
+    assert_eq!(follower.log(), &original_log);
+    assert!(follower.actions().is_empty());
+}
+
+#[test]
 fn create_two_nodes_cluster() {
     let initial_voters = [id(0), id(1)];
     let mut node0 = TestNode::asserted_start(id(0), &initial_voters);
@@ -164,7 +198,9 @@ fn leader_commits_after_shrinking_to_self_only_voter() {
     let reply = follower.asserted_handle_append_entries_call_success(&call);
 
     let final_config_prev_position = leader.log().last_position();
-    leader.handle_message(&reply);
+    leader
+        .handle_message(&reply)
+        .expect("message handling should succeed");
 
     assert_eq!(leader.config().voters, [leader.id()].into_iter().collect());
     assert!(!leader.config().is_joint_consensus());
@@ -213,7 +249,8 @@ fn self_request_vote_call_is_ignored() {
         node.log().entries().last_position(),
     );
 
-    node.handle_message(&msg);
+    node.handle_message(&msg)
+        .expect("message handling should succeed");
 
     assert_eq!(node.current_term(), prev_term);
     assert_eq!(node.voted_for(), prev_voted_for);
@@ -291,7 +328,8 @@ fn disruptive_request_vote_is_processed_without_prefilter() {
     let msg = request_vote_call(t(3), id(2), node.log().entries().last_position());
     assert!(node.could_be_disruptive_request_vote(&msg));
 
-    node.handle_message(&msg);
+    node.handle_message(&msg)
+        .expect("message handling should succeed");
 
     assert_eq!(node.role(), Role::Follower);
     assert_eq!(node.current_term(), t(3));
@@ -341,7 +379,8 @@ fn high_term_candidate_with_stale_log_is_rejected() {
     let stale_but_long = log_pos(t(3), i(100));
     let msg = request_vote_call(t(7), id(1), stale_but_long);
 
-    node.handle_message(&msg);
+    node.handle_message(&msg)
+        .expect("message handling should succeed");
 
     // Term must still bump (high term always wins that race), but the candidate
     // must NOT receive a vote because its log is staler by term.
@@ -402,7 +441,10 @@ fn election() {
     let reply = cluster
         .node0
         .asserted_handle_append_entries_call_success(&call);
-    cluster.node1.handle_message(&reply);
+    cluster
+        .node1
+        .handle_message(&reply)
+        .expect("message handling should succeed");
     assert_no_action!(cluster.node1);
 
     // Periodic heartbeat.
@@ -417,7 +459,10 @@ fn election() {
     let reply = cluster
         .node2
         .asserted_handle_append_entries_call_success(&call);
-    cluster.node1.handle_message(&reply);
+    cluster
+        .node1
+        .handle_message(&reply)
+        .expect("message handling should succeed");
     assert_no_action!(cluster.node1);
 }
 
@@ -508,7 +553,9 @@ fn follower_accepts_same_term_append_entries_after_voting_for_another_candidate(
 
     let _call = leader.asserted_follower_election_timeout();
     let first_vote_reply = request_vote_reply(leader.current_term(), id(1), true);
-    leader.handle_message(&first_vote_reply);
+    leader
+        .handle_message(&first_vote_reply)
+        .expect("message handling should succeed");
     assert_eq!(leader.role(), Role::Candidate);
     assert_no_action!(leader);
 
@@ -578,7 +625,10 @@ fn truncate_log() {
     let should_ignore = cluster.node0.could_be_disruptive_request_vote(&call);
     assert!(should_ignore);
     if !should_ignore {
-        cluster.node0.handle_message(&call);
+        cluster
+            .node0
+            .handle_message(&call)
+            .expect("message handling should succeed");
     }
     assert_eq!(cluster.node0.role(), Role::Leader);
     assert_no_action!(cluster.node0);
@@ -690,7 +740,9 @@ fn same_index_different_term_tail_is_truncated_before_replication() {
     let truncated_reply = follower.asserted_handle_append_entries_call_failure(&truncate_call);
     assert_eq!(follower.log().last_position(), log_pos(t(2), i(3)));
 
-    leader.handle_message(&truncated_reply);
+    leader
+        .handle_message(&truncated_reply)
+        .expect("message handling should succeed");
     let Some(repair_call) = leader.actions_mut().send_messages.remove(&follower.id()) else {
         panic!("Expected repair AppendEntriesCall");
     };
@@ -748,7 +800,9 @@ fn follower_rewrites_from_common_prefix_when_repair_term_is_outside_local_log() 
         entries: repair_entries.clone(),
     };
 
-    follower.handle_message(&repair_call);
+    follower
+        .handle_message(&repair_call)
+        .expect("message handling should succeed");
 
     let reply = append_entries_reply(&repair_call, &follower);
     assert_eq!(follower.commit_index(), i(6));
@@ -1040,7 +1094,8 @@ impl TestNode {
         let prev_commit_index = self.commit_index();
         let prev_voted_for = self.voted_for();
 
-        self.handle_message(msg);
+        self.handle_message(msg)
+            .expect("message handling should succeed");
         assert_eq!(
             self.log().entries().last_position(),
             entries.last_position()
@@ -1086,7 +1141,8 @@ impl TestNode {
         let prev_voted_for = self.voted_for();
         let prev_term = self.current_term();
 
-        self.handle_message(msg);
+        self.handle_message(msg)
+            .expect("message handling should succeed");
         assert_ne!(
             self.log().entries().last_position(),
             entries.last_position()
@@ -1124,7 +1180,8 @@ impl TestNode {
         };
         assert!(since(self.log().entries(), *last_position).is_none());
 
-        self.handle_message(msg);
+        self.handle_message(msg)
+            .expect("message handling should succeed");
         assert_action!(self, Action::InstallSnapshot(*from));
         assert_no_action!(self);
 
@@ -1149,7 +1206,8 @@ impl TestNode {
             unreachable!();
         };
 
-        self.handle_message(msg);
+        self.handle_message(msg)
+            .expect("message handling should succeed");
         let call = append_entries_call(
             self,
             LogEntries::from_iter(
@@ -1178,7 +1236,8 @@ impl TestNode {
         assert!(matches!(reply, Message::AppendEntriesReply { .. }));
 
         let old_last_position = self.log().entries().last_position();
-        self.handle_message(reply);
+        self.handle_message(reply)
+            .expect("message handling should succeed");
         self.actions = self.inner.actions().clone();
 
         let Message::AppendEntriesReply { last_position, .. } = reply else {
@@ -1212,7 +1271,8 @@ impl TestNode {
     fn asserted_handle_append_entries_reply_failure(&mut self, reply: &Message) -> Message {
         assert!(matches!(reply, Message::AppendEntriesReply { .. }));
 
-        self.handle_message(reply);
+        self.handle_message(reply)
+            .expect("message handling should succeed");
         let Some(call) = self.actions_mut().send_messages.remove(&reply.from()) else {
             panic!("No send message action");
         };
@@ -1272,7 +1332,8 @@ impl TestNode {
     fn asserted_handle_request_vote_call_success(&mut self, msg: &Message) -> Message {
         assert!(matches!(msg, Message::RequestVoteCall { .. }));
 
-        self.handle_message(msg);
+        self.handle_message(msg)
+            .expect("message handling should succeed");
 
         let reply = request_vote_reply(msg.term(), self.id(), true);
         assert_action!(self, save_current_term());
@@ -1293,7 +1354,8 @@ impl TestNode {
         assert!(matches!(msg, Message::RequestVoteReply { .. }));
 
         let tail = self.log().entries().last_position();
-        self.handle_message(msg);
+        self.handle_message(msg)
+            .expect("message handling should succeed");
         self.actions = self.inner.actions().clone();
         let call = append_entries_call(
             self,
@@ -1314,7 +1376,8 @@ impl TestNode {
         assert!(matches!(msg, Message::AppendEntriesCall { .. }));
 
         let tail = self.log().entries().last_position();
-        self.handle_message(msg);
+        self.handle_message(msg)
+            .expect("message handling should succeed");
         let reply = append_entries_reply(msg, self);
         assert_action!(self, save_current_term());
         assert_eq!(self.current_term(), msg.term());
