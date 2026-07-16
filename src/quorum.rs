@@ -66,6 +66,11 @@ fn update_majority<T: Ord>(
     old_entry: (T, NodeId),
     new_entry: (T, NodeId),
 ) {
+    debug_assert!(old_entry.0 <= new_entry.0);
+
+    // This set keeps only the current majority-sized top entries, not every
+    // node. The incremental update is valid only while each node's index moves
+    // monotonically forward; if an index can decrease, rebuild the whole quorum.
     if set.first().is_none_or(|min| new_entry.0 <= min.0) {
         return;
     }
