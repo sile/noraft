@@ -351,8 +351,7 @@ impl Node {
 
         let quorum = Quorum::new(self.config());
         let followers = BTreeMap::new();
-        let solo_voter =
-            self.config().unique_voters().count() == 1 && self.config().voters.contains(&self.id);
+        let solo_voter = self.is_self_solo_voter();
         self.role = RoleState::Leader {
             followers,
             quorum,
@@ -364,6 +363,17 @@ impl Node {
         self.propose(LogEntry::Term(self.current_term));
     }
 
+    fn is_self_solo_voter(&self) -> bool {
+        self.config().unique_voters().count() == 1 && self.config().voters.contains(&self.id)
+    }
+
+    fn refresh_solo_voter(&mut self) {
+        let is_self_solo_voter = self.is_self_solo_voter();
+        if let RoleState::Leader { solo_voter, .. } = &mut self.role {
+            *solo_voter = is_self_solo_voter;
+        }
+    }
+
     fn transition_to_candidate(&mut self) {
         if !self.log.latest_config().is_voter(self.id) {
             // Non voter or removed node cannot become a candidate.
@@ -373,8 +383,7 @@ impl Node {
         self.set_current_term(self.current_term.next());
         self.set_voted_for(Some(self.id));
 
-        let solo_voter =
-            self.config().unique_voters().count() == 1 && self.config().voters.contains(&self.id);
+        let solo_voter = self.is_self_solo_voter();
         if solo_voter {
             self.transition_to_leader();
             return;
@@ -727,6 +736,7 @@ impl Node {
         if matches!(entry, LogEntry::ClusterConfig(_)) {
             self.rebuild_followers();
             self.rebuild_quorum();
+            self.refresh_solo_voter();
         }
 
         if matches!(
