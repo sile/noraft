@@ -216,6 +216,10 @@ impl Message {
     }
 
     pub(crate) fn handle_snapshot_installed(&mut self, last_included_position: LogPosition) {
+        // Outbound calls are still requests from this node, so their log state
+        // may be rebased to the installed snapshot. Replies describe a past
+        // observation by this node; raising their term would synthesize a reply
+        // for a term that the node did not actually observe.
         match self {
             Message::RequestVoteCall {
                 term,
@@ -227,20 +231,17 @@ impl Message {
                     *last_position = last_included_position;
                 }
             }
-            Message::RequestVoteReply { term, .. } => {
-                *term = (*term).max(last_included_position.term);
-            }
+            Message::RequestVoteReply { .. } => {}
             Message::AppendEntriesCall { term, entries, .. } => {
                 *term = (*term).max(last_included_position.term);
                 entries.handle_snapshot_installed(last_included_position);
             }
             Message::AppendEntriesReply {
-                term,
+                term: _,
                 generation: _,
                 last_position,
                 ..
             } => {
-                *term = (*term).max(last_included_position.term);
                 if last_position.index < last_included_position.index {
                     *last_position = last_included_position;
                 }
@@ -377,5 +378,43 @@ mod tests {
 
         assert!(!request_vote.strip_append_entries_prefix(1));
         assert_eq!(request_vote, original);
+    }
+
+    #[test]
+    fn handle_snapshot_installed_keeps_request_vote_reply_term() {
+        let mut message = Message::request_vote_reply(Term::new(10), NodeId::new(1), true);
+
+        message.handle_snapshot_installed(pos(12, 5));
+
+        assert_eq!(
+            message,
+            Message::request_vote_reply(Term::new(10), NodeId::new(1), true)
+        );
+    }
+
+    #[test]
+    fn handle_snapshot_installed_keeps_append_entries_reply_term() {
+        let mut message = Message::append_entries_reply(
+            Term::new(10),
+            NodeId::new(1),
+            NodeGeneration::new(2),
+            pos(10, 3),
+        );
+
+        message.handle_snapshot_installed(pos(12, 5));
+
+        assert_eq!(
+            message,
+            Message::append_entries_reply(
+                Term::new(10),
+                NodeId::new(1),
+                NodeGeneration::new(2),
+                pos(12, 5),
+            )
+        );
+    }
+
+    fn pos(term: u64, index: u64) -> LogPosition {
+        LogPosition::new(Term::new(term), LogIndex::new(index))
     }
 }
