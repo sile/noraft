@@ -582,6 +582,70 @@ fn same_index_different_term_tail_is_truncated_before_replication() {
 }
 
 #[test]
+fn follower_rewrites_from_common_prefix_when_repair_term_is_outside_local_log() {
+    let leader_term = t(4);
+    let follower_log = Log::new(
+        ClusterConfig::new(),
+        LogEntries::from_iter(
+            LogPosition::ZERO,
+            [
+                term_entry(t(1)),
+                LogEntry::Command,
+                LogEntry::Command,
+                term_entry(t(3)),
+            ],
+        ),
+    );
+    let mut follower = TestNode {
+        inner: Node::restart(
+            id(1),
+            NodeGeneration::new(1),
+            leader_term,
+            Some(id(0)),
+            follower_log,
+        ),
+        actions: Actions::default(),
+    };
+    assert_action!(follower, set_election_timeout());
+    assert_no_action!(follower);
+
+    let repair_entries = LogEntries::from_iter(
+        log_pos(t(1), i(3)),
+        [LogEntry::Command, LogEntry::Command, term_entry(t(2))],
+    );
+    let repair_call = Message::AppendEntriesCall {
+        from: id(0),
+        term: leader_term,
+        commit_index: i(6),
+        entries: repair_entries.clone(),
+    };
+
+    follower.handle_message(&repair_call);
+
+    let reply = append_entries_reply(&repair_call, &follower);
+    assert_eq!(follower.commit_index(), i(6));
+    assert_eq!(
+        follower
+            .log()
+            .entries()
+            .iter_with_positions()
+            .collect::<Vec<_>>(),
+        vec![
+            (log_pos(t(1), i(1)), term_entry(t(1))),
+            (log_pos(t(1), i(2)), LogEntry::Command),
+            (log_pos(t(1), i(3)), LogEntry::Command),
+            (log_pos(t(1), i(4)), LogEntry::Command),
+            (log_pos(t(1), i(5)), LogEntry::Command),
+            (log_pos(t(2), i(6)), term_entry(t(2))),
+        ]
+    );
+    assert_action!(follower, append_log_entries(&repair_entries));
+    assert_action!(follower, send_message(id(0), &reply));
+    assert_action!(follower, set_election_timeout());
+    assert_no_action!(follower);
+}
+
+#[test]
 fn snapshot() {
     let mut cluster = ThreeNodeCluster::new();
     cluster.init_cluster();

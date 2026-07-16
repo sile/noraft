@@ -479,15 +479,30 @@ impl LogEntries {
                 .expect("unreachable");
         }
 
+        // This method only best-effort minimizes the delta to append.
+        // It keeps the latest position that is proven to be common, and
+        // `append()` will truncate the local suffix after that position.
         let mut last_common_position = self.prev_position;
         for (&index, &term) in &self.terms {
             let position = LogPosition { term, index };
-            if !local_entries.contains(position) {
-                last_common_position.index = LogIndex::new(index.get() - 1);
-                debug_assert!(local_entries.contains(last_common_position));
-                return self.since(last_common_position).expect("unreachable");
+            if local_entries.contains(position) {
+                last_common_position = position;
+                continue;
             }
-            last_common_position.term = term;
+
+            // The entry immediately before a mismatching Term boundary may
+            // still be common, but that boundary can also be beyond the local
+            // range. Only use the predecessor after verifying it locally.
+            let candidate = LogPosition {
+                term: last_common_position.term,
+                index: LogIndex::new(index.get() - 1),
+            };
+            if local_entries.contains(candidate) {
+                last_common_position = candidate;
+            }
+            return self
+                .since(last_common_position)
+                .expect("last_common_position is derived from this log");
         }
 
         // self.terms is empty
@@ -855,6 +870,34 @@ mod tests {
                 .strip_common_prefix(&local_entries)
                 .prev_position,
             pos(1, 4)
+        );
+    }
+
+    #[test]
+    fn log_entries_strip_common_prefix_falls_back_when_term_is_outside_local_range() {
+        let local_entries = entries(
+            LogPosition::ZERO,
+            &[
+                LogEntry::Term(Term::new(1)),
+                LogEntry::Command,
+                LogEntry::Command,
+                LogEntry::Term(Term::new(3)),
+            ],
+        );
+        let remote_entries = entries(
+            pos(1, 3),
+            &[
+                LogEntry::Command,
+                LogEntry::Command,
+                LogEntry::Term(Term::new(2)),
+            ],
+        );
+
+        assert!(local_entries.contains(remote_entries.prev_position()));
+        assert!(!local_entries.contains(remote_entries.last_position()));
+        assert_eq!(
+            remote_entries.strip_common_prefix(&local_entries),
+            remote_entries
         );
     }
 
