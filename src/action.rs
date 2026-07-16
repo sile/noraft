@@ -50,8 +50,12 @@ pub enum Action {
     /// They may include entries that are already present in storage when the node chooses a conservative common prefix to repair divergence.
     /// Implementations should treat [`LogEntries::prev_position()`](crate::LogEntries::prev_position) as the overwrite anchor and replace the persisted suffix after that position with these entries.
     ///
-    /// To guarantee properties by the Raft algorithm, the entries must be appended before responding to users or other nodes.
-    /// (However, because writing all log entries to persistent storage synchronously could be too costly, in reality, the entries are often written asynchronously.)
+    /// To guarantee properties by the Raft algorithm, entries that may become visible as committed
+    /// must be durably appended before responding to users, processing replies that can commit the entries,
+    /// or sending messages that expose the committed state to other nodes.
+    /// Integrations that perform storage writes asynchronously for performance must do so with the
+    /// understanding that some Raft guarantees may no longer hold if later effects observe entries
+    /// before they are durable.
     AppendLogEntries(LogEntries),
 
     /// Send a message to a specific node.
@@ -89,6 +93,12 @@ pub enum Action {
 /// Instead, they can use the [`Iterator`] interface of [`Actions`].
 /// When [`Actions::next()`] is called, the most prioritized action is returned.
 ///
+/// The iterator yields local storage actions before outbound network actions by default.
+/// This avoids exposing a newly committed entry to non-voters before the leader's local log is durable.
+/// Integrations may inspect the public fields and pipeline outbound messages earlier, for example to
+/// overlap replication with storage writes, but then they are responsible for any loss of Raft
+/// guarantees caused by entries becoming visible before they are durable.
+///
 /// Note that any unconsumed actions are merged, so users can achieve pipelining simply by calling multiple [`Node`](crate::Node) methods (such as [`Node::propose_command()`](crate::Node::propose_command)), and then execute the final actions.
 #[derive(Debug, Default, Clone)]
 pub struct Actions {
@@ -101,11 +111,11 @@ pub struct Actions {
     /// If [`true`], [`Action::SaveVotedFor`] needs to be executed.
     pub save_voted_for: bool,
 
-    /// If [`Some`], [`Action::BroadcastMessage`] needs to be executed.
-    pub broadcast_message: Option<Message>,
-
     /// If [`Some`], [`Action::AppendLogEntries`] needs to be executed.
     pub append_log_entries: Option<LogEntries>,
+
+    /// If [`Some`], [`Action::BroadcastMessage`] needs to be executed.
+    pub broadcast_message: Option<Message>,
 
     /// If there is an entry for a node, [`Action::SendMessage`] for the node needs to be executed.
     pub send_messages: BTreeMap<NodeId, Message>,
@@ -175,11 +185,15 @@ impl Iterator for Actions {
             self.save_voted_for = false;
             return Some(Action::SaveVotedFor);
         }
-        if let Some(broadcast_message) = self.broadcast_message.take() {
-            return Some(Action::BroadcastMessage(broadcast_message));
-        }
         if let Some(log_entries) = self.append_log_entries.take() {
             return Some(Action::AppendLogEntries(log_entries));
+        }
+        // Local persistence is prioritized over outbound messages so a solo voter
+        // with non-voters does not publish a committed entry before the leader log
+        // is durable. Integrations that pipeline messages earlier are responsible
+        // for any loss of Raft guarantees caused by asynchronous persistence.
+        if let Some(broadcast_message) = self.broadcast_message.take() {
+            return Some(Action::BroadcastMessage(broadcast_message));
         }
         if let Some((node_id, message)) = self.send_messages.pop_first() {
             return Some(Action::SendMessage(node_id, message));
@@ -292,6 +306,25 @@ mod tests {
             actions.next(),
             Some(Action::InstallSnapshot(NodeId::new(3)))
         );
+        assert_eq!(actions.next(), None);
+    }
+
+    #[test]
+    fn actions_iter_prioritizes_log_append_before_broadcast() {
+        let mut actions = Actions::default();
+        let entries = LogEntries::from_iter(pos(2, 3), core::iter::once(LogEntry::Command));
+        let message = Message::append_entries_call(
+            Term::new(2),
+            NodeId::new(3),
+            LogIndex::new(4),
+            LogEntries::new(pos(2, 4)),
+        );
+
+        actions.set(Action::BroadcastMessage(message.clone()));
+        actions.set(Action::AppendLogEntries(entries.clone()));
+
+        assert_eq!(actions.next(), Some(Action::AppendLogEntries(entries)));
+        assert_eq!(actions.next(), Some(Action::BroadcastMessage(message)));
         assert_eq!(actions.next(), None);
     }
 
