@@ -46,6 +46,9 @@ pub enum Action {
     ///
     /// Note that previously written log suffix entries may be overwritten by these new entries.
     /// In other words, the [`LogEntries::last_position().index`](crate::LogEntries::last_position) can be any value within the range from the start index to the end index of the local log.
+    /// The supplied entries are not guaranteed to be the minimal missing suffix.
+    /// They may include entries that are already present in storage when the node chooses a conservative common prefix to repair divergence.
+    /// Implementations should treat [`LogEntries::prev_position()`](crate::LogEntries::prev_position) as the overwrite anchor and replace the persisted suffix after that position with these entries.
     ///
     /// To guarantee properties by the Raft algorithm, the entries must be appended before responding to users or other nodes.
     /// (However, because writing all log entries to persistent storage synchronously could be too costly, in reality, the entries are often written asynchronously.)
