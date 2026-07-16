@@ -427,10 +427,11 @@ impl LogEntries {
     /// assert_eq!(entries.get_entry(noraft::LogIndex::new(1)), None);
     /// ```
     pub fn truncate(&mut self, len: usize) {
-        let last_index = LogIndex::new(self.prev_position.index.get() + len as u64);
-        if self.last_position.index <= last_index {
+        if self.len() <= len {
             return;
         }
+
+        let last_index = LogIndex::new(self.prev_position.index.get() + len as u64);
         let Some(last_term) = self.get_term(last_index) else {
             unreachable!();
         };
@@ -772,6 +773,23 @@ mod tests {
         assert_eq!(entries.get_entry(i(2)), Some(LogEntry::Command));
         assert_eq!(entries.get_entry(i(3)), Some(LogEntry::Term(Term::new(3))));
         assert_eq!(entries.get_entry(i(4)), Some(LogEntry::Command));
+    }
+
+    #[test]
+    fn log_entries_truncate_with_large_len_has_no_effect() {
+        let mut entries = entries(
+            pos(1, 5),
+            &[
+                LogEntry::Command,
+                LogEntry::Term(Term::new(2)),
+                LogEntry::Command,
+            ],
+        );
+        let original = entries.clone();
+
+        entries.truncate(usize::MAX);
+
+        assert_eq!(entries, original);
     }
 
     #[test]
