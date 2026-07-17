@@ -918,7 +918,9 @@ impl TestNode {
                 if self.inner.could_be_disruptive_request_vote(&message) {
                     continue;
                 }
-                self.inner.handle_message(&message);
+                self.inner
+                    .handle_message(&message)
+                    .expect("message handling should succeed");
             } else {
                 break;
             }

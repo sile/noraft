@@ -50,7 +50,7 @@
 //!
 //!     // If a message is received, handle it.
 //!     while let Some(message) = try_receive_message() {
-//!         node.handle_message(&message);
+//!         node.handle_message(&message).expect("message handling should succeed");
 //!     }
 //!     # break;
 //! }
@@ -84,7 +84,7 @@ pub use action::{Action, Actions};
 pub use config::ClusterConfig;
 pub use log::{CommitStatus, Log, LogEntries, LogEntry, LogIndex, LogPosition};
 pub use message::Message;
-pub use node::{Node, NodeGeneration, NodeId};
+pub use node::{Error, Node, NodeGeneration, NodeId};
 pub use role::Role;
 
 /// Term.

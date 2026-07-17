@@ -104,6 +104,29 @@ impl From<NodeGeneration> for u64 {
     }
 }
 
+/// Error returned by fallible node operations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Error {
+    /// The local snapshot position conflicts with a leader log.
+    ///
+    /// This cannot happen in a valid Raft execution and suggests corrupted or
+    /// inconsistent persistent state. The crate user should stop using the
+    /// affected node and inspect or rebuild its persistent state.
+    LocalSnapshotMismatch,
+}
+
+impl core::fmt::Display for Error {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::LocalSnapshotMismatch => {
+                f.write_str("local snapshot position conflicts with leader log")
+            }
+        }
+    }
+}
+
+impl core::error::Error for Error {}
+
 /// Raft node.
 #[derive(Debug, Clone)]
 pub struct Node {
@@ -750,12 +773,12 @@ impl Node {
         }
     }
 
-    fn append_log_entries_from_leader(&mut self, entries: &LogEntries) -> bool {
+    fn append_log_entries_from_leader(&mut self, entries: &LogEntries) -> Result<bool, Error> {
         debug_assert!(self.role().is_follower());
 
         if self.log.entries().contains(entries.last_position()) {
             // Already up-to-date.
-            return self.log().last_position() == entries.last_position();
+            return Ok(self.log().last_position() == entries.last_position());
         }
         if !self.log.entries().contains(entries.prev_position()) {
             // Cannot append.
@@ -779,13 +802,10 @@ impl Node {
                         entries.prev_position().index.get()
                     );
                 } else {
-                    // The local snapshot does not match the leader's log.
-                    // Such a situation should never occur if the Raft properties are satisfied.
-                    // Although this is very unusual, we will reset the log and request the leader's snapshot.
-                    self.log = Log::new(ClusterConfig::new(), LogEntries::new(LogPosition::ZERO));
+                    return Err(Error::LocalSnapshotMismatch);
                 }
             }
-            return false;
+            return Ok(false);
         }
 
         // Append.
@@ -793,7 +813,7 @@ impl Node {
         self.log.entries_mut().append(&entries);
         self.actions.set(Action::AppendLogEntries(entries));
 
-        true
+        Ok(true)
     }
 
     fn set_current_term(&mut self, term: Term) {
@@ -851,6 +871,12 @@ impl Node {
     /// To pre-filter such messages, call [`Node::could_be_disruptive_request_vote`]
     /// before invoking this method.
     ///
+    /// # Errors
+    ///
+    /// If this method returns [`Err`], the node has detected a state that cannot
+    /// occur in a valid Raft execution. The crate user should stop using this node
+    /// and inspect or rebuild its persistent state.
+    ///
     /// # Examples
     ///
     /// ```
@@ -859,16 +885,16 @@ impl Node {
     ///
     /// let msg = /* ... ; */
     /// # noraft::Message::RequestVoteReply { from: noraft::NodeId::new(1), term: noraft::Term::new(1), vote_granted: true };
-    /// node.handle_message(&msg);
+    /// node.handle_message(&msg).expect("message handling should succeed");
     ///
     /// // Execute actions queued by the message handling.
     /// for action in node.actions_mut() {
     ///     // ...
     /// }
     /// ```
-    pub fn handle_message(&mut self, msg: &Message) {
+    pub fn handle_message(&mut self, msg: &Message) -> Result<(), Error> {
         if msg.from() == self.id {
-            return;
+            return Ok(());
         }
         if self.current_term < msg.term() {
             self.transition_to_follower(msg.term());
@@ -890,7 +916,7 @@ impl Node {
                 term,
                 commit_index,
                 entries,
-            } => self.handle_append_entries_call(*from, *term, *commit_index, entries),
+            } => self.handle_append_entries_call(*from, *term, *commit_index, entries)?,
             Message::AppendEntriesReply {
                 from,
                 term,
@@ -898,6 +924,8 @@ impl Node {
                 last_position,
             } => self.handle_append_entries_reply(*from, *term, *generation, *last_position),
         }
+
+        Ok(())
     }
 
     fn handle_request_vote_call(&mut self, from: NodeId, term: Term, last_position: LogPosition) {
@@ -974,16 +1002,16 @@ impl Node {
         term: Term,
         leader_commit: LogIndex,
         entries: &LogEntries,
-    ) {
+    ) -> Result<(), Error> {
         if term < self.current_term {
             // Needs to reply to update the sender's term.
             self.reply_append_entries(from);
-            return;
+            return Ok(());
         }
 
         if self.role().is_leader() {
             // A same-term leader conflict cannot happen in a correct Raft execution.
-            return;
+            return Ok(());
         }
 
         if !self.role().is_follower() {
@@ -995,7 +1023,7 @@ impl Node {
             self.set_voted_for(Some(from));
         }
 
-        let no_divergence = self.append_log_entries_from_leader(entries);
+        let no_divergence = self.append_log_entries_from_leader(entries)?;
         if no_divergence {
             let next_commit_index = leader_commit.min(self.log.last_position().index);
             if self.commit_index < next_commit_index {
@@ -1005,6 +1033,7 @@ impl Node {
 
         self.reply_append_entries(from);
         self.actions.set(Action::SetElectionTimeout);
+        Ok(())
     }
 
     fn handle_append_entries_reply(
