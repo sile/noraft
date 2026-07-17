@@ -444,16 +444,66 @@ impl LogEntries {
         self.configs.split_off(&last_index.next());
     }
 
-    pub(crate) fn since(&self, new_prev_position: LogPosition) -> Option<Self> {
+    /// Returns the suffix after `new_prev_position`.
+    ///
+    /// The returned [`LogEntries`] has `new_prev_position` as its previous position
+    /// and contains all entries after that position.
+    ///
+    /// This method returns [`None`] if `new_prev_position` is not contained in this
+    /// [`LogEntries`] instance. The position must match both the index and the term.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// fn pos(term: u64, index: u64) -> noraft::LogPosition {
+    ///     noraft::LogPosition {
+    ///         term: noraft::Term::new(term),
+    ///         index: noraft::LogIndex::new(index),
+    ///     }
+    /// }
+    ///
+    /// let entries = noraft::LogEntries::from_iter(
+    ///     noraft::LogPosition::ZERO,
+    ///     vec![
+    ///         noraft::LogEntry::Term(noraft::Term::ZERO),
+    ///         noraft::LogEntry::Command,
+    ///         noraft::LogEntry::Term(noraft::Term::new(1)),
+    ///         noraft::LogEntry::Command,
+    ///     ],
+    /// );
+    ///
+    /// let suffix = entries.since(pos(0, 2)).expect("position should match");
+    /// assert_eq!(suffix.prev_position(), pos(0, 2));
+    /// assert_eq!(
+    ///     suffix.iter_with_positions().collect::<Vec<_>>(),
+    ///     vec![
+    ///         (pos(1, 3), noraft::LogEntry::Term(noraft::Term::new(1))),
+    ///         (pos(1, 4), noraft::LogEntry::Command),
+    ///     ],
+    /// );
+    ///
+    /// assert_eq!(entries.since(pos(0, 3)), None); // Term mismatch.
+    /// ```
+    pub fn since(&self, new_prev_position: LogPosition) -> Option<Self> {
         if !self.contains(new_prev_position) {
             return None;
         }
 
-        let mut this = self.clone();
-        this.prev_position = new_prev_position;
-        this.terms = this.terms.split_off(&new_prev_position.index.next());
-        this.configs = this.configs.split_off(&new_prev_position.index.next());
-        Some(this)
+        let next_index = new_prev_position.index.next();
+        Some(Self {
+            prev_position: new_prev_position,
+            last_position: self.last_position,
+            terms: self
+                .terms
+                .range(next_index..)
+                .map(|(index, term)| (*index, *term))
+                .collect(),
+            configs: self
+                .configs
+                .range(next_index..)
+                .map(|(index, config)| (*index, config.clone()))
+                .collect(),
+        })
     }
 
     pub(crate) fn append(&mut self, entries: &Self) {
@@ -850,6 +900,13 @@ mod tests {
                 (pos(1, 5), LogEntry::Command)
             ])
         );
+
+        let suffix = entries
+            .since(pos(1, 5))
+            .expect("last position should be a valid suffix boundary");
+        assert!(suffix.is_empty());
+        assert_eq!(suffix.prev_position(), pos(1, 5));
+        assert_eq!(suffix.last_position(), pos(1, 5));
 
         assert_eq!(entries.since(pos(0, 3)), None); // Term mismatch
     }
