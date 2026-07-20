@@ -1,6 +1,6 @@
 [package]
 name = "noraft"
-version = "0.6.1"
+version = "0.6.2"
 edition = "2024"
 license = "MIT"
 description = "Minimal, feature-complete no_std Raft for Rust - no I/O, no dependencies"

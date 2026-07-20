@@ -48,7 +48,7 @@ checksum = "68ab91017fe16c622486840e4c83c9a37afeff978bd239b5293d61ece587de66"
 
 [[package]]
 name = "noraft"
-version = "0.6.1"
+version = "0.6.2"
 dependencies = [
  "rand",
 ]
