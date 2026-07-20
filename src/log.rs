@@ -48,6 +48,20 @@ impl Log {
         &mut self.entries
     }
 
+    /// Appends a suffix to this log.
+    ///
+    /// This method preserves the snapshot configuration and delegates to
+    /// [`LogEntries::append_suffix()`].
+    ///
+    /// The caller is expected to pass a suffix whose `prev_position()` is
+    /// contained in this log.
+    /// Returns [`true`] if the suffix was appended.
+    /// Returns [`false`] and leaves this log unchanged if `suffix.prev_position()`
+    /// is not contained in this log.
+    pub fn append_suffix(&mut self, suffix: &LogEntries) -> bool {
+        self.entries.append_suffix(suffix)
+    }
+
     /// Returns the position of the last entry in this log.
     ///
     /// This is equivalent to `self.entries().last_position()`.
@@ -506,14 +520,67 @@ impl LogEntries {
         })
     }
 
-    pub(crate) fn append(&mut self, entries: &Self) {
-        if self.last_position != entries.prev_position {
-            // Truncate
-            debug_assert!(self.contains(entries.prev_position));
-            self.last_position = entries.prev_position;
-            self.terms.split_off(&self.last_position.index.next());
-            self.configs.split_off(&self.last_position.index.next());
+    /// Appends a suffix to these log entries.
+    ///
+    /// The `suffix.prev_position()` is used as the append anchor.
+    /// The caller is expected to pass a suffix whose append anchor is contained
+    /// in these log entries. A contained position must match both the index and
+    /// the term.
+    /// Local entries after the anchor are replaced by the suffix entries.
+    ///
+    /// Passing an empty suffix truncates local entries after the append anchor.
+    /// This method is intended for applying a known suffix replacement, such as
+    /// replaying persistent append records. It is not equivalent to handling an
+    /// empty AppendEntries RPC heartbeat.
+    ///
+    /// Returns [`true`] if the suffix was appended.
+    /// Returns [`false`] and leaves these log entries unchanged if
+    /// `suffix.prev_position()` is not contained in these log entries.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let mut entries = noraft::LogEntries::from_iter(
+    ///     noraft::LogPosition::ZERO,
+    ///     [
+    ///         noraft::LogEntry::Term(noraft::Term::ZERO),
+    ///         noraft::LogEntry::Command,
+    ///         noraft::LogEntry::Term(noraft::Term::new(1)),
+    ///     ],
+    /// );
+    /// let suffix = noraft::LogEntries::from_iter(
+    ///     noraft::LogPosition::new(noraft::Term::ZERO, noraft::LogIndex::new(2)),
+    ///     [
+    ///         noraft::LogEntry::Term(noraft::Term::new(2)),
+    ///         noraft::LogEntry::Command,
+    ///     ],
+    /// );
+    ///
+    /// assert!(entries.append_suffix(&suffix));
+    ///
+    /// assert_eq!(entries.last_position(), suffix.last_position());
+    /// assert_eq!(
+    ///     entries.get_entry(noraft::LogIndex::new(3)),
+    ///     Some(noraft::LogEntry::Term(noraft::Term::new(2))),
+    /// );
+    /// ```
+    pub fn append_suffix(&mut self, suffix: &Self) -> bool {
+        if !self.contains(suffix.prev_position) {
+            return false;
         }
+        self.append_unchecked(suffix);
+        true
+    }
+
+    pub(crate) fn append(&mut self, entries: &Self) {
+        self.append_unchecked(entries);
+    }
+
+    fn append_unchecked(&mut self, entries: &Self) {
+        debug_assert!(self.contains(entries.prev_position));
+        self.last_position = entries.prev_position;
+        self.terms.split_off(&self.last_position.index.next());
+        self.configs.split_off(&self.last_position.index.next());
 
         self.terms.extend(&entries.terms);
         self.configs
@@ -860,6 +927,111 @@ mod tests {
         assert_eq!(entries.get_entry(i(2)), Some(LogEntry::Command));
         assert_eq!(entries.get_entry(i(3)), Some(LogEntry::Term(Term::new(3))));
         assert_eq!(entries.get_entry(i(4)), Some(LogEntry::Command));
+    }
+
+    #[test]
+    fn log_entries_append_suffix_replaces_local_suffix() {
+        let mut local_entries = entries(
+            LogPosition::ZERO,
+            &[
+                LogEntry::Term(Term::ZERO),
+                LogEntry::Command,
+                LogEntry::Term(Term::new(1)),
+            ],
+        );
+        let suffix = entries(
+            pos(0, 2),
+            &[LogEntry::Term(Term::new(2)), LogEntry::Command],
+        );
+
+        assert!(local_entries.append_suffix(&suffix));
+
+        assert_eq!(local_entries.last_position(), pos(2, 4));
+        assert_eq!(
+            local_entries.iter_with_positions().collect::<Vec<_>>(),
+            vec![
+                (pos(0, 1), LogEntry::Term(Term::ZERO)),
+                (pos(0, 2), LogEntry::Command),
+                (pos(2, 3), LogEntry::Term(Term::new(2))),
+                (pos(2, 4), LogEntry::Command),
+            ]
+        );
+    }
+
+    #[test]
+    fn log_entries_append_suffix_truncates_with_empty_suffix() {
+        let mut entries = entries(
+            LogPosition::ZERO,
+            &[
+                LogEntry::Term(Term::ZERO),
+                LogEntry::Command,
+                LogEntry::Term(Term::new(1)),
+            ],
+        );
+        let suffix = LogEntries::new(pos(0, 2));
+
+        assert!(entries.append_suffix(&suffix));
+
+        assert_eq!(entries.prev_position(), LogPosition::ZERO);
+        assert_eq!(entries.last_position(), pos(0, 2));
+        assert_eq!(entries.get_entry(i(3)), None);
+    }
+
+    #[test]
+    fn log_entries_append_suffix_returns_false_for_missing_anchor() {
+        let mut local_entries = entries(
+            LogPosition::ZERO,
+            &[
+                LogEntry::Term(Term::ZERO),
+                LogEntry::Command,
+                LogEntry::Term(Term::new(1)),
+            ],
+        );
+        let suffix = entries(pos(0, 3), &[LogEntry::Command]);
+        let original = local_entries.clone();
+
+        let appended = local_entries.append_suffix(&suffix);
+
+        assert!(!appended);
+        assert_eq!(suffix.prev_position(), pos(0, 3));
+        assert_eq!(local_entries, original);
+    }
+
+    #[test]
+    fn log_append_suffix_preserves_snapshot_config() {
+        let mut snapshot_config = ClusterConfig::new();
+        snapshot_config.voters.insert(NodeId::new(1));
+        let mut log = Log::new(
+            snapshot_config.clone(),
+            entries(
+                LogPosition::ZERO,
+                &[
+                    LogEntry::Term(Term::ZERO),
+                    LogEntry::Command,
+                    LogEntry::Term(Term::new(1)),
+                ],
+            ),
+        );
+        let suffix = entries(
+            pos(0, 2),
+            &[LogEntry::Term(Term::new(2)), LogEntry::Command],
+        );
+
+        assert!(log.append_suffix(&suffix));
+
+        assert_eq!(log.snapshot_config(), &snapshot_config);
+        assert_eq!(
+            log.entries(),
+            &entries(
+                LogPosition::ZERO,
+                &[
+                    LogEntry::Term(Term::ZERO),
+                    LogEntry::Command,
+                    LogEntry::Term(Term::new(2)),
+                    LogEntry::Command,
+                ]
+            )
+        );
     }
 
     #[test]
