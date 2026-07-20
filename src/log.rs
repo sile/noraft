@@ -624,7 +624,15 @@ impl LogIndex {
         self.0
     }
 
-    pub(crate) const fn next(self) -> Self {
+    /// Returns the next log index.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let index = noraft::LogIndex::new(3);
+    /// assert_eq!(index.next(), noraft::LogIndex::new(4));
+    /// ```
+    pub const fn next(self) -> Self {
         Self(self.0 + 1)
     }
 }
@@ -688,11 +696,37 @@ impl LogPosition {
     /// An invalid log position.
     pub const INVALID: Self = Self::new(Term::new(u64::MAX), LogIndex::ZERO);
 
-    pub(crate) const fn new(term: Term, index: LogIndex) -> Self {
+    /// Makes a new [`LogPosition`] instance.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let position = noraft::LogPosition::new(
+    ///     noraft::Term::new(2),
+    ///     noraft::LogIndex::new(7),
+    /// );
+    /// assert_eq!(position.term, noraft::Term::new(2));
+    /// assert_eq!(position.index, noraft::LogIndex::new(7));
+    /// ```
+    pub const fn new(term: Term, index: LogIndex) -> Self {
         Self { term, index }
     }
 
-    pub(crate) const fn next(self) -> Self {
+    /// Returns the position at the next log index in the same term.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let position = noraft::LogPosition::new(
+    ///     noraft::Term::new(2),
+    ///     noraft::LogIndex::new(7),
+    /// );
+    /// assert_eq!(
+    ///     position.next(),
+    ///     noraft::LogPosition::new(noraft::Term::new(2), noraft::LogIndex::new(8)),
+    /// );
+    /// ```
+    pub const fn next(self) -> Self {
         Self::new(self.term, self.index.next())
     }
 
@@ -1037,6 +1071,20 @@ mod tests {
             remote_entries.strip_common_prefix(&local_entries),
             remote_entries
         );
+    }
+
+    #[test]
+    fn log_index_next() {
+        assert_eq!(i(7).next(), i(8));
+    }
+
+    #[test]
+    fn log_position_new_and_next() {
+        let position = LogPosition::new(Term::new(3), i(7));
+
+        assert_eq!(position.term, Term::new(3));
+        assert_eq!(position.index, i(7));
+        assert_eq!(position.next(), pos(3, 8));
     }
 
     #[test]
