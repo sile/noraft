@@ -127,6 +127,121 @@ impl core::fmt::Display for Error {
 
 impl core::error::Error for Error {}
 
+/// Cumulative counters for internal Raft-protocol events observed by a [`Node`].
+///
+/// Each [`Node`] owns a [`NodeMetrics`] instance, obtainable via [`Node::metrics`].
+/// All counters are [`u64`] and are updated with saturating addition, so they clamp
+/// at [`u64::MAX`] rather than wrapping.
+///
+/// # Interpretation
+///
+/// An increase in any counter alone does not confirm a protocol violation, a
+/// storage failure, or a bug. Message reordering, duplication, delayed delivery,
+/// and leader changes are all part of normal operation in a distributed system,
+/// and each of them can legitimately increase one or more counters. Treat
+/// sustained or unusually rapid growth as a signal to start an investigation
+/// rather than as a definitive diagnosis.
+///
+/// [`NodeMetrics::append_entries_replies_ignored_behind_match_index`] and
+/// [`NodeMetrics::term_advances_from_messages`] deserve particular care in
+/// interpretation; see their field documentation for details.
+///
+/// # Lifecycle
+///
+/// Counters accumulate over the lifetime of the [`Node`] instance. They are not
+/// reset on role transitions between follower, candidate, and leader. They are
+/// not carried across [`Node::start`] or [`Node::restart`], and they are not part
+/// of the persistent Raft state.
+///
+/// Cloning a [`Node`] copies the current counter values.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct NodeMetrics {
+    /// Number of times [`Node::handle_message`] observed a message whose sender
+    /// is this node itself.
+    pub self_messages_ignored: u64,
+
+    /// Number of times an incoming message carried a term greater than the
+    /// current term, causing this node to step down to follower.
+    ///
+    /// This counter also increases during normal leader elections, so a single
+    /// increment is not by itself abnormal. Rapid growth over a short window can
+    /// indicate an election storm or a network partition.
+    pub term_advances_from_messages: u64,
+
+    /// Number of times a `RequestVoteCall` was rejected because its term was
+    /// smaller than the current term.
+    pub request_vote_calls_rejected_by_old_term: u64,
+
+    /// Number of times a `RequestVoteCall` was rejected because the
+    /// candidate's last log position was older than this node's local log.
+    pub request_vote_calls_rejected_by_log: u64,
+
+    /// Number of times a `RequestVoteCall` was rejected because this node had
+    /// already voted for another node in the current term.
+    pub request_vote_calls_rejected_by_existing_vote: u64,
+
+    /// Number of times a `RequestVoteReply` was ignored because its term was
+    /// smaller than the current term.
+    pub request_vote_replies_ignored_from_old_terms: u64,
+
+    /// Number of times a `RequestVoteReply` was ignored because this node was
+    /// not a candidate (that is, it was a follower or a leader).
+    pub request_vote_replies_ignored_while_not_candidate: u64,
+
+    /// Number of times an `AppendEntriesCall` was rejected because its term was
+    /// smaller than the current term.
+    pub append_entries_calls_rejected_by_old_term: u64,
+
+    /// Number of times this node, acting as leader, received an
+    /// `AppendEntriesCall` from another leader in the same term. A correct Raft
+    /// execution never produces this situation.
+    pub same_term_append_entries_calls_received_by_leader: u64,
+
+    /// Number of times this node, acting as follower, detected that an incoming
+    /// `AppendEntriesCall` anchored at an index that exists in the local log but
+    /// with a different term (log divergence detected on the follower side).
+    pub log_divergences_detected_by_follower: u64,
+
+    /// Number of times an `AppendEntriesReply` was ignored because its term was
+    /// smaller than the current term.
+    pub append_entries_replies_ignored_from_old_terms: u64,
+
+    /// Number of times an `AppendEntriesReply` was ignored because this node
+    /// was not a leader (that is, it was a follower or a candidate).
+    pub append_entries_replies_ignored_while_not_leader: u64,
+
+    /// Number of times an `AppendEntriesReply` was ignored because it came from
+    /// a node that the current leader does not track as a follower.
+    pub append_entries_replies_ignored_from_unknown_nodes: u64,
+
+    /// Number of times a follower reported a last log index smaller than the
+    /// index that the leader had already acknowledged for that follower.
+    ///
+    /// Under normal operation this counter increases occasionally due to
+    /// message reordering. Sustained or acute growth during a single leader's
+    /// tenure, combined with a follower whose `match_index` does not advance,
+    /// can indicate log reordering, incorrect persistence ordering, or a
+    /// missing log tail on the follower.
+    pub append_entries_replies_ignored_behind_match_index: u64,
+
+    /// Number of times a follower reported a last log index greater than the
+    /// leader's own last log index.
+    pub append_entries_replies_ahead_of_leader: u64,
+
+    /// Number of times this node, acting as leader, detected that a follower's
+    /// reported last log position had an index present in the leader's log but
+    /// with a different term (log divergence detected on the leader side).
+    pub log_divergences_detected_by_leader: u64,
+
+    /// Number of times this node, being a voter, started a new election by
+    /// transitioning to candidate. The counter is not incremented when a
+    /// non-voter or a removed node attempts to start an election.
+    pub elections_started: u64,
+
+    /// Number of times this node transitioned to leader.
+    pub leaderships_started: u64,
+}
+
 /// Raft node.
 #[derive(Debug, Clone)]
 pub struct Node {
@@ -138,6 +253,7 @@ pub struct Node {
     commit_index: LogIndex,
     actions: Actions,
     role: RoleState,
+    metrics: NodeMetrics,
 }
 
 impl Node {
@@ -293,6 +409,7 @@ impl Node {
             commit_index: LogIndex::ZERO,
             actions: Actions::default(),
             role: RoleState::Follower,
+            metrics: NodeMetrics::default(),
         }
     }
 
@@ -369,8 +486,23 @@ impl Node {
         &mut self.actions
     }
 
+    /// Returns a shared reference to the cumulative counters for this node.
+    ///
+    /// The returned [`NodeMetrics`] is owned by the node and is updated in place
+    /// as protocol events occur. Callers only receive read access, so the
+    /// counters cannot be reset or modified from outside. Scraping the counters
+    /// therefore never copies the whole snapshot.
+    ///
+    /// See [`NodeMetrics`] for the meaning of each counter and for guidance on
+    /// how to interpret their values.
+    pub fn metrics(&self) -> &NodeMetrics {
+        &self.metrics
+    }
+
     fn transition_to_leader(&mut self) {
         debug_assert_eq!(self.voted_for, Some(self.id));
+
+        self.metrics.leaderships_started = self.metrics.leaderships_started.saturating_add(1);
 
         let quorum = Quorum::new(self.config());
         let followers = BTreeMap::new();
@@ -402,6 +534,8 @@ impl Node {
             // Non voter or removed node cannot become a candidate.
             return;
         }
+
+        self.metrics.elections_started = self.metrics.elections_started.saturating_add(1);
 
         self.set_current_term(self.current_term.next());
         self.set_voted_for(Some(self.id));
@@ -787,6 +921,10 @@ impl Node {
                 .entries()
                 .contains_index(entries.prev_position().index)
             {
+                self.metrics.log_divergences_detected_by_follower = self
+                    .metrics
+                    .log_divergences_detected_by_follower
+                    .saturating_add(1);
                 // Remove the divergence entries.
                 // Note that `Action::AppendLogEntries` is not triggered until
                 // the root of the divergence point is identified.
@@ -894,9 +1032,13 @@ impl Node {
     /// ```
     pub fn handle_message(&mut self, msg: &Message) -> Result<(), Error> {
         if msg.from() == self.id {
+            self.metrics.self_messages_ignored =
+                self.metrics.self_messages_ignored.saturating_add(1);
             return Ok(());
         }
         if self.current_term < msg.term() {
+            self.metrics.term_advances_from_messages =
+                self.metrics.term_advances_from_messages.saturating_add(1);
             self.transition_to_follower(msg.term());
         }
 
@@ -930,6 +1072,10 @@ impl Node {
 
     fn handle_request_vote_call(&mut self, from: NodeId, term: Term, last_position: LogPosition) {
         if term < self.current_term {
+            self.metrics.request_vote_calls_rejected_by_old_term = self
+                .metrics
+                .request_vote_calls_rejected_by_old_term
+                .saturating_add(1);
             // Needs to reply to update the sender's term.
             let reply = Message::request_vote_reply(self.current_term, self.id, false);
             self.actions.set(Action::SendMessage(from, reply));
@@ -937,6 +1083,10 @@ impl Node {
         }
 
         if self.log.last_position() > last_position {
+            self.metrics.request_vote_calls_rejected_by_log = self
+                .metrics
+                .request_vote_calls_rejected_by_log
+                .saturating_add(1);
             // Deny the vote without sending an explicit false reply. A negative reply in
             // the candidate's current term would not change the candidate's state in this
             // implementation; the candidate will retry after its election timeout if it
@@ -949,6 +1099,10 @@ impl Node {
         }
 
         if self.voted_for != Some(from) {
+            self.metrics.request_vote_calls_rejected_by_existing_vote = self
+                .metrics
+                .request_vote_calls_rejected_by_existing_vote
+                .saturating_add(1);
             // Deny the vote without sending an explicit false reply. This node is either a
             // candidate, a leader, or has already voted for another node in this term.
             return;
@@ -963,6 +1117,11 @@ impl Node {
 
     fn handle_request_vote_reply(&mut self, from: NodeId, term: Term, vote_granted: bool) {
         let RoleState::Candidate { granted_votes } = &mut self.role else {
+            self.metrics
+                .request_vote_replies_ignored_while_not_candidate = self
+                .metrics
+                .request_vote_replies_ignored_while_not_candidate
+                .saturating_add(1);
             return;
         };
         if !vote_granted {
@@ -970,6 +1129,10 @@ impl Node {
         }
         if term < self.current_term {
             // Delayed (obsolete) reply from an old term.
+            self.metrics.request_vote_replies_ignored_from_old_terms = self
+                .metrics
+                .request_vote_replies_ignored_from_old_terms
+                .saturating_add(1);
             return;
         }
         granted_votes.insert(from);
@@ -1004,12 +1167,21 @@ impl Node {
         entries: &LogEntries,
     ) -> Result<(), Error> {
         if term < self.current_term {
+            self.metrics.append_entries_calls_rejected_by_old_term = self
+                .metrics
+                .append_entries_calls_rejected_by_old_term
+                .saturating_add(1);
             // Needs to reply to update the sender's term.
             self.reply_append_entries(from);
             return Ok(());
         }
 
         if self.role().is_leader() {
+            self.metrics
+                .same_term_append_entries_calls_received_by_leader = self
+                .metrics
+                .same_term_append_entries_calls_received_by_leader
+                .saturating_add(1);
             // A same-term leader conflict cannot happen in a correct Raft execution.
             return Ok(());
         }
@@ -1044,6 +1216,10 @@ impl Node {
         follower_last_position: LogPosition,
     ) {
         if term < self.current_term {
+            self.metrics.append_entries_replies_ignored_from_old_terms = self
+                .metrics
+                .append_entries_replies_ignored_from_old_terms
+                .saturating_add(1);
             // Delayed (obsolete) reply from an old term.
             return;
         }
@@ -1052,19 +1228,35 @@ impl Node {
             followers, quorum, ..
         } = &mut self.role
         else {
+            self.metrics.append_entries_replies_ignored_while_not_leader = self
+                .metrics
+                .append_entries_replies_ignored_while_not_leader
+                .saturating_add(1);
             return;
         };
 
         let Some(follower) = followers.get_mut(&from) else {
+            self.metrics
+                .append_entries_replies_ignored_from_unknown_nodes = self
+                .metrics
+                .append_entries_replies_ignored_from_unknown_nodes
+                .saturating_add(1);
             // Replies from unknown nodes are ignored.
             return;
         };
 
-        if generation < follower.generation
-            || (generation == follower.generation
-                && follower_last_position.index < follower.match_index)
+        if generation < follower.generation {
+            // Delayed reply from an old generation.
+            return;
+        }
+        if generation == follower.generation && follower_last_position.index < follower.match_index
         {
-            // Delayed reply.
+            self.metrics
+                .append_entries_replies_ignored_behind_match_index = self
+                .metrics
+                .append_entries_replies_ignored_behind_match_index
+                .saturating_add(1);
+            // Delayed reply behind the acknowledged match index.
             return;
         }
 
@@ -1102,6 +1294,10 @@ impl Node {
 
         if !self.log.entries().contains(follower_last_position) {
             if let Some(term) = self.log.entries().get_term(follower_last_position.index) {
+                self.metrics.log_divergences_detected_by_leader = self
+                    .metrics
+                    .log_divergences_detected_by_leader
+                    .saturating_add(1);
                 // Delete the follower's last log entry.
                 let index = follower_last_position.index;
                 let call = Message::append_entries_call(
@@ -1112,6 +1308,10 @@ impl Node {
                 );
                 self.actions.set(Action::SendMessage(from, call));
             } else if self.log.last_position().index < follower_last_position.index {
+                self.metrics.append_entries_replies_ahead_of_leader = self
+                    .metrics
+                    .append_entries_replies_ahead_of_leader
+                    .saturating_add(1);
                 // Something seems strange.
                 // However, as the leader log grows, a divergence point will be detected.
             } else {
@@ -1289,5 +1489,408 @@ impl Follower {
             match_index: LogIndex::new(0),
             generation: NodeGeneration::ZERO,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::message::Message;
+
+    fn pos(term: u64, index: u64) -> LogPosition {
+        LogPosition {
+            term: Term::new(term),
+            index: LogIndex::new(index),
+        }
+    }
+
+    fn config(voters: &[NodeId]) -> ClusterConfig {
+        let mut c = ClusterConfig::new();
+        for &v in voters {
+            c.voters.insert(v);
+        }
+        c
+    }
+
+    fn follower(id: NodeId, voters: &[NodeId], term: u64, voted_for: Option<NodeId>) -> Node {
+        let cfg = config(voters);
+        let entries = LogEntries::from_iter(
+            LogPosition::ZERO,
+            core::iter::once(LogEntry::ClusterConfig(cfg.clone())),
+        );
+        Node::restart(
+            id,
+            NodeGeneration::ZERO,
+            Term::new(term),
+            voted_for,
+            Log::new(cfg, entries),
+        )
+    }
+
+    fn drain(node: &mut Node) {
+        while node.actions_mut().next().is_some() {}
+    }
+
+    fn leader_with(id: NodeId, others: &[NodeId]) -> Node {
+        let mut voters = alloc::vec::Vec::from([id]);
+        voters.extend_from_slice(others);
+        let mut node = Node::start(id);
+        node.create_cluster(&voters);
+        drain(&mut node);
+        for &f in others {
+            let msg = Message::request_vote_reply(node.current_term(), f, true);
+            node.handle_message(&msg).unwrap();
+            if node.role().is_leader() {
+                break;
+            }
+        }
+        assert!(node.role().is_leader());
+        drain(&mut node);
+        node.metrics = NodeMetrics::default();
+        node
+    }
+
+    fn candidate_with(id: NodeId, others: &[NodeId]) -> Node {
+        let mut voters = alloc::vec::Vec::from([id]);
+        voters.extend_from_slice(others);
+        let mut node = follower(id, &voters, 0, None);
+        drain(&mut node);
+        node.handle_election_timeout();
+        assert!(node.role().is_candidate());
+        drain(&mut node);
+        node.metrics = NodeMetrics::default();
+        node
+    }
+
+    #[test]
+    fn metrics_default_after_start() {
+        let node = Node::start(NodeId::new(0));
+        assert_eq!(*node.metrics(), NodeMetrics::default());
+    }
+
+    #[test]
+    fn metrics_default_after_restart() {
+        let node = follower(NodeId::new(0), &[NodeId::new(0)], 3, Some(NodeId::new(1)));
+        assert_eq!(*node.metrics(), NodeMetrics::default());
+    }
+
+    #[test]
+    fn self_messages_ignored_counter() {
+        let mut node = Node::start(NodeId::new(0));
+        let msg = Message::request_vote_call(Term::new(1), NodeId::new(0), pos(0, 0));
+        node.handle_message(&msg).unwrap();
+        assert_eq!(node.metrics().self_messages_ignored, 1);
+        assert_eq!(node.metrics().term_advances_from_messages, 0);
+    }
+
+    #[test]
+    fn term_advances_from_messages_counter() {
+        let mut node = follower(NodeId::new(0), &[NodeId::new(0), NodeId::new(1)], 1, None);
+        drain(&mut node);
+        let msg = Message::request_vote_call(Term::new(5), NodeId::new(1), pos(5, 1));
+        node.handle_message(&msg).unwrap();
+        assert_eq!(node.metrics().term_advances_from_messages, 1);
+    }
+
+    #[test]
+    fn request_vote_calls_rejected_by_old_term_counter() {
+        let mut node = follower(NodeId::new(0), &[NodeId::new(0), NodeId::new(1)], 5, None);
+        drain(&mut node);
+        let msg = Message::request_vote_call(Term::new(2), NodeId::new(1), pos(2, 5));
+        node.handle_message(&msg).unwrap();
+        assert_eq!(node.metrics().request_vote_calls_rejected_by_old_term, 1);
+        assert_eq!(node.metrics().request_vote_calls_rejected_by_log, 0);
+        assert_eq!(
+            node.metrics().request_vote_calls_rejected_by_existing_vote,
+            0
+        );
+    }
+
+    #[test]
+    fn request_vote_calls_rejected_by_log_counter() {
+        let mut node = follower(NodeId::new(0), &[NodeId::new(0), NodeId::new(1)], 1, None);
+        drain(&mut node);
+        // Follower's log has ClusterConfig at (term=0, index=1); candidate reports (0, 0).
+        let msg = Message::request_vote_call(Term::new(1), NodeId::new(1), pos(0, 0));
+        node.handle_message(&msg).unwrap();
+        assert_eq!(node.metrics().request_vote_calls_rejected_by_log, 1);
+        assert_eq!(node.metrics().request_vote_calls_rejected_by_old_term, 0);
+    }
+
+    #[test]
+    fn request_vote_calls_rejected_by_existing_vote_counter() {
+        let mut node = follower(
+            NodeId::new(0),
+            &[NodeId::new(0), NodeId::new(1), NodeId::new(2)],
+            3,
+            Some(NodeId::new(1)),
+        );
+        drain(&mut node);
+        // Same term, log check passes (candidate's last_position >= follower's).
+        let msg = Message::request_vote_call(Term::new(3), NodeId::new(2), pos(3, 5));
+        node.handle_message(&msg).unwrap();
+        assert_eq!(
+            node.metrics().request_vote_calls_rejected_by_existing_vote,
+            1
+        );
+    }
+
+    #[test]
+    fn request_vote_replies_ignored_from_old_terms_counter() {
+        let mut node = candidate_with(NodeId::new(0), &[NodeId::new(1), NodeId::new(2)]);
+        // Candidate's term after election timeout is 1; reply carries term 0.
+        assert_eq!(node.current_term(), Term::new(1));
+        let msg = Message::request_vote_reply(Term::new(0), NodeId::new(1), true);
+        node.handle_message(&msg).unwrap();
+        assert_eq!(
+            node.metrics().request_vote_replies_ignored_from_old_terms,
+            1
+        );
+        assert_eq!(
+            node.metrics()
+                .request_vote_replies_ignored_while_not_candidate,
+            0
+        );
+    }
+
+    #[test]
+    fn request_vote_replies_ignored_while_not_candidate_counter() {
+        let mut node = follower(NodeId::new(0), &[NodeId::new(0), NodeId::new(1)], 3, None);
+        drain(&mut node);
+        let msg = Message::request_vote_reply(Term::new(3), NodeId::new(1), true);
+        node.handle_message(&msg).unwrap();
+        assert_eq!(
+            node.metrics()
+                .request_vote_replies_ignored_while_not_candidate,
+            1
+        );
+        assert_eq!(
+            node.metrics().request_vote_replies_ignored_from_old_terms,
+            0
+        );
+    }
+
+    #[test]
+    fn append_entries_calls_rejected_by_old_term_counter() {
+        let mut node = follower(NodeId::new(0), &[NodeId::new(0), NodeId::new(1)], 5, None);
+        drain(&mut node);
+        let call = Message::append_entries_call(
+            Term::new(2),
+            NodeId::new(1),
+            LogIndex::ZERO,
+            LogEntries::new(pos(2, 1)),
+        );
+        node.handle_message(&call).unwrap();
+        assert_eq!(node.metrics().append_entries_calls_rejected_by_old_term, 1);
+    }
+
+    #[test]
+    fn same_term_append_entries_calls_received_by_leader_counter() {
+        let mut node = leader_with(NodeId::new(0), &[NodeId::new(1)]);
+        // Another node claims to be leader at the same term.
+        let call = Message::append_entries_call(
+            node.current_term(),
+            NodeId::new(1),
+            LogIndex::ZERO,
+            LogEntries::new(node.log().last_position()),
+        );
+        node.handle_message(&call).unwrap();
+        assert_eq!(
+            node.metrics()
+                .same_term_append_entries_calls_received_by_leader,
+            1
+        );
+    }
+
+    #[test]
+    fn log_divergences_detected_by_follower_counter() {
+        let mut node = follower(NodeId::new(0), &[NodeId::new(0), NodeId::new(1)], 2, None);
+        drain(&mut node);
+        // Follower has ClusterConfig at (term=0, index=1). Send a call with prev at
+        // (term=999, index=1) — index exists but term differs.
+        let call = Message::append_entries_call(
+            Term::new(2),
+            NodeId::new(1),
+            LogIndex::ZERO,
+            LogEntries::from_iter(pos(999, 1), core::iter::once(LogEntry::Command)),
+        );
+        node.handle_message(&call).unwrap();
+        assert_eq!(node.metrics().log_divergences_detected_by_follower, 1);
+    }
+
+    #[test]
+    fn append_entries_replies_ignored_from_old_terms_counter() {
+        let mut node = leader_with(NodeId::new(0), &[NodeId::new(1)]);
+        let reply = Message::append_entries_reply(
+            Term::new(node.current_term().get() - 1),
+            NodeId::new(1),
+            NodeGeneration::ZERO,
+            node.log().last_position(),
+        );
+        node.handle_message(&reply).unwrap();
+        assert_eq!(
+            node.metrics().append_entries_replies_ignored_from_old_terms,
+            1
+        );
+    }
+
+    #[test]
+    fn append_entries_replies_ignored_while_not_leader_counter() {
+        let mut node = follower(NodeId::new(0), &[NodeId::new(0), NodeId::new(1)], 3, None);
+        drain(&mut node);
+        let reply = Message::append_entries_reply(
+            Term::new(3),
+            NodeId::new(1),
+            NodeGeneration::ZERO,
+            pos(3, 1),
+        );
+        node.handle_message(&reply).unwrap();
+        assert_eq!(
+            node.metrics()
+                .append_entries_replies_ignored_while_not_leader,
+            1
+        );
+    }
+
+    #[test]
+    fn append_entries_replies_ignored_from_unknown_nodes_counter() {
+        let mut node = leader_with(NodeId::new(0), &[NodeId::new(1)]);
+        let reply = Message::append_entries_reply(
+            node.current_term(),
+            NodeId::new(9),
+            NodeGeneration::ZERO,
+            node.log().last_position(),
+        );
+        node.handle_message(&reply).unwrap();
+        assert_eq!(
+            node.metrics()
+                .append_entries_replies_ignored_from_unknown_nodes,
+            1
+        );
+    }
+
+    #[test]
+    fn append_entries_replies_ignored_behind_match_index_counter() {
+        let mut node = leader_with(NodeId::new(0), &[NodeId::new(1)]);
+        // Manually advance follower.match_index so a smaller last_position looks stale.
+        if let RoleState::Leader { followers, .. } = &mut node.role {
+            let f = followers.get_mut(&NodeId::new(1)).unwrap();
+            f.match_index = LogIndex::new(5);
+        }
+        let reply = Message::append_entries_reply(
+            node.current_term(),
+            NodeId::new(1),
+            NodeGeneration::ZERO,
+            pos(node.current_term().get(), 3),
+        );
+        node.handle_message(&reply).unwrap();
+        assert_eq!(
+            node.metrics()
+                .append_entries_replies_ignored_behind_match_index,
+            1
+        );
+    }
+
+    #[test]
+    fn append_entries_replies_ahead_of_leader_counter() {
+        let mut node = leader_with(NodeId::new(0), &[NodeId::new(1)]);
+        let leader_last = node.log().last_position().index.get();
+        let reply = Message::append_entries_reply(
+            node.current_term(),
+            NodeId::new(1),
+            NodeGeneration::ZERO,
+            pos(node.current_term().get(), leader_last + 10),
+        );
+        node.handle_message(&reply).unwrap();
+        assert_eq!(node.metrics().append_entries_replies_ahead_of_leader, 1);
+    }
+
+    #[test]
+    fn log_divergences_detected_by_leader_counter() {
+        let mut node = leader_with(NodeId::new(0), &[NodeId::new(1)]);
+        let last_index = node.log().last_position().index;
+        // The leader's log has an entry at last_index; report a different term at the
+        // same index so contains() fails but get_term() returns Some.
+        let reply = Message::append_entries_reply(
+            node.current_term(),
+            NodeId::new(1),
+            NodeGeneration::ZERO,
+            LogPosition {
+                term: Term::new(999),
+                index: last_index,
+            },
+        );
+        node.handle_message(&reply).unwrap();
+        assert_eq!(node.metrics().log_divergences_detected_by_leader, 1);
+    }
+
+    #[test]
+    fn elections_started_counter() {
+        let mut node = follower(NodeId::new(0), &[NodeId::new(0), NodeId::new(1)], 0, None);
+        drain(&mut node);
+        assert_eq!(node.metrics().elections_started, 0);
+        node.handle_election_timeout();
+        assert_eq!(node.metrics().elections_started, 1);
+    }
+
+    #[test]
+    fn elections_started_not_counted_for_non_voter() {
+        // Node 9 is not a voter in the cluster {0}.
+        let cfg = config(&[NodeId::new(0)]);
+        let entries = LogEntries::from_iter(
+            LogPosition::ZERO,
+            core::iter::once(LogEntry::ClusterConfig(cfg.clone())),
+        );
+        let mut node = Node::restart(
+            NodeId::new(9),
+            NodeGeneration::ZERO,
+            Term::ZERO,
+            None,
+            Log::new(cfg, entries),
+        );
+        drain(&mut node);
+        node.handle_election_timeout();
+        assert_eq!(node.metrics().elections_started, 0);
+    }
+
+    #[test]
+    fn leaderships_started_counter() {
+        // Solo voter transitions to leader immediately in create_cluster.
+        let mut node = Node::start(NodeId::new(0));
+        node.create_cluster(&[NodeId::new(0)]);
+        assert!(node.role().is_leader());
+        assert_eq!(node.metrics().leaderships_started, 1);
+        assert_eq!(node.metrics().elections_started, 1);
+    }
+
+    #[test]
+    fn counters_persist_through_role_transitions() {
+        let mut node = follower(NodeId::new(0), &[NodeId::new(0), NodeId::new(1)], 0, None);
+        drain(&mut node);
+        // Trigger a term advance while still a follower.
+        let msg = Message::request_vote_call(Term::new(5), NodeId::new(1), pos(5, 1));
+        node.handle_message(&msg).unwrap();
+        assert_eq!(node.metrics().term_advances_from_messages, 1);
+        drain(&mut node);
+        // Trigger a candidate → follower transition on election timeout followed by a
+        // higher-term message.
+        node.handle_election_timeout();
+        assert!(node.role().is_candidate());
+        assert_eq!(node.metrics().elections_started, 1);
+        let msg = Message::request_vote_call(Term::new(10), NodeId::new(1), pos(10, 1));
+        node.handle_message(&msg).unwrap();
+        assert!(node.role().is_follower());
+        // Earlier counter values are preserved across role transitions.
+        assert_eq!(node.metrics().elections_started, 1);
+        assert_eq!(node.metrics().term_advances_from_messages, 2);
+    }
+
+    #[test]
+    fn counters_saturate_at_max() {
+        let mut node = Node::start(NodeId::new(0));
+        node.metrics.self_messages_ignored = u64::MAX;
+        let msg = Message::request_vote_call(Term::new(1), NodeId::new(0), pos(0, 0));
+        node.handle_message(&msg).unwrap();
+        assert_eq!(node.metrics().self_messages_ignored, u64::MAX);
     }
 }

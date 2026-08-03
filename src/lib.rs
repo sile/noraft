@@ -84,7 +84,7 @@ pub use action::{Action, Actions};
 pub use config::ClusterConfig;
 pub use log::{CommitStatus, Log, LogEntries, LogEntry, LogIndex, LogPosition};
 pub use message::Message;
-pub use node::{Error, Node, NodeGeneration, NodeId};
+pub use node::{Error, Node, NodeGeneration, NodeId, NodeMetrics};
 pub use role::Role;
 
 /// Term.
