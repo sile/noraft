@@ -12,4 +12,4 @@ categories = ["algorithms", "no-std"]
 [dependencies]
 
 [dev-dependencies]
-rand = "0.10.0"
+noprop = "0.1.0"
