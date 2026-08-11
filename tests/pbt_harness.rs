@@ -2,8 +2,7 @@
 
 use noprop::TestCaseContext;
 use noraft::{
-    ClusterConfig, CommitStatus, Log, LogEntries, LogEntry, LogPosition, Message, Node,
-    NodeGeneration, NodeId, Role, Term,
+    ClusterConfig, CommitStatus, LogEntry, LogPosition, Message, Node, NodeId, Role, Term,
 };
 use std::collections::BTreeMap;
 use std::io::{Error, ErrorKind};
@@ -471,6 +470,7 @@ pub struct TestNode {
     incoming_messages: BTreeMap<(Clock, u64), Message>,
     stop_time: Option<Clock>,
     start_time: Option<Clock>,
+    restarts: u64,
 }
 
 impl TestNode {
@@ -488,19 +488,13 @@ impl TestNode {
             incoming_messages: BTreeMap::new(),
             stop_time: None,
             start_time: None,
+            restarts: 0,
         }
     }
 
-    /// Restarts the node after discarding all durable and in-flight state.
-    pub fn lose_storage(&mut self) {
-        let id = self.inner.id();
-        let generation = NodeGeneration::new(self.inner.generation().get().saturating_add(1));
-        let log = Log::new(ClusterConfig::new(), LogEntries::new(LogPosition::ZERO));
-        self.inner = Node::restart(id, generation, Term::ZERO, None, log);
-        self.timeout_expire_time = None;
-        self.storage_finish_time = None;
-        self.snapshot_finish_time = None;
-        self.incoming_messages.clear();
+    /// Number of times this node has been restarted (never resets).
+    pub fn restarts(&self) -> u64 {
+        self.restarts
     }
 
     fn run_tick(&mut self, ctx: &mut TestCaseContext, now: Clock) {
@@ -520,11 +514,11 @@ impl TestNode {
                 }
                 self.inner = Node::restart(
                     self.inner.id(),
-                    NodeGeneration::new(self.inner.generation().get().saturating_add(1)),
                     self.inner.current_term(),
                     self.inner.voted_for(),
                     self.inner.log().clone(),
                 );
+                self.restarts = self.restarts.saturating_add(1);
             } else {
                 return;
             }

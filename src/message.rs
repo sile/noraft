@@ -1,7 +1,7 @@
 use crate::{
     Term,
     log::{LogEntries, LogIndex, LogPosition},
-    node::{NodeGeneration, NodeId},
+    node::NodeId,
 };
 
 /// Message for RPC.
@@ -62,9 +62,6 @@ pub enum Message {
 
         /// Term of the sender.
         term: Term,
-
-        /// Generation of the sender.
-        generation: NodeGeneration,
 
         /// Last log position of the follower.
         ///
@@ -169,13 +166,11 @@ impl Message {
     pub(crate) fn append_entries_reply(
         term: Term,
         from: NodeId,
-        generation: NodeGeneration,
         last_position: LogPosition,
     ) -> Self {
         Self::AppendEntriesReply {
             from,
             term,
-            generation,
             last_position,
         }
     }
@@ -238,7 +233,6 @@ impl Message {
             }
             Message::AppendEntriesReply {
                 term: _,
-                generation: _,
                 last_position,
                 ..
             } => {
@@ -394,23 +388,13 @@ mod tests {
 
     #[test]
     fn handle_snapshot_installed_keeps_append_entries_reply_term() {
-        let mut message = Message::append_entries_reply(
-            Term::new(10),
-            NodeId::new(1),
-            NodeGeneration::new(2),
-            pos(10, 3),
-        );
+        let mut message = Message::append_entries_reply(Term::new(10), NodeId::new(1), pos(10, 3));
 
         message.handle_snapshot_installed(pos(12, 5));
 
         assert_eq!(
             message,
-            Message::append_entries_reply(
-                Term::new(10),
-                NodeId::new(1),
-                NodeGeneration::new(2),
-                pos(12, 5),
-            )
+            Message::append_entries_reply(Term::new(10), NodeId::new(1), pos(12, 5),)
         );
     }
 

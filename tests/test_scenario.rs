@@ -1,6 +1,6 @@
 use noraft::{
     Action, Actions, ClusterConfig, Error, Log, LogEntries, LogEntry, LogIndex, LogPosition,
-    Message, Node, NodeGeneration, NodeId, Role, Term,
+    Message, Node, NodeId, Role, Term,
 };
 use std::ops::{Deref, DerefMut};
 
@@ -111,7 +111,7 @@ fn local_snapshot_mismatch_returns_error() {
         ClusterConfig::new(),
         LogEntries::from_iter(snapshot_position, [LogEntry::Command]),
     );
-    let mut follower = Node::restart(id(0), NodeGeneration::new(1), t(2), Some(id(1)), log);
+    let mut follower = Node::restart(id(0), t(2), Some(id(1)), log);
     assert_action!(follower, set_election_timeout());
     assert_no_action!(follower);
 
@@ -226,6 +226,56 @@ fn leader_commits_after_shrinking_to_self_only_voter() {
 }
 
 #[test]
+fn append_entries_reply_below_match_index_is_ignored() {
+    let initial_voters = [id(0), id(1)];
+    let mut leader = TestNode::asserted_start(id(0), &initial_voters);
+    let mut follower = TestNode::asserted_start(id(1), &[]);
+
+    leader.handle_election_timeout();
+    assert_eq!(leader.role(), Role::Candidate);
+    assert_action!(leader, set_election_timeout());
+    assert_action!(leader, save_current_term());
+    assert_action!(leader, save_voted_for());
+    let Some(Action::BroadcastMessage(call @ Message::RequestVoteCall { .. })) =
+        leader.actions_mut().next()
+    else {
+        panic!("Expected RequestVoteCall message");
+    };
+    let reply = follower.asserted_handle_request_vote_call_success(&call);
+    let call = leader.asserted_handle_request_vote_reply_majority_vote_granted(&reply);
+    let reply = follower.asserted_handle_append_entries_call_failure(&call);
+    let call = leader.asserted_handle_append_entries_reply_failure(&reply);
+    let reply = follower.asserted_handle_append_entries_call_success(&call);
+    leader.asserted_handle_append_entries_reply_success(&reply, true, false);
+
+    // The leader has now acknowledged the initial config replication.
+    let follower_last = follower.log().last_position();
+    assert!(follower_last.index > LogIndex::ZERO);
+    let commit_before = leader.commit_index();
+    let baseline = leader
+        .metrics()
+        .append_entries_replies_ignored_behind_match_index;
+
+    let stale_reply = Message::AppendEntriesReply {
+        from: follower.id(),
+        term: leader.current_term(),
+        last_position: log_pos(follower_last.term, i(0)),
+    };
+    leader
+        .handle_message(&stale_reply)
+        .expect("delayed reply must be ignored, not error");
+
+    assert_eq!(
+        leader
+            .metrics()
+            .append_entries_replies_ignored_behind_match_index,
+        baseline + 1
+    );
+    assert_eq!(leader.commit_index(), commit_before);
+    assert_no_action!(leader);
+}
+
+#[test]
 fn create_three_nodes_cluster() {
     let mut cluster = ThreeNodeCluster::new();
     cluster.init_cluster();
@@ -261,13 +311,7 @@ fn self_request_vote_call_is_ignored() {
 #[test]
 fn could_be_disruptive_request_vote_true_when_high_term_request_vote_conflicts_with_voted_for() {
     let base = Node::start(id(0));
-    let mut node = Node::restart(
-        id(0),
-        NodeGeneration::new(1),
-        t(2),
-        Some(id(1)),
-        base.log().clone(),
-    );
+    let mut node = Node::restart(id(0), t(2), Some(id(1)), base.log().clone());
     assert_action!(node, set_election_timeout());
     assert_no_action!(node);
 
@@ -292,13 +336,7 @@ fn could_be_disruptive_request_vote_false_for_candidate() {
 #[test]
 fn could_be_disruptive_request_vote_false_for_non_request_vote() {
     let base = Node::start(id(0));
-    let mut node = Node::restart(
-        id(0),
-        NodeGeneration::new(1),
-        t(2),
-        Some(id(1)),
-        base.log().clone(),
-    );
+    let mut node = Node::restart(id(0), t(2), Some(id(1)), base.log().clone());
     assert_action!(node, set_election_timeout());
     assert_no_action!(node);
 
@@ -315,13 +353,7 @@ fn could_be_disruptive_request_vote_false_for_non_request_vote() {
 #[test]
 fn disruptive_request_vote_is_processed_without_prefilter() {
     let base = Node::start(id(0));
-    let mut node = Node::restart(
-        id(0),
-        NodeGeneration::new(1),
-        t(2),
-        Some(id(1)),
-        base.log().clone(),
-    );
+    let mut node = Node::restart(id(0), t(2), Some(id(1)), base.log().clone());
     assert_action!(node, set_election_timeout());
     assert_no_action!(node);
 
@@ -372,7 +404,7 @@ fn high_term_candidate_with_stale_log_is_rejected() {
     assert_eq!(entries.last_position(), log_pos(t(5), i(4)));
 
     let log = Log::new(ClusterConfig::new(), entries);
-    let mut node = Node::restart(id(0), NodeGeneration::new(1), t(5), None, log);
+    let mut node = Node::restart(id(0), t(5), None, log);
     assert_action!(node, set_election_timeout());
     assert_no_action!(node);
 
@@ -482,7 +514,6 @@ fn candidate_accepts_same_term_append_entries_from_leader() {
     let mut leader = TestNode {
         inner: Node::restart(
             id(0),
-            NodeGeneration::new(1),
             t(3),
             None,
             Log::new(ClusterConfig::new(), prefix.clone()),
@@ -499,13 +530,7 @@ fn candidate_accepts_same_term_append_entries_from_leader() {
     assert_eq!(leader.role(), Role::Leader);
 
     let mut candidate = TestNode {
-        inner: Node::restart(
-            id(1),
-            NodeGeneration::new(1),
-            t(3),
-            None,
-            Log::new(ClusterConfig::new(), prefix),
-        ),
+        inner: Node::restart(id(1), t(3), None, Log::new(ClusterConfig::new(), prefix)),
         actions: Actions::default(),
     };
     assert_action!(candidate, set_election_timeout());
@@ -541,7 +566,6 @@ fn follower_accepts_same_term_append_entries_after_voting_for_another_candidate(
     let mut leader = TestNode {
         inner: Node::restart(
             id(0),
-            NodeGeneration::new(1),
             t(3),
             None,
             Log::new(ClusterConfig::new(), prefix.clone()),
@@ -567,7 +591,6 @@ fn follower_accepts_same_term_append_entries_after_voting_for_another_candidate(
     let mut follower = TestNode {
         inner: Node::restart(
             id(3),
-            NodeGeneration::new(1),
             leader.current_term(),
             Some(id(4)),
             Log::new(ClusterConfig::new(), prefix),
@@ -596,7 +619,6 @@ fn restart() {
     assert_eq!(cluster.node1.role(), Role::Follower);
     cluster.node1.inner = Node::restart(
         cluster.node1.id(),
-        NodeGeneration::new(cluster.node1.inner.generation().get() + 1),
         cluster.node1.current_term(),
         cluster.node1.voted_for(),
         cluster.node1.log().clone(),
@@ -689,7 +711,7 @@ fn same_index_different_term_tail_is_truncated_before_replication() {
     );
     let leader_log = Log::new(ClusterConfig::new(), leader_prefix);
     let mut leader = TestNode {
-        inner: Node::restart(id(0), NodeGeneration::new(1), t(3), None, leader_log),
+        inner: Node::restart(id(0), t(3), None, leader_log),
         actions: Actions::default(),
     };
     assert_action!(leader, set_election_timeout());
@@ -716,7 +738,7 @@ fn same_index_different_term_tail_is_truncated_before_replication() {
         ),
     );
     let mut follower = TestNode {
-        inner: Node::restart(id(1), NodeGeneration::new(1), t(3), None, divergent_log),
+        inner: Node::restart(id(1), t(3), None, divergent_log),
         actions: Actions::default(),
     };
     assert_action!(follower, set_election_timeout());
@@ -726,7 +748,6 @@ fn same_index_different_term_tail_is_truncated_before_replication() {
     let divergent_reply = Message::AppendEntriesReply {
         from: follower.id(),
         term: leader.current_term(),
-        generation: follower.generation(),
         last_position: follower.log().last_position(),
     };
     let truncate_call = leader.asserted_handle_append_entries_reply_failure(&divergent_reply);
@@ -777,13 +798,7 @@ fn follower_rewrites_from_common_prefix_when_repair_term_is_outside_local_log() 
         ),
     );
     let mut follower = TestNode {
-        inner: Node::restart(
-            id(1),
-            NodeGeneration::new(1),
-            leader_term,
-            Some(id(0)),
-            follower_log,
-        ),
+        inner: Node::restart(id(1), leader_term, Some(id(0)), follower_log),
         actions: Actions::default(),
     };
     assert_action!(follower, set_election_timeout());
@@ -1481,12 +1496,10 @@ fn append_entries_reply(call: &Message, node: &Node) -> Message {
 
     let term = node.current_term();
     let from = node.id();
-    let generation = node.generation();
     let last_position = node.log().entries().last_position();
     Message::AppendEntriesReply {
         from,
         term,
-        generation,
         last_position,
     }
 }

@@ -7,9 +7,7 @@
 
 pub mod pbt_harness;
 
-use noraft::{
-    Action, Log, LogEntry, LogIndex, LogPosition, Message, Node, NodeGeneration, NodeId, Role, Term,
-};
+use noraft::{Action, Log, LogEntry, LogIndex, LogPosition, Message, Node, NodeId, Role, Term};
 use pbt_harness::run_config;
 use std::cell::Cell;
 use std::collections::{BTreeMap, VecDeque};
@@ -56,7 +54,6 @@ enum CmdKind {
 }
 
 struct CrashedNode {
-    generation: NodeGeneration,
     term: Term,
     voted_for: Option<NodeId>,
     log: Log,
@@ -272,7 +269,6 @@ impl Cluster {
                 self.crashed.insert(
                     id,
                     CrashedNode {
-                        generation: NodeGeneration::new(node.generation().get().saturating_add(1)),
                         term: node.current_term(),
                         voted_for: node.voted_for(),
                         log: node.log().clone(),
@@ -285,8 +281,7 @@ impl Cluster {
                     .crashed
                     .remove(&id)
                     .expect("commands only select crashed nodes");
-                let node =
-                    Node::restart(id, state.generation, state.term, state.voted_for, state.log);
+                let node = Node::restart(id, state.term, state.voted_for, state.log);
                 self.nodes.insert(id, node);
                 self.queues.insert(id, VecDeque::new());
                 self.drain_actions(id)
