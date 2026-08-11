@@ -47,9 +47,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "68ab91017fe16c622486840e4c83c9a37afeff978bd239b5293d61ece587de66"
 
 [[package]]
+name = "noprop"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "827bc70adb92a00321d7cd4fd1db0c7cae5c50ca2ab93d0c32178331cad45a05"
+
+[[package]]
 name = "noraft"
 version = "0.6.2"
 dependencies = [
+ "noprop",
  "rand",
 ]
 
