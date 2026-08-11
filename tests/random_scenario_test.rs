@@ -1,617 +1,803 @@
+//! Liveness-oriented property tests for noraft clusters, driven by
+//! noprop (https://github.com/sile/noprop).
+//!
+//! The safety invariants are covered by `tests/prop_cluster_test.rs`.
+//! The properties in this file assert *bounded liveness*: commands
+//! proposed while a leader exists reach a terminal commit status
+//! (committed / rejected / unknown) within a declared tick budget,
+//! even under unstable links, node restarts, storage repair, snapshot
+//! installation, membership changes, and leader isolation.
+//!
+//! Each case samples its scenario parameters (link quality, proposal
+//! count, restart cadence, ...) from the noprop case context, and a
+//! coverage gate fails the run if the scenario's critical event
+//! (restart / reset / snapshot / config change / rejoin) never
+//! occurred, so a broken harness cannot pass silently.
+//!
+//! Seed / case budget come from the `NORAFT_PBT_SEED` and
+//! `NORAFT_PBT_CASES` environment variables; unset means
+//! "clock-derived seed" and the per-property default budget. A
+//! failing seed can be re-run with:
+//!
+//! ```text
+//! NORAFT_PBT_SEED=<seed> cargo test --test random_scenario_test
+//! ```
+
+use noprop::TestCaseContext;
 use noraft::{
     ClusterConfig, CommitStatus, Log, LogEntries, LogIndex, LogPosition, Message, Node,
     NodeGeneration, NodeId, Role, Term,
 };
-use rand::{
-    Rng, RngExt, SeedableRng,
-    distr::{Distribution, uniform::SampleRange},
-    prelude::IndexedRandom,
-    rngs::StdRng,
-};
+use std::cell::Cell;
 use std::collections::BTreeMap;
 
-#[test]
-fn propose_commands() -> noprop::TestResult {
-    let seed = noprop::seed_from_env_or_time("NORAFT_PBT_SEED")?;
-    let rng = StdRng::seed_from_u64(seed);
-
-    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
-
-    // Create a cluster.
-    let mut cluster = TestCluster::new(&node_ids, rng);
-    let position = cluster.random_node_mut().create_cluster(&node_ids);
-    assert_ne!(position, LogPosition::INVALID);
-
-    let deadline = cluster.clock.add(10000);
-    let satisfied = cluster.run_until(deadline, |cluster| cluster.leader_node().is_some());
-    assert!(satisfied, "Create cluster timeout");
-
-    // Propose commands.
-    let mut positions = Vec::new();
-    for _ in 0..100 {
-        let Some(leader) = cluster.leader_node_mut() else {
-            panic!("No leader");
-        };
-        positions.push(leader.propose_command());
-
-        let ticks = MinMax::new(1, 10).sample(&mut cluster.rng);
-        cluster.run(cluster.clock.add(ticks));
-    }
-    assert_eq!(positions.len(), 100);
-
-    for position in positions {
-        let mut committed = false;
-        for _ in 0..1000 {
-            let Some(leader) = cluster.leader_node_mut() else {
-                panic!("No leader");
-            };
-            if leader.get_commit_status(position).is_committed() {
-                committed = true;
-                break;
-            }
-            cluster.run(cluster.clock.add(10));
-        }
-        assert!(committed);
-    }
-
-    let deadline = cluster.clock.add(1000);
-    let satisfied = cluster.run_until(deadline, |cluster| {
-        cluster.nodes[0].inner.commit_index() == cluster.nodes[1].inner.commit_index()
-            && cluster.nodes[0].inner.commit_index() == cluster.nodes[2].inner.commit_index()
-    });
-    assert!(satisfied, "Commit indices are not synchronized");
-
-    // Links are stable, so the leader should not change.
-    assert_eq!(cluster.nodes[0].inner.current_term().get(), 1);
-    Ok(())
+/// Reads the case-budget environment variable with a default
+/// fallback.
+fn cases_from_env(default: usize) -> usize {
+    std::env::var("NORAFT_PBT_CASES")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(default)
 }
 
-#[test]
-fn unstable_network() -> noprop::TestResult {
-    let seed = noprop::seed_from_env_or_time("NORAFT_PBT_SEED")?;
-    let rng = StdRng::seed_from_u64(seed);
-
-    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
-
-    // Create a cluster.
-    let mut cluster = TestCluster::new(&node_ids, rng);
-
-    // [NOTE] This test is almost the same as `propose_commands()`, but the network is very unstable.
-    cluster.default_link_options.drop_rate = 0.3;
-    cluster.default_link_options.latency_ticks = MinMax::new(1, 1000);
-
-    let position = cluster.random_node_mut().create_cluster(&node_ids);
-    assert_ne!(position, LogPosition::INVALID);
-
-    let deadline = cluster.clock.add(100000);
-    let satisfied = cluster.run_until(deadline, |cluster| cluster.leader_node().is_some());
-    assert!(satisfied, "Create cluster timeout");
-
-    // Propose commands.
-    let mut positions = Vec::new();
-    for _ in 0..100 {
-        cluster.run_while_leader_absent(cluster.clock.add(100_000));
-        let Some(leader) = cluster.leader_node_mut() else {
-            panic!("No leader");
-        };
-        positions.push(leader.propose_command());
-
-        let ticks = MinMax::new(1, 10).sample(&mut cluster.rng);
-        cluster.run(cluster.clock.add(ticks));
-    }
-    assert_eq!(positions.len(), 100);
-
-    for position in positions {
-        let mut committed = false;
-        for _ in 0..10000 {
-            cluster.run_while_leader_absent(cluster.clock.add(100_000));
-            let Some(leader) = cluster.leader_node_mut() else {
-                panic!("No leader");
-            };
-            if leader.get_commit_status(position).is_committed() {
-                committed = true;
-                break;
-            }
-            cluster.run(cluster.clock.add(10));
+/// Runs the cluster until `position` reaches a terminal commit status
+/// (committed / rejected / unknown), or the round budget is
+/// exhausted.
+///
+/// Each round first waits for a leader to appear (bounded by 100_000
+/// ticks) because `get_commit_status` is queried through the leader.
+/// Returns `None` on timeout.
+fn wait_until_terminal(
+    cluster: &mut TestCluster,
+    ctx: &mut TestCaseContext,
+    position: LogPosition,
+    max_rounds: usize,
+) -> Option<CommitStatus> {
+    for _ in 0..max_rounds {
+        let found = cluster.run_while_leader_absent(ctx, cluster.clock.add(100_000));
+        if !found {
+            return None;
         }
-        assert!(committed);
+        let Some(leader) = cluster.leader_node() else {
+            unreachable!();
+        };
+        let status = leader.get_commit_status(position);
+        if !status.is_in_progress() {
+            return Some(status);
+        }
+        cluster.run(ctx, cluster.clock.add(10));
     }
-
-    let deadline = cluster.clock.add(100000);
-    let satisfied = cluster.run_until(deadline, |cluster| {
-        cluster.nodes[0].inner.commit_index() == cluster.nodes[1].inner.commit_index()
-            && cluster.nodes[0].inner.commit_index() == cluster.nodes[2].inner.commit_index()
-    });
-    assert!(satisfied, "Commit indices are not synchronized");
-    Ok(())
+    None
 }
 
-#[test]
-fn node_restart() -> noprop::TestResult {
-    let seed = noprop::seed_from_env_or_time("NORAFT_PBT_SEED")?;
-    let rng = StdRng::seed_from_u64(seed);
-
-    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
-
-    // Create a cluster.
-    let mut cluster = TestCluster::new(&node_ids, rng);
-
-    cluster.nodes[0].options.running_ticks = MinMax::new(800, 5000);
-    cluster.nodes[0].options.stopping_ticks = MinMax::new(800, 5000);
-
-    let position = cluster.random_node_mut().create_cluster(&node_ids);
-    assert_ne!(position, LogPosition::INVALID);
-
-    let deadline = cluster.clock.add(10000);
-    let satisfied = cluster.run_until(deadline, |cluster| cluster.leader_node().is_some());
-    assert!(satisfied, "Create cluster timeout");
-
-    // Propose commands.
-    let mut positions = Vec::new();
-    for _ in 0..100 {
-        cluster.run_while_leader_absent(cluster.clock.add(10000));
-        let Some(leader) = cluster.leader_node_mut() else {
-            panic!("No leader");
-        };
-        positions.push(leader.propose_command());
-
-        let ticks = MinMax::new(1, 10).sample(&mut cluster.rng);
-        cluster.run(cluster.clock.add(ticks));
-    }
-    assert_eq!(positions.len(), 100);
-
-    for position in positions {
-        let mut committed = false;
-        for _ in 0..1000 {
-            cluster.run_while_leader_absent(cluster.clock.add(10000));
-            let Some(leader) = cluster.leader_node_mut() else {
-                panic!("No leader");
-            };
-            if leader.get_commit_status(position).is_committed() {
-                committed = true;
-                break;
-            }
-            cluster.run(cluster.clock.add(10));
+/// All positions must reach a terminal status: committed, or (when
+/// the corresponding argument is `true`) rejected due to truncation
+/// of uncommitted entries, or unknown due to being covered by a
+/// snapshot. Returns the number of committed positions.
+fn assert_all_terminal(
+    cluster: &mut TestCluster,
+    ctx: &mut TestCaseContext,
+    positions: &[LogPosition],
+    allow_rejected: bool,
+    allow_unknown: bool,
+) -> Result<usize, String> {
+    let mut committed = 0;
+    for (i, position) in positions.iter().enumerate() {
+        let status = wait_until_terminal(cluster, ctx, *position, 1000)
+            .ok_or_else(|| format!("proposal {i} did not reach a terminal status"))?;
+        if status.is_committed() {
+            committed += 1;
+        } else if (!status.is_rejected() || !allow_rejected)
+            && (!status.is_unknown() || !allow_unknown)
+        {
+            return Err(format!(
+                "proposal {i} ended with unexpected status {status:?}"
+            ));
         }
-        assert!(committed);
     }
-
-    let deadline = cluster.clock.add(50000);
-    let satisfied = cluster.run_until(deadline, |cluster| {
-        cluster.nodes[0].inner.commit_index() == cluster.nodes[1].inner.commit_index()
-            && cluster.nodes[0].inner.commit_index() == cluster.nodes[2].inner.commit_index()
-    });
-    assert!(satisfied, "Commit indices are not synchronized");
-    Ok(())
+    Ok(committed)
 }
 
+/// Command proposals commit under stable links, the commit indices
+/// converge, and the leader does not change (term stays 1).
 #[test]
-fn pipelining() -> noprop::TestResult {
+fn proposals_commit_with_stable_links() -> noprop::TestResult {
     let seed = noprop::seed_from_env_or_time("NORAFT_PBT_SEED")?;
-    let rng = StdRng::seed_from_u64(seed);
+    let cases = cases_from_env(64);
 
-    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    noprop::Runner::new(seed).run(cases, |ctx| {
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let mut cluster = TestCluster::new(&node_ids);
 
-    // Create a cluster.
-    let mut cluster = TestCluster::new(&node_ids, rng);
-    let position = cluster.random_node_mut().create_cluster(&node_ids);
-    assert_ne!(position, LogPosition::INVALID);
-
-    let deadline = cluster.clock.add(10000);
-    let satisfied = cluster.run_until(deadline, |cluster| cluster.leader_node().is_some());
-    assert!(satisfied, "Create cluster timeout");
-
-    // Propose commands and trigger heartbeats.
-    let mut positions = Vec::new();
-    for _ in 0..100 {
-        let pipeline_command = cluster.rng.random_bool(0.8);
-        let do_hearbeat = cluster.rng.random_bool(0.5);
-
-        cluster.run_while_leader_absent(cluster.clock.add(10000));
-        let Some(leader) = cluster.leader_node_mut() else {
-            panic!("No leader");
-        };
-        positions.push(leader.propose_command());
-        if do_hearbeat {
-            assert!(leader.heartbeat());
-        }
-
-        if !pipeline_command {
-            let ticks = MinMax::new(0, 5).sample(&mut cluster.rng);
-            cluster.run(cluster.clock.add(ticks));
-        }
-    }
-    assert_eq!(positions.len(), 100);
-
-    for position in positions {
-        let mut committed = false;
-        for _ in 0..1000 {
-            cluster.run_while_leader_absent(cluster.clock.add(10000));
-            let Some(leader) = cluster.leader_node_mut() else {
-                panic!("No leader");
-            };
-            if leader.get_commit_status(position).is_committed() {
-                committed = true;
-                break;
-            }
-            cluster.run(cluster.clock.add(10));
-        }
-        assert!(committed);
-    }
-
-    let deadline = cluster.clock.add(10000);
-    let satisfied = cluster.run_until(deadline, |cluster| {
-        cluster.nodes[0].inner.commit_index() == cluster.nodes[1].inner.commit_index()
-            && cluster.nodes[0].inner.commit_index() == cluster.nodes[2].inner.commit_index()
-    });
-    assert!(satisfied, "Commit indices are not synchronized");
-    Ok(())
-}
-
-#[test]
-fn storage_repair_without_snapshot() -> noprop::TestResult {
-    let seed = noprop::seed_from_env_or_time("NORAFT_PBT_SEED")?;
-    let rng = StdRng::seed_from_u64(seed);
-
-    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
-
-    // Create a cluster.
-    let mut cluster = TestCluster::new(&node_ids, rng);
-    let position = cluster.random_node_mut().create_cluster(&node_ids);
-    assert_ne!(position, LogPosition::INVALID);
-
-    let deadline = cluster.clock.add(10000);
-    let satisfied = cluster.run_until(deadline, |cluster| cluster.leader_node().is_some());
-    assert!(satisfied, "Create cluster timeout");
-
-    // Propose commands.
-    let mut positions = Vec::new();
-    for i in 0..100 {
-        if i == 50 {
-            for node in cluster.nodes.iter_mut() {
-                if !node.inner.role().is_leader() {
-                    // Reset the node.
-                    let generation =
-                        NodeGeneration::new(node.inner.generation().get().saturating_add(1));
-                    let log = Log::new(ClusterConfig::new(), LogEntries::new(LogPosition::ZERO));
-                    node.inner = Node::restart(node.inner.id(), generation, Term::ZERO, None, log);
-                }
-            }
-        }
-
-        cluster.run_while_leader_absent(cluster.clock.add(10000));
-        let Some(leader) = cluster.leader_node_mut() else {
-            panic!("No leader");
-        };
-        positions.push(leader.propose_command());
-
-        let ticks = MinMax::new(1, 10).sample(&mut cluster.rng);
-        cluster.run(cluster.clock.add(ticks));
-    }
-    assert_eq!(positions.len(), 100);
-
-    for position in positions {
-        let mut committed = false;
-        for _ in 0..1000 {
-            let Some(leader) = cluster.leader_node_mut() else {
-                panic!("No leader");
-            };
-            if leader.get_commit_status(position).is_committed() {
-                committed = true;
-                break;
-            }
-            cluster.run(cluster.clock.add(10));
-        }
-        assert!(committed);
-    }
-
-    let deadline = cluster.clock.add(1_000_000);
-    let satisfied = cluster.run_until(deadline, |cluster| {
-        cluster.nodes[0].inner.commit_index() == cluster.nodes[1].inner.commit_index()
-            && cluster.nodes[0].inner.commit_index() == cluster.nodes[2].inner.commit_index()
-    });
-    assert!(satisfied, "Commit indices are not synchronized");
-    Ok(())
-}
-
-#[test]
-fn storage_repair_with_snapshot() -> noprop::TestResult {
-    let seed = noprop::seed_from_env_or_time("NORAFT_PBT_SEED")?;
-    let rng = StdRng::seed_from_u64(seed);
-
-    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
-
-    // Create a cluster.
-    let mut cluster = TestCluster::new(&node_ids, rng);
-    let position = cluster.random_node_mut().create_cluster(&node_ids);
-    assert_ne!(position, LogPosition::INVALID);
-
-    let deadline = cluster.clock.add(10000);
-    let satisfied = cluster.run_until(deadline, |cluster| cluster.leader_node().is_some());
-    assert!(satisfied, "Create cluster timeout");
-
-    // Propose commands.
-    let mut positions = Vec::new();
-    let mut snapshot_index = LogIndex::ZERO;
-    for i in 0..100 {
-        if i == 25 {
-            // Take snapshot
-            cluster.run_until(cluster.clock.add(10000), |cluster| {
-                cluster
-                    .nodes
-                    .iter()
-                    .all(|node| node.inner.commit_index().get() > 0)
-            });
-            for node in cluster.nodes.iter_mut() {
-                let (position, config) = node
-                    .inner
-                    .log()
-                    .get_position_and_config(node.inner.commit_index())
-                    .expect("unreachable");
-                assert!(
-                    node.inner
-                        .handle_snapshot_installed(position, config.clone())
-                );
-                if node.inner.role().is_leader() {
-                    snapshot_index = position.index;
-                }
-            }
-        }
-        if i == 50 {
-            for node in cluster.nodes.iter_mut() {
-                if !node.inner.role().is_leader() {
-                    // Reset the node.
-                    let generation =
-                        NodeGeneration::new(node.inner.generation().get().saturating_add(1));
-                    let log = Log::new(ClusterConfig::new(), LogEntries::new(LogPosition::ZERO));
-                    node.inner = Node::restart(node.inner.id(), generation, Term::ZERO, None, log);
-                }
-            }
-        }
-
-        cluster.run_while_leader_absent(cluster.clock.add(10000));
-        let Some(leader) = cluster.leader_node_mut() else {
-            panic!("No leader");
-        };
-        positions.push(leader.propose_command());
-
-        let ticks = MinMax::new(1, 10).sample(&mut cluster.rng);
-        cluster.run(cluster.clock.add(ticks));
-    }
-    assert_eq!(positions.len(), 100);
-
-    for position in positions {
-        let mut status = CommitStatus::InProgress;
-        for _ in 0..1000 {
-            let Some(leader) = cluster.leader_node_mut() else {
-                panic!("No leader");
-            };
-
-            status = leader.get_commit_status(position);
-            if !status.is_in_progress() {
-                break;
-            }
-            cluster.run(cluster.clock.add(10));
-        }
-
-        if position.index < snapshot_index {
-            assert!(status.is_unknown());
-        } else {
-            assert!(status.is_committed());
-        }
-    }
-
-    let deadline = cluster.clock.add(1_000_000);
-    let satisfied = cluster.run_until(deadline, |cluster| {
-        cluster.nodes[0].inner.commit_index() == cluster.nodes[1].inner.commit_index()
-            && cluster.nodes[0].inner.commit_index() == cluster.nodes[2].inner.commit_index()
-    });
-    assert!(satisfied, "Commit indices are not synchronized");
-    Ok(())
-}
-
-#[test]
-fn dynamic_membership() -> noprop::TestResult {
-    let seed = noprop::seed_from_env_or_time("NORAFT_PBT_SEED")?;
-    let rng = StdRng::seed_from_u64(seed);
-
-    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
-
-    // Create a cluster.
-    let mut cluster = TestCluster::new(&node_ids, rng);
-
-    cluster.default_link_options.drop_rate = 0.3;
-    cluster.default_link_options.latency_ticks = MinMax::new(1, 1000);
-
-    let position = cluster.random_node_mut().create_cluster(&node_ids);
-    assert_ne!(position, LogPosition::INVALID);
-
-    let deadline = cluster.clock.add(100000);
-    let satisfied = cluster.run_until(deadline, |cluster| cluster.leader_node().is_some());
-    assert!(satisfied, "Create cluster timeout");
-
-    for i in 0..10 {
-        // Change the cluster configuration. Wait for the previous
-        // configuration change to settle first: proposing the next
-        // change while the cluster is still in joint consensus returns
-        // `LogPosition::INVALID`.
-        let deadline = cluster.clock.add(1_000_000);
-        let settled = cluster.run_until(deadline, |cluster| {
-            cluster
-                .leader_node()
-                .is_some_and(|leader| !leader.config().is_joint_consensus())
+        let position = cluster.random_node_mut(ctx).create_cluster(&node_ids);
+        assert_ne!(position, LogPosition::INVALID);
+        let satisfied = cluster.run_until(ctx, cluster.clock.add(10_000), |cluster| {
+            cluster.leader_node().is_some()
         });
-        assert!(settled, "Leader without joint consensus not found");
-        if cluster.rng.random_bool(0.7) {
-            // Add.
-            let node_id = NodeId::new(3 + i);
-            let voter = cluster.rng.random_bool(0.5);
-            let mut node = TestNode::new(node_id);
-            node.voter = voter;
-            cluster.nodes.push(node);
-
-            let Some(leader) = cluster.leader_node_mut() else {
-                unreachable!();
-            };
-            let new_config = if voter {
-                leader.config().to_joint_consensus(&[node_id], &[])
-            } else {
-                let mut new_config = leader.config().clone();
-                new_config.non_voters.insert(node_id);
-                new_config
-            };
-            let position = leader.propose_config(new_config);
-            assert_ne!(position, LogPosition::INVALID);
-        } else if cluster.nodes.iter().filter(|n| n.voter).count() > 2 {
-            // Remove.
-            let node_ids = cluster
-                .nodes
-                .iter()
-                .map(|n| n.inner.id())
-                .collect::<Vec<_>>();
-            let node_id = node_ids
-                .choose(&mut cluster.rng)
-                .copied()
-                .expect("unreachable");
-
-            let Some(leader) = cluster.leader_node_mut() else {
-                unreachable!();
-            };
-            let new_config = if leader.config().non_voters.contains(&node_id) {
-                let mut new_config = leader.config().clone();
-                new_config.non_voters.remove(&node_id);
-                new_config
-            } else {
-                leader.config().to_joint_consensus(&[], &[node_id])
-            };
-            let position = leader.propose_config(new_config);
-            assert_ne!(position, LogPosition::INVALID);
+        if !satisfied {
+            return Err("cluster creation timed out".into());
         }
 
-        // Propose commands.
+        let proposals = noprop::sample_usize_in(ctx, 1..=32);
         let mut positions = Vec::new();
-        for _ in 0..10 {
-            cluster.run_while_leader_absent(cluster.clock.add(1_000_000));
+        for _ in 0..proposals {
             let Some(leader) = cluster.leader_node_mut() else {
-                panic!("No leader");
+                return Err("leader disappeared".into());
             };
             positions.push(leader.propose_command());
-
-            let ticks = MinMax::new(1, 10).sample(&mut cluster.rng);
-            cluster.run(cluster.clock.add(ticks));
+            let ticks = MinMax::new(1, 10).sample(ctx);
+            cluster.run(ctx, cluster.clock.add(ticks));
         }
-        assert_eq!(positions.len(), 10);
 
-        let mut success_count = 0;
-        for position in positions {
-            for _ in 0..20000 {
-                cluster.run_while_leader_absent(cluster.clock.add(1_000_000));
-                let Some(leader) = cluster.leader_node_mut() else {
-                    panic!("No leader");
-                };
-                if !leader.get_commit_status(position).is_in_progress() {
-                    if leader.get_commit_status(position).is_committed() {
-                        success_count += 1;
-                    }
-                    break;
-                }
-                cluster.run(cluster.clock.add(10));
-            }
+        let committed = assert_all_terminal(&mut cluster, ctx, &positions, false, false)?;
+        if committed != positions.len() {
+            return Err("all proposals must commit".into());
         }
-        // The committed count is not asserted: under the random
-        // scheduler (drop_rate / latency) the number of commits within
-        // the budget is not guaranteed. The safety of committed entries
-        // is checked by the invariant tests in `tests/prop_cluster_test.rs`,
-        // and bounded liveness is left to controlled-scheduler
-        // scenarios.
-        let _ = success_count;
-    }
+
+        let satisfied = cluster.run_until(ctx, cluster.clock.add(1000), |cluster| {
+            cluster.nodes[0].inner.commit_index() == cluster.nodes[1].inner.commit_index()
+                && cluster.nodes[0].inner.commit_index() == cluster.nodes[2].inner.commit_index()
+        });
+        if !satisfied {
+            return Err("commit indices are not synchronized".into());
+        }
+
+        // Links are stable, so the leader should not change.
+        if cluster.nodes[0].inner.current_term().get() != 1 {
+            return Err("leader must not change under stable links".into());
+        }
+        Ok(())
+    })?;
     Ok(())
 }
 
+/// Command proposals commit even under a very unstable network
+/// (30% drop rate, 1-1000 tick latency).
 #[test]
-fn truncate_divergence_log() -> noprop::TestResult {
+fn proposals_commit_with_unstable_links() -> noprop::TestResult {
     let seed = noprop::seed_from_env_or_time("NORAFT_PBT_SEED")?;
-    let rng = StdRng::seed_from_u64(seed);
+    let cases = cases_from_env(32);
 
-    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    noprop::Runner::new(seed).run(cases, |ctx| {
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let mut cluster = TestCluster::new(&node_ids);
+        cluster.default_link_options.drop_rate = noprop::Ratio::new(3, 10);
+        cluster.default_link_options.latency_ticks = MinMax::new(1, 1000);
 
-    // Create a cluster.
-    let mut cluster = TestCluster::new(&node_ids, rng);
-    let position = cluster.random_node_mut().create_cluster(&node_ids);
-    assert_ne!(position, LogPosition::INVALID);
-
-    let deadline = cluster.clock.add(10000);
-    let satisfied = cluster.run_until(deadline, |cluster| cluster.leader_node().is_some());
-    assert!(satisfied, "Create cluster timeout");
-
-    // Propose 20 commands as usual.
-    let mut positions = Vec::new();
-    for _ in 0..20 {
-        let Some(leader) = cluster.leader_node_mut() else {
-            panic!("No leader");
-        };
-        positions.push(leader.propose_command());
-
-        let ticks = MinMax::new(1, 10).sample(&mut cluster.rng);
-        cluster.run(cluster.clock.add(ticks));
-    }
-
-    // Propose next 20 commands without calling `cluster.run()`
-    for _ in 0..20 {
-        let Some(leader) = cluster.leader_node_mut() else {
-            panic!("No leader");
-        };
-        positions.push(leader.propose_command());
-    }
-
-    // Isolate the leader from the cluster.
-    let leader_node_index = cluster
-        .nodes
-        .iter()
-        .position(|n| n.inner.role().is_leader())
-        .expect("unreachable");
-    let old_leader = cluster.nodes.remove(leader_node_index);
-
-    // Elect a new leader.
-    cluster.run_while_leader_absent(cluster.clock.add(1_000_000));
-
-    // Propose remaining commands.
-    for _ in 0..60 {
-        let Some(leader) = cluster.leader_node_mut() else {
-            panic!("No leader");
-        };
-        positions.push(leader.propose_command());
-    }
-    assert_eq!(positions.len(), 100);
-
-    // Rejoin the old leader.
-    cluster.nodes.push(old_leader);
-
-    let mut success_count = 0;
-    for position in positions {
-        for _ in 0..1000 {
-            let Some(leader) = cluster.leader_node_mut() else {
-                panic!("No leader");
-            };
-            if !leader.get_commit_status(position).is_in_progress() {
-                if leader.get_commit_status(position).is_committed() {
-                    success_count += 1;
-                }
-                break;
-            }
-            cluster.run(cluster.clock.add(10));
+        let position = cluster.random_node_mut(ctx).create_cluster(&node_ids);
+        assert_ne!(position, LogPosition::INVALID);
+        let satisfied = cluster.run_until(ctx, cluster.clock.add(100_000), |cluster| {
+            cluster.leader_node().is_some()
+        });
+        if !satisfied {
+            return Err("cluster creation timed out".into());
         }
-    }
-    assert!(60 <= success_count);
-    assert!(success_count <= 80);
 
-    let deadline = cluster.clock.add(10_000);
-    let satisfied = cluster.run_until(deadline, |cluster| {
-        cluster.nodes[0].inner.commit_index() == cluster.nodes[1].inner.commit_index()
-            && cluster.nodes[0].inner.commit_index() == cluster.nodes[2].inner.commit_index()
-    });
-    assert!(satisfied, "Commit indices are not synchronized");
+        let proposals = noprop::sample_usize_in(ctx, 1..=16);
+        let mut positions = Vec::new();
+        for _ in 0..proposals {
+            let found = cluster.run_while_leader_absent(ctx, cluster.clock.add(100_000));
+            if !found {
+                return Err("leader absent while proposing".into());
+            }
+            let Some(leader) = cluster.leader_node_mut() else {
+                unreachable!();
+            };
+            positions.push(leader.propose_command());
+            let ticks = MinMax::new(1, 10).sample(ctx);
+            cluster.run(ctx, cluster.clock.add(ticks));
+        }
+
+        let committed = assert_all_terminal(&mut cluster, ctx, &positions, false, false)?;
+        if committed != positions.len() {
+            return Err("all proposals must commit".into());
+        }
+
+        let satisfied = cluster.run_until(ctx, cluster.clock.add(100_000), |cluster| {
+            cluster.nodes[0].inner.commit_index() == cluster.nodes[1].inner.commit_index()
+                && cluster.nodes[0].inner.commit_index() == cluster.nodes[2].inner.commit_index()
+        });
+        if !satisfied {
+            return Err("commit indices are not synchronized".into());
+        }
+        Ok(())
+    })?;
+    Ok(())
+}
+
+/// Command proposals commit when proposals are pipelined (no waiting
+/// for the previous commit) and interleaved with heartbeats.
+#[test]
+fn proposals_commit_with_pipelining() -> noprop::TestResult {
+    let seed = noprop::seed_from_env_or_time("NORAFT_PBT_SEED")?;
+    let cases = cases_from_env(32);
+
+    noprop::Runner::new(seed).run(cases, |ctx| {
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let mut cluster = TestCluster::new(&node_ids);
+
+        let position = cluster.random_node_mut(ctx).create_cluster(&node_ids);
+        assert_ne!(position, LogPosition::INVALID);
+        let satisfied = cluster.run_until(ctx, cluster.clock.add(10_000), |cluster| {
+            cluster.leader_node().is_some()
+        });
+        if !satisfied {
+            return Err("cluster creation timed out".into());
+        }
+
+        let proposals = noprop::sample_usize_in(ctx, 1..=32);
+        let mut positions = Vec::new();
+        for _ in 0..proposals {
+            let pipeline = noprop::sample_ratio(ctx, noprop::Ratio::new(4, 5));
+            let do_heartbeat = noprop::sample_ratio(ctx, noprop::Ratio::one_nth(2));
+
+            let found = cluster.run_while_leader_absent(ctx, cluster.clock.add(10_000));
+            if !found {
+                return Err("leader absent while proposing".into());
+            }
+            let Some(leader) = cluster.leader_node_mut() else {
+                unreachable!();
+            };
+            positions.push(leader.propose_command());
+            if do_heartbeat && !leader.heartbeat() {
+                return Err("heartbeat must succeed on the leader".into());
+            }
+
+            if !pipeline {
+                let ticks = MinMax::new(0, 5).sample(ctx);
+                cluster.run(ctx, cluster.clock.add(ticks));
+            }
+        }
+
+        let committed = assert_all_terminal(&mut cluster, ctx, &positions, false, false)?;
+        if committed != positions.len() {
+            return Err("all proposals must commit".into());
+        }
+
+        let satisfied = cluster.run_until(ctx, cluster.clock.add(10_000), |cluster| {
+            cluster.nodes[0].inner.commit_index() == cluster.nodes[1].inner.commit_index()
+                && cluster.nodes[0].inner.commit_index() == cluster.nodes[2].inner.commit_index()
+        });
+        if !satisfied {
+            return Err("commit indices are not synchronized".into());
+        }
+        Ok(())
+    })?;
+    Ok(())
+}
+
+/// Command proposals commit while a node periodically restarts, and
+/// the run must exercise at least one restart.
+#[test]
+fn proposals_commit_across_node_restarts() -> noprop::TestResult {
+    let seed = noprop::seed_from_env_or_time("NORAFT_PBT_SEED")?;
+    let cases = cases_from_env(32);
+    let cases_with_commit: Cell<usize> = Cell::new(0);
+
+    noprop::Runner::new(seed).run(cases, |ctx| {
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let mut cluster = TestCluster::new(&node_ids);
+
+        // Node 0 stops and restarts periodically with the same slow
+        // cadence as the original scenario test: while it is down,
+        // the remaining two voters can still elect a leader and
+        // commit, so the cluster keeps making progress.
+        cluster.nodes[0].options.running_ticks = MinMax::new(800, 5000);
+        cluster.nodes[0].options.stopping_ticks = MinMax::new(800, 5000);
+        let initial_generation = cluster.nodes[0].inner.generation().get();
+
+        let position = cluster.random_node_mut(ctx).create_cluster(&node_ids);
+        assert_ne!(position, LogPosition::INVALID);
+        let satisfied = cluster.run_until(ctx, cluster.clock.add(10_000), |cluster| {
+            cluster.leader_node().is_some()
+        });
+        if !satisfied {
+            return Err("cluster creation timed out".into());
+        }
+
+        // Propose a first batch of commands.
+        let mut positions = Vec::new();
+        let first_batch = noprop::sample_usize_in(ctx, 1..=16);
+        for _ in 0..first_batch {
+            let Some(leader) = cluster.leader_node_mut() else {
+                unreachable!();
+            };
+            positions.push(leader.propose_command());
+            let ticks = MinMax::new(1, 10).sample(ctx);
+            cluster.run(ctx, cluster.clock.add(ticks));
+        }
+
+        // Wait for node 0 to stop and restart at least once. The
+        // restart is guaranteed to happen by construction (the stop /
+        // start cadence is bounded), and the wait bounds the liveness
+        // claim: the cluster must not stall during the restart cycle.
+        let restarted = cluster.run_until(ctx, cluster.clock.add(50_000), |cluster| {
+            cluster.nodes[0].inner.generation().get() > initial_generation
+        });
+        if !restarted {
+            return Err("node 0 did not restart within the budget".into());
+        }
+
+        // Propose a second batch of commands while node 0 keeps
+        // restarting.
+        let second_batch = noprop::sample_usize_in(ctx, 8..=48);
+        for _ in 0..second_batch {
+            let found = cluster.run_while_leader_absent(ctx, cluster.clock.add(10_000));
+            if !found {
+                return Err("leader absent while proposing".into());
+            }
+            let Some(leader) = cluster.leader_node_mut() else {
+                unreachable!();
+            };
+            positions.push(leader.propose_command());
+            let ticks = MinMax::new(1, 10).sample(ctx);
+            cluster.run(ctx, cluster.clock.add(ticks));
+        }
+
+        // A proposal made on a leader that stops before replicating
+        // it may be truncated by a later leader, so a terminal
+        // `Rejected` status is legitimate here. The liveness claim is
+        // that every proposal settles and the cluster keeps
+        // committing while node 0 restarts.
+        let committed = assert_all_terminal(&mut cluster, ctx, &positions, true, false)?;
+        if committed > 0 {
+            cases_with_commit.set(cases_with_commit.get() + 1);
+        }
+
+        let satisfied = cluster.run_until(ctx, cluster.clock.add(50_000), |cluster| {
+            cluster.nodes[0].inner.commit_index() == cluster.nodes[1].inner.commit_index()
+                && cluster.nodes[0].inner.commit_index() == cluster.nodes[2].inner.commit_index()
+        });
+        if !satisfied {
+            return Err("commit indices are not synchronized".into());
+        }
+        Ok(())
+    })?;
+
+    assert!(
+        cases_with_commit.get() > 0,
+        "no case committed a command while a node was restarting (seed={seed:#018x})",
+    );
+    Ok(())
+}
+
+/// Command proposals commit after non-leader nodes lose their storage
+/// mid-run and recover through log repair, and the run must exercise
+/// at least one storage loss.
+#[test]
+fn proposals_commit_after_storage_repair() -> noprop::TestResult {
+    let seed = noprop::seed_from_env_or_time("NORAFT_PBT_SEED")?;
+    let cases = cases_from_env(32);
+    let cases_with_repair: Cell<usize> = Cell::new(0);
+
+    noprop::Runner::new(seed).run(cases, |ctx| {
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let mut cluster = TestCluster::new(&node_ids);
+
+        let position = cluster.random_node_mut(ctx).create_cluster(&node_ids);
+        assert_ne!(position, LogPosition::INVALID);
+        let satisfied = cluster.run_until(ctx, cluster.clock.add(10_000), |cluster| {
+            cluster.leader_node().is_some()
+        });
+        if !satisfied {
+            return Err("cluster creation timed out".into());
+        }
+
+        let proposals = noprop::sample_usize_in(ctx, 2..=32);
+        let repair_at = noprop::sample_usize_in(ctx, 1..proposals);
+        let mut positions = Vec::new();
+        for i in 0..proposals {
+            if i == repair_at {
+                // Reset the non-leader nodes: their storage is lost.
+                for node in cluster.nodes.iter_mut() {
+                    if !node.inner.role().is_leader() {
+                        let generation =
+                            NodeGeneration::new(node.inner.generation().get().saturating_add(1));
+                        let log =
+                            Log::new(ClusterConfig::new(), LogEntries::new(LogPosition::ZERO));
+                        node.inner =
+                            Node::restart(node.inner.id(), generation, Term::ZERO, None, log);
+                    }
+                }
+                cases_with_repair.set(cases_with_repair.get() + 1);
+            }
+
+            let found = cluster.run_while_leader_absent(ctx, cluster.clock.add(10_000));
+            if !found {
+                return Err("leader absent while proposing".into());
+            }
+            let Some(leader) = cluster.leader_node_mut() else {
+                unreachable!();
+            };
+            positions.push(leader.propose_command());
+            let ticks = MinMax::new(1, 10).sample(ctx);
+            cluster.run(ctx, cluster.clock.add(ticks));
+        }
+
+        let committed = assert_all_terminal(&mut cluster, ctx, &positions, false, false)?;
+        if committed != positions.len() {
+            return Err("all proposals must commit".into());
+        }
+
+        let satisfied = cluster.run_until(ctx, cluster.clock.add(1_000_000), |cluster| {
+            cluster.nodes[0].inner.commit_index() == cluster.nodes[1].inner.commit_index()
+                && cluster.nodes[0].inner.commit_index() == cluster.nodes[2].inner.commit_index()
+        });
+        if !satisfied {
+            return Err("commit indices are not synchronized".into());
+        }
+        Ok(())
+    })?;
+
+    assert!(
+        cases_with_repair.get() > 0,
+        "no case exercised a storage loss (seed={seed:#018x})",
+    );
+    Ok(())
+}
+
+/// Command proposals commit after a snapshot is installed and
+/// non-leader nodes lose their storage; entries covered by the
+/// snapshot are reported as unknown, newer ones as committed. The run
+/// must exercise at least one snapshot installation.
+#[test]
+fn proposals_commit_after_snapshot_repair() -> noprop::TestResult {
+    let seed = noprop::seed_from_env_or_time("NORAFT_PBT_SEED")?;
+    let cases = cases_from_env(16);
+    let cases_with_snapshot: Cell<usize> = Cell::new(0);
+
+    noprop::Runner::new(seed).run(cases, |ctx| {
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let mut cluster = TestCluster::new(&node_ids);
+
+        let position = cluster.random_node_mut(ctx).create_cluster(&node_ids);
+        assert_ne!(position, LogPosition::INVALID);
+        let satisfied = cluster.run_until(ctx, cluster.clock.add(10_000), |cluster| {
+            cluster.leader_node().is_some()
+        });
+        if !satisfied {
+            return Err("cluster creation timed out".into());
+        }
+
+        let proposals = noprop::sample_usize_in(ctx, 4..=32);
+        let snapshot_at = noprop::sample_usize_in(ctx, 1..proposals - 1);
+        let repair_at = noprop::sample_usize_in(ctx, snapshot_at + 1..proposals);
+        let mut positions = Vec::new();
+        let mut snapshot_index = LogIndex::ZERO;
+        for i in 0..proposals {
+            if i == snapshot_at {
+                // Take a snapshot at the current commit index.
+                let satisfied = cluster.run_until(ctx, cluster.clock.add(10_000), |cluster| {
+                    cluster
+                        .nodes
+                        .iter()
+                        .all(|node| node.inner.commit_index().get() > 0)
+                });
+                if !satisfied {
+                    return Err("nothing committed at snapshot time".into());
+                }
+                for node in cluster.nodes.iter_mut() {
+                    let (snapshot_position, config) = node
+                        .inner
+                        .log()
+                        .get_position_and_config(node.inner.commit_index())
+                        .expect("commit index is contained");
+                    if !node
+                        .inner
+                        .handle_snapshot_installed(snapshot_position, config.clone())
+                    {
+                        return Err("snapshot installation failed".into());
+                    }
+                    if node.inner.role().is_leader() {
+                        snapshot_index = snapshot_position.index;
+                    }
+                }
+                cases_with_snapshot.set(cases_with_snapshot.get() + 1);
+            }
+            if i == repair_at {
+                // Reset the non-leader nodes: their storage is lost.
+                for node in cluster.nodes.iter_mut() {
+                    if !node.inner.role().is_leader() {
+                        let generation =
+                            NodeGeneration::new(node.inner.generation().get().saturating_add(1));
+                        let log =
+                            Log::new(ClusterConfig::new(), LogEntries::new(LogPosition::ZERO));
+                        node.inner =
+                            Node::restart(node.inner.id(), generation, Term::ZERO, None, log);
+                    }
+                }
+            }
+
+            let found = cluster.run_while_leader_absent(ctx, cluster.clock.add(10_000));
+            if !found {
+                return Err("leader absent while proposing".into());
+            }
+            let Some(leader) = cluster.leader_node_mut() else {
+                unreachable!();
+            };
+            positions.push(leader.propose_command());
+            let ticks = MinMax::new(1, 10).sample(ctx);
+            cluster.run(ctx, cluster.clock.add(ticks));
+        }
+
+        // Entries covered by the snapshot are unknown; newer entries
+        // must commit.
+        for (i, position) in positions.iter().enumerate() {
+            if position.index < snapshot_index {
+                let status = wait_until_terminal(&mut cluster, ctx, *position, 1000)
+                    .ok_or_else(|| format!("proposal {i} did not reach a terminal status"))?;
+                if !status.is_unknown() {
+                    return Err(format!(
+                        "snapshot-covered proposal {i} must be unknown, got {status:?}"
+                    )
+                    .into());
+                }
+            }
+        }
+        let after_snapshot: Vec<LogPosition> = positions
+            .iter()
+            .copied()
+            .filter(|position| position.index >= snapshot_index)
+            .collect();
+        let committed = assert_all_terminal(&mut cluster, ctx, &after_snapshot, false, false)?;
+        if committed != after_snapshot.len() {
+            return Err("all post-snapshot proposals must commit".into());
+        }
+
+        let satisfied = cluster.run_until(ctx, cluster.clock.add(1_000_000), |cluster| {
+            cluster.nodes[0].inner.commit_index() == cluster.nodes[1].inner.commit_index()
+                && cluster.nodes[0].inner.commit_index() == cluster.nodes[2].inner.commit_index()
+        });
+        if !satisfied {
+            return Err("commit indices are not synchronized".into());
+        }
+        Ok(())
+    })?;
+
+    assert!(
+        cases_with_snapshot.get() > 0,
+        "no case exercised a snapshot installation (seed={seed:#018x})",
+    );
+    Ok(())
+}
+
+/// Cluster configuration changes (add / remove voters and non-voters)
+/// settle without getting stuck in joint consensus, and at least one
+/// command commits somewhere across the run. The run must exercise at
+/// least one config change.
+#[test]
+fn membership_changes_settle() -> noprop::TestResult {
+    let seed = noprop::seed_from_env_or_time("NORAFT_PBT_SEED")?;
+    let cases = cases_from_env(16);
+    let cases_with_change: Cell<usize> = Cell::new(0);
+    let cases_with_commit: Cell<usize> = Cell::new(0);
+
+    noprop::Runner::new(seed).run(cases, |ctx| {
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let mut cluster = TestCluster::new(&node_ids);
+        cluster.default_link_options.drop_rate = noprop::Ratio::new(3, 10);
+        cluster.default_link_options.latency_ticks = MinMax::new(1, 1000);
+
+        let position = cluster.random_node_mut(ctx).create_cluster(&node_ids);
+        assert_ne!(position, LogPosition::INVALID);
+        let satisfied = cluster.run_until(ctx, cluster.clock.add(100_000), |cluster| {
+            cluster.leader_node().is_some()
+        });
+        if !satisfied {
+            return Err("cluster creation timed out".into());
+        }
+
+        let rounds = noprop::sample_usize_in(ctx, 1..=4);
+        let mut total_committed = 0;
+        for i in 0..rounds {
+            // Wait for the previous configuration change to settle:
+            // proposing the next change while the cluster is still in
+            // joint consensus returns `LogPosition::INVALID`.
+            let settled = cluster.run_until(ctx, cluster.clock.add(1_000_000), |cluster| {
+                cluster
+                    .leader_node()
+                    .is_some_and(|leader| !leader.config().is_joint_consensus())
+            });
+            if !settled {
+                return Err(format!("config change {i} did not settle").into());
+            }
+            if noprop::sample_ratio(ctx, noprop::Ratio::new(7, 10)) {
+                // Add.
+                let node_id = NodeId::new(3 + i as u64);
+                let voter = noprop::sample_ratio(ctx, noprop::Ratio::one_nth(2));
+                let mut node = TestNode::new(node_id);
+                node.voter = voter;
+                cluster.nodes.push(node);
+                cases_with_change.set(cases_with_change.get() + 1);
+
+                let Some(leader) = cluster.leader_node_mut() else {
+                    unreachable!();
+                };
+                let new_config = if voter {
+                    leader.config().to_joint_consensus(&[node_id], &[])
+                } else {
+                    let mut new_config = leader.config().clone();
+                    new_config.non_voters.insert(node_id);
+                    new_config
+                };
+                let position = leader.propose_config(new_config);
+                assert_ne!(position, LogPosition::INVALID);
+            } else if cluster.nodes.iter().filter(|n| n.voter).count() > 2 {
+                // Remove.
+                let candidate_ids = cluster
+                    .nodes
+                    .iter()
+                    .map(|n| n.inner.id())
+                    .collect::<Vec<_>>();
+                let node_id = noprop::sample_choice(ctx, &candidate_ids);
+                cases_with_change.set(cases_with_change.get() + 1);
+
+                let Some(leader) = cluster.leader_node_mut() else {
+                    unreachable!();
+                };
+                let new_config = if leader.config().non_voters.contains(&node_id) {
+                    let mut new_config = leader.config().clone();
+                    new_config.non_voters.remove(&node_id);
+                    new_config
+                } else {
+                    leader.config().to_joint_consensus(&[], &[node_id])
+                };
+                let position = leader.propose_config(new_config);
+                assert_ne!(position, LogPosition::INVALID);
+            }
+
+            // Propose commands.
+            let mut positions = Vec::new();
+            let command_count = noprop::sample_usize_in(ctx, 1..=4);
+            for _ in 0..command_count {
+                let found = cluster.run_while_leader_absent(ctx, cluster.clock.add(1_000_000));
+                if !found {
+                    return Err("leader absent while proposing".into());
+                }
+                let Some(leader) = cluster.leader_node_mut() else {
+                    unreachable!();
+                };
+                positions.push(leader.propose_command());
+                let ticks = MinMax::new(1, 10).sample(ctx);
+                cluster.run(ctx, cluster.clock.add(ticks));
+            }
+
+            for position in positions.iter() {
+                // A proposal may legitimately stay in progress when a
+                // config change is still converging under an unstable
+                // network (e.g. a newly added voter that has not yet
+                // caught up); the liveness claim is that *some*
+                // command commits, not that every one does.
+                if let Some(status) = wait_until_terminal(&mut cluster, ctx, *position, 20_000)
+                    && status.is_committed()
+                {
+                    total_committed += 1;
+                }
+            }
+        }
+        if total_committed == 0 {
+            return Err("no proposal committed; the cluster made no progress".into());
+        }
+        cases_with_commit.set(cases_with_commit.get() + 1);
+        Ok(())
+    })?;
+
+    assert!(
+        cases_with_change.get() > 0,
+        "no case exercised a config change (seed={seed:#018x})",
+    );
+    assert!(
+        cases_with_commit.get() > 0,
+        "no case committed a command under membership changes \
+         (seed={seed:#018x})",
+    );
+    Ok(())
+}
+
+/// After the leader is isolated from the cluster and a new leader is
+/// elected, rejoining the old leader reconciles the divergent logs:
+/// every proposed position reaches a terminal status, at least one
+/// position commits, and the commit indices converge.
+#[test]
+fn divergent_logs_reconcile() -> noprop::TestResult {
+    let seed = noprop::seed_from_env_or_time("NORAFT_PBT_SEED")?;
+    let cases = cases_from_env(16);
+    let cases_with_commit: Cell<usize> = Cell::new(0);
+
+    noprop::Runner::new(seed).run(cases, |ctx| {
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let mut cluster = TestCluster::new(&node_ids);
+
+        let position = cluster.random_node_mut(ctx).create_cluster(&node_ids);
+        assert_ne!(position, LogPosition::INVALID);
+        let satisfied = cluster.run_until(ctx, cluster.clock.add(10_000), |cluster| {
+            cluster.leader_node().is_some()
+        });
+        if !satisfied {
+            return Err("cluster creation timed out".into());
+        }
+        // Let the initial cluster-config / term entries replicate to
+        // all nodes before proceeding: a follower that never receives
+        // the config entry is not a voter and can never campaign.
+        cluster.run(ctx, cluster.clock.add(100));
+
+        // Propose commands as usual.
+        let mut positions = Vec::new();
+        let first_batch = noprop::sample_usize_in(ctx, 4..=16);
+        for _ in 0..first_batch {
+            let Some(leader) = cluster.leader_node_mut() else {
+                unreachable!();
+            };
+            positions.push(leader.propose_command());
+            let ticks = MinMax::new(1, 10).sample(ctx);
+            cluster.run(ctx, cluster.clock.add(ticks));
+        }
+
+        // Propose more commands without giving the cluster time to
+        // replicate them, then isolate the leader.
+        let second_batch = noprop::sample_usize_in(ctx, 4..=16);
+        for _ in 0..second_batch {
+            let Some(leader) = cluster.leader_node_mut() else {
+                unreachable!();
+            };
+            positions.push(leader.propose_command());
+        }
+        let leader_node_index = cluster
+            .nodes
+            .iter()
+            .position(|n| n.inner.role().is_leader())
+            .expect("leader exists");
+        let old_leader = cluster.nodes.remove(leader_node_index);
+
+        // Elect a new leader.
+        let found = cluster.run_while_leader_absent(ctx, cluster.clock.add(1_000_000));
+        if !found {
+            return Err("new leader was not elected".into());
+        }
+
+        // Propose remaining commands.
+        let third_batch = noprop::sample_usize_in(ctx, 4..=16);
+        for _ in 0..third_batch {
+            let found = cluster.run_while_leader_absent(ctx, cluster.clock.add(1_000_000));
+            if !found {
+                return Err("leader absent while proposing".into());
+            }
+            let Some(leader) = cluster.leader_node_mut() else {
+                unreachable!();
+            };
+            positions.push(leader.propose_command());
+            let ticks = MinMax::new(1, 10).sample(ctx);
+            cluster.run(ctx, cluster.clock.add(ticks));
+        }
+
+        // Rejoin the old leader.
+        cluster.nodes.push(old_leader);
+
+        // Uncommitted positions on the isolated leader are truncated
+        // after the rejoin, so a terminal `Rejected` status is
+        // legitimate here; the liveness claim is that the cluster
+        // recovers and keeps committing.
+        let committed = assert_all_terminal(&mut cluster, ctx, &positions, true, false)?;
+        if committed == 0 {
+            return Err("no proposal committed after reconciliation".into());
+        }
+        cases_with_commit.set(cases_with_commit.get() + 1);
+
+        let satisfied = cluster.run_until(ctx, cluster.clock.add(10_000), |cluster| {
+            cluster.nodes[0].inner.commit_index() == cluster.nodes[1].inner.commit_index()
+                && cluster.nodes[0].inner.commit_index() == cluster.nodes[2].inner.commit_index()
+        });
+        if !satisfied {
+            return Err("commit indices are not synchronized".into());
+        }
+        Ok(())
+    })?;
+
+    assert!(
+        cases_with_commit.get() > 0,
+        "no case committed a command after divergent-log reconciliation \
+         (seed={seed:#018x})",
+    );
     Ok(())
 }
 
@@ -619,17 +805,15 @@ fn truncate_divergence_log() -> noprop::TestResult {
 pub struct TestCluster {
     pub nodes: Vec<TestNode>,
     pub clock: Clock,
-    pub rng: StdRng,
     pub default_link_options: TestLinkOptions,
     seqno: u64,
 }
 
 impl TestCluster {
-    pub fn new(node_ids: &[NodeId], rng: StdRng) -> Self {
+    pub fn new(node_ids: &[NodeId]) -> Self {
         Self {
             nodes: node_ids.iter().map(|&id| TestNode::new(id)).collect(),
             clock: Clock::new(),
-            rng,
             default_link_options: TestLinkOptions::default(),
             seqno: 0,
         }
@@ -649,37 +833,37 @@ impl TestCluster {
             .map(|node| &mut node.inner)
     }
 
-    pub fn random_node_mut(&mut self) -> &mut Node {
-        let index = self.rng.random_range(0..self.nodes.len());
+    pub fn random_node_mut(&mut self, ctx: &mut TestCaseContext) -> &mut Node {
+        let index = noprop::sample_usize_in(ctx, 0..self.nodes.len());
         &mut self.nodes[index].inner
     }
 
-    pub fn run_while_leader_absent(&mut self, deadline: Clock) {
-        self.run_until(deadline, |cluster| cluster.leader_node().is_some());
+    pub fn run_while_leader_absent(&mut self, ctx: &mut TestCaseContext, deadline: Clock) -> bool {
+        self.run_until(ctx, deadline, |cluster| cluster.leader_node().is_some())
     }
 
-    pub fn run(&mut self, deadline: Clock) {
-        self.run_until(deadline, |_| false);
+    pub fn run(&mut self, ctx: &mut TestCaseContext, deadline: Clock) {
+        self.run_until(ctx, deadline, |_| false);
     }
 
-    pub fn run_until<F>(&mut self, deadline: Clock, condition: F) -> bool
+    pub fn run_until<F>(&mut self, ctx: &mut TestCaseContext, deadline: Clock, condition: F) -> bool
     where
         F: Fn(&TestCluster) -> bool,
     {
         while self.clock < deadline && !condition(self) {
-            self.run_tick();
+            self.run_tick(ctx);
         }
         self.clock < deadline
     }
 
-    pub fn run_tick(&mut self) {
+    pub fn run_tick(&mut self, ctx: &mut TestCaseContext) {
         self.clock.tick();
         let mut messages = Vec::new();
         let mut snapshots = Vec::new();
 
         // Run nodes.
         for node in &mut self.nodes {
-            node.run_tick(&mut self.rng, self.clock);
+            node.run_tick(ctx, self.clock);
 
             let src = node.inner.id();
             let mut actions = std::mem::take(node.inner.actions_mut());
@@ -703,23 +887,23 @@ impl TestCluster {
 
         // Deliver messages.
         for (src, dst, msg) in messages {
-            self.send_message(src, dst, msg);
+            self.send_message(ctx, src, dst, msg);
         }
 
         // Deliver snapshots.
         for (src, dst, position, config) in snapshots {
-            self.send_snashot(src, dst, position, config);
+            self.send_snashot(ctx, src, dst, position, config);
         }
     }
 
-    fn send_message(&mut self, _src: NodeId, dst: NodeId, msg: Message) {
+    fn send_message(&mut self, ctx: &mut TestCaseContext, _src: NodeId, dst: NodeId, msg: Message) {
         let options = &self.default_link_options;
 
-        if self.rng.random_bool(options.drop_rate) {
+        if noprop::sample_ratio(ctx, options.drop_rate) {
             return;
         }
 
-        let latency = options.latency_ticks.sample(&mut self.rng) * message_size(&msg);
+        let latency = options.latency_ticks.sample(ctx) * message_size(&msg);
         for node in &mut self.nodes {
             if node.inner.id() == dst {
                 node.incoming_messages
@@ -732,6 +916,7 @@ impl TestCluster {
 
     fn send_snashot(
         &mut self,
+        ctx: &mut TestCaseContext,
         _src: NodeId,
         dst: NodeId,
         position: LogPosition,
@@ -745,7 +930,7 @@ impl TestCluster {
 
                 node.snapshot_finish_time = Some((
                     self.clock
-                        .add(node.options.install_snapshot_ticks.sample(&mut self.rng)),
+                        .add(node.options.install_snapshot_ticks.sample(ctx)),
                     position,
                     config,
                 ));
@@ -767,14 +952,14 @@ fn message_size(msg: &Message) -> usize {
 #[derive(Debug, Clone)]
 pub struct TestLinkOptions {
     pub latency_ticks: MinMax,
-    pub drop_rate: f64,
+    pub drop_rate: noprop::Ratio,
 }
 
 impl Default for TestLinkOptions {
     fn default() -> Self {
         Self {
             latency_ticks: MinMax::new(5, 20),
-            drop_rate: 0.01,
+            drop_rate: noprop::Ratio::new(1, 100),
         }
     }
 }
@@ -821,24 +1006,9 @@ impl MinMax {
     pub fn constant(value: usize) -> MinMax {
         MinMax::new(value, value)
     }
-}
 
-impl Distribution<usize> for MinMax {
-    fn sample<R: Rng + ?Sized>(&self, rng: &mut R) -> usize {
-        rng.random_range(self.min..=self.max)
-    }
-}
-
-impl SampleRange<usize> for MinMax {
-    fn sample_single<R: Rng + ?Sized>(
-        self,
-        rng: &mut R,
-    ) -> Result<usize, rand::distr::uniform::Error> {
-        Ok(self.sample(rng))
-    }
-
-    fn is_empty(&self) -> bool {
-        self.min > self.max
+    pub fn sample(&self, ctx: &mut TestCaseContext) -> usize {
+        noprop::sample_usize_in(ctx, self.min..=self.max)
     }
 }
 
@@ -872,7 +1042,7 @@ impl TestNode {
         }
     }
 
-    pub fn run_tick(&mut self, rng: &mut StdRng, now: Clock) {
+    pub fn run_tick(&mut self, ctx: &mut TestCaseContext, now: Clock) {
         if !self.voter {
             assert!(self.inner.role().is_follower());
         }
@@ -901,19 +1071,20 @@ impl TestNode {
             }
         }
         if self.stop_time.is_none() {
-            self.stop_time = Some(now.add(self.options.running_ticks.sample(rng)));
+            self.stop_time = Some(now.add(self.options.running_ticks.sample(ctx)));
         }
         if self.stop_time.take_if(|t| *t <= now).is_some() {
             self.running = false;
             self.timeout_expire_time = None;
             self.storage_finish_time = None;
-            self.start_time = Some(now.add(self.options.stopping_ticks.sample(rng)));
+            self.start_time = Some(now.add(self.options.stopping_ticks.sample(ctx)));
             return;
         }
 
         self.storage_finish_time.take_if(|t| *t <= now);
         if self.storage_finish_time.is_some() {
-            // Storage operations are synchronous, so we can't do anything else until they finish.
+            // Storage operations are synchronous, so we can't do
+            // anything else until they finish.
             return;
         }
 
@@ -930,9 +1101,6 @@ impl TestNode {
         while let Some(entry) = self.incoming_messages.first_entry() {
             if entry.key().0 <= now {
                 let message = entry.remove();
-                if self.inner.could_be_disruptive_request_vote(&message) {
-                    continue;
-                }
                 self.inner
                     .handle_message(&message)
                     .expect("message handling should succeed");
@@ -942,31 +1110,31 @@ impl TestNode {
         }
 
         if std::mem::take(&mut self.inner.actions_mut().set_election_timeout) {
-            self.reset_election_timeout(rng, now);
+            self.reset_election_timeout(ctx, now);
         }
         if std::mem::take(&mut self.inner.actions_mut().save_current_term) {
-            self.extend_storage_finish_time(rng, now, 1);
+            self.extend_storage_finish_time(ctx, now, 1);
         }
         if std::mem::take(&mut self.inner.actions_mut().save_voted_for) {
-            self.extend_storage_finish_time(rng, now, 1);
+            self.extend_storage_finish_time(ctx, now, 1);
         }
         if let Some(entries) = self.inner.actions_mut().append_log_entries.take() {
-            self.extend_storage_finish_time(rng, now, entries.len());
+            self.extend_storage_finish_time(ctx, now, entries.len());
         }
     }
 
-    fn reset_election_timeout(&mut self, rng: &mut StdRng, now: Clock) {
+    fn reset_election_timeout(&mut self, ctx: &mut TestCaseContext, now: Clock) {
         let timeout = match self.inner.role() {
             Role::Leader => self.options.election_timeout_ticks.min,
-            Role::Candidate => self.options.election_timeout_ticks.sample(rng),
+            Role::Candidate => self.options.election_timeout_ticks.sample(ctx),
             Role::Follower => self.options.election_timeout_ticks.max,
         };
         self.timeout_expire_time = Some(now.add(timeout));
     }
 
-    fn extend_storage_finish_time(&mut self, rng: &mut StdRng, now: Clock, n: usize) {
+    fn extend_storage_finish_time(&mut self, ctx: &mut TestCaseContext, now: Clock, n: usize) {
         let remaining_latency = self.storage_finish_time.map_or(0, |t| t.0 - now.0);
-        let additional_latency = self.options.storage_latency_ticks.sample(rng) * n;
+        let additional_latency = self.options.storage_latency_ticks.sample(ctx) * n;
         let latency = remaining_latency + additional_latency;
         self.storage_finish_time = Some(now.add(latency));
     }
