@@ -1,7 +1,9 @@
 //! Shared tick-driven cluster harness for bounded-liveness properties.
 
 use noprop::TestCaseContext;
-use noraft::{ClusterConfig, LogPosition, Message, Node, NodeGeneration, NodeId, Role};
+use noraft::{
+    ClusterConfig, CommitStatus, LogPosition, Message, Node, NodeGeneration, NodeId, Role,
+};
 use std::collections::BTreeMap;
 
 #[derive(Debug)]
@@ -144,6 +146,57 @@ impl TestCluster {
             }
         }
     }
+}
+
+/// Runs the cluster until `position` reaches a terminal commit status
+/// (committed / rejected / unknown), or the round budget is exhausted.
+pub fn wait_until_terminal(
+    cluster: &mut TestCluster,
+    ctx: &mut TestCaseContext,
+    position: LogPosition,
+    max_rounds: usize,
+) -> Option<CommitStatus> {
+    for _ in 0..max_rounds {
+        let found = cluster.run_while_leader_absent(ctx, cluster.clock.after(100_000));
+        if !found {
+            return None;
+        }
+        let leader = cluster
+            .leader_node()
+            .expect("a leader was found immediately above");
+        let status = leader.get_commit_status(position);
+        if !status.is_in_progress() {
+            return Some(status);
+        }
+        cluster.run(ctx, cluster.clock.after(10));
+    }
+    None
+}
+
+/// Requires all positions to reach an allowed terminal status and
+/// returns the number that committed.
+pub fn assert_all_terminal(
+    cluster: &mut TestCluster,
+    ctx: &mut TestCaseContext,
+    positions: &[LogPosition],
+    allow_rejected: bool,
+    allow_unknown: bool,
+) -> Result<usize, String> {
+    let mut committed = 0;
+    for (i, position) in positions.iter().enumerate() {
+        let status = wait_until_terminal(cluster, ctx, *position, 1000)
+            .ok_or_else(|| format!("proposal {i} did not reach a terminal status"))?;
+        if status.is_committed() {
+            committed += 1;
+        } else if (!status.is_rejected() || !allow_rejected)
+            && (!status.is_unknown() || !allow_unknown)
+        {
+            return Err(format!(
+                "proposal {i} ended with unexpected status {status:?}"
+            ));
+        }
+    }
+    Ok(committed)
 }
 
 fn message_size(message: &Message) -> usize {

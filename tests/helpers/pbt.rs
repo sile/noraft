@@ -13,7 +13,11 @@ pub struct RunConfig {
     pub cases: usize,
 }
 
-/// Loads the reproducibility seed and a strictly positive case budget.
+/// Loads a fresh-or-reproducible seed and a strictly positive case budget.
+///
+/// [`noprop::seed_from_env_or_time`] reads `NORAFT_PBT_SEED` only when
+/// explicitly set for failure reproduction. Otherwise each invocation
+/// derives a new seed from the current time, including on CI.
 ///
 /// An unset case-budget variable selects `default_cases`. A malformed
 /// value or zero is an error so a misspelled override cannot silently
@@ -46,7 +50,7 @@ pub fn run_config(default_cases: usize) -> noprop::TestResult<RunConfig> {
     Ok(RunConfig { seed, cases })
 }
 
-/// Runs a property using the standard noraft PBT environment variables.
+/// Runs a property with a time-derived seed unless reproduction is requested.
 pub fn run<F>(default_cases: usize, property: F) -> noprop::TestResult
 where
     F: Fn(&mut noprop::TestCaseContext) -> noprop::TestResult,
