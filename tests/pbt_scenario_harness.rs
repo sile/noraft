@@ -1,0 +1,357 @@
+//! Shared tick-driven cluster harness for bounded-liveness properties.
+
+use noprop::TestCaseContext;
+use noraft::{ClusterConfig, LogPosition, Message, Node, NodeGeneration, NodeId, Role};
+use std::collections::BTreeMap;
+
+#[derive(Debug)]
+pub struct TestCluster {
+    pub nodes: Vec<TestNode>,
+    pub clock: Clock,
+    pub default_link_options: TestLinkOptions,
+    seqno: u64,
+}
+
+impl TestCluster {
+    pub fn new(node_ids: &[NodeId]) -> Self {
+        Self {
+            nodes: node_ids.iter().map(|&id| TestNode::new(id)).collect(),
+            clock: Clock::new(),
+            default_link_options: TestLinkOptions::default(),
+            seqno: 0,
+        }
+    }
+
+    pub fn leader_node(&self) -> Option<&Node> {
+        self.nodes
+            .iter()
+            .find(|node| node.inner.role().is_leader())
+            .map(|node| &node.inner)
+    }
+
+    pub fn leader_node_mut(&mut self) -> Option<&mut Node> {
+        self.nodes
+            .iter_mut()
+            .find(|node| node.inner.role().is_leader())
+            .map(|node| &mut node.inner)
+    }
+
+    pub fn random_node_mut(&mut self, ctx: &mut TestCaseContext) -> &mut Node {
+        let index = noprop::sample_usize_in(ctx, 0..self.nodes.len());
+        &mut self.nodes[index].inner
+    }
+
+    pub fn run_while_leader_absent(&mut self, ctx: &mut TestCaseContext, deadline: Clock) -> bool {
+        self.run_until(ctx, deadline, |cluster| cluster.leader_node().is_some())
+    }
+
+    pub fn run(&mut self, ctx: &mut TestCaseContext, deadline: Clock) {
+        self.run_until(ctx, deadline, |_| false);
+    }
+
+    pub fn run_until<F>(&mut self, ctx: &mut TestCaseContext, deadline: Clock, condition: F) -> bool
+    where
+        F: Fn(&TestCluster) -> bool,
+    {
+        while self.clock < deadline {
+            if condition(self) {
+                return true;
+            }
+            self.run_tick(ctx);
+        }
+        condition(self)
+    }
+
+    pub fn run_tick(&mut self, ctx: &mut TestCaseContext) {
+        self.clock.tick();
+        let mut messages = Vec::new();
+        let mut snapshots = Vec::new();
+
+        for node in &mut self.nodes {
+            node.run_tick(ctx, self.clock);
+
+            let source = node.inner.id();
+            let mut actions = std::mem::take(node.inner.actions_mut());
+            if let Some(message) = actions.broadcast_message.take() {
+                for destination in node.inner.peers() {
+                    messages.push((source, destination, message.clone()));
+                }
+            }
+            for (destination, message) in actions.send_messages {
+                messages.push((source, destination, message));
+            }
+            for destination in actions.install_snapshots {
+                snapshots.push((
+                    source,
+                    destination,
+                    node.inner.log().snapshot_position(),
+                    node.inner.log().snapshot_config().clone(),
+                ));
+            }
+        }
+
+        for (source, destination, message) in messages {
+            self.send_message(ctx, source, destination, message);
+        }
+        for (source, destination, position, config) in snapshots {
+            self.send_snapshot(ctx, source, destination, position, config);
+        }
+    }
+
+    fn send_message(
+        &mut self,
+        ctx: &mut TestCaseContext,
+        _source: NodeId,
+        destination: NodeId,
+        message: Message,
+    ) {
+        let options = &self.default_link_options;
+        if noprop::sample_ratio(ctx, options.drop_rate) {
+            return;
+        }
+
+        let latency = options.latency_ticks.sample(ctx) * message_size(&message);
+        for node in &mut self.nodes {
+            if node.inner.id() == destination {
+                node.incoming_messages
+                    .insert((self.clock.after(latency), self.seqno), message);
+                self.seqno += 1;
+                return;
+            }
+        }
+    }
+
+    fn send_snapshot(
+        &mut self,
+        ctx: &mut TestCaseContext,
+        _source: NodeId,
+        destination: NodeId,
+        position: LogPosition,
+        config: ClusterConfig,
+    ) {
+        for node in &mut self.nodes {
+            if node.inner.id() == destination {
+                if node.snapshot_finish_time.is_some() {
+                    return;
+                }
+                node.snapshot_finish_time = Some((
+                    self.clock
+                        .after(node.options.install_snapshot_ticks.sample(ctx)),
+                    position,
+                    config,
+                ));
+                return;
+            }
+        }
+    }
+}
+
+fn message_size(message: &Message) -> usize {
+    match message {
+        Message::AppendEntriesCall { entries, .. } => entries.len(),
+        Message::AppendEntriesReply { .. }
+        | Message::RequestVoteCall { .. }
+        | Message::RequestVoteReply { .. } => 1,
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct TestLinkOptions {
+    pub latency_ticks: MinMax,
+    pub drop_rate: noprop::Ratio,
+}
+
+impl Default for TestLinkOptions {
+    fn default() -> Self {
+        Self {
+            latency_ticks: MinMax::new(5, 20),
+            drop_rate: noprop::Ratio::new(1, 100),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct TestNodeOptions {
+    pub election_timeout_ticks: MinMax,
+    pub storage_latency_ticks: MinMax,
+    pub install_snapshot_ticks: MinMax,
+    pub running_ticks: MinMax,
+    pub stopping_ticks: MinMax,
+}
+
+impl Default for TestNodeOptions {
+    fn default() -> Self {
+        Self {
+            election_timeout_ticks: MinMax::new(100, 1000),
+            storage_latency_ticks: MinMax::new(1, 10),
+            install_snapshot_ticks: MinMax::new(1000, 10_000),
+            running_ticks: MinMax::constant(usize::MAX),
+            stopping_ticks: MinMax::constant(usize::MAX),
+        }
+    }
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+pub struct MinMax {
+    pub min: usize,
+    pub max: usize,
+}
+
+impl MinMax {
+    pub fn new(min: usize, max: usize) -> Self {
+        assert!(min <= max, "MinMax requires min <= max");
+        Self { min, max }
+    }
+
+    pub fn constant(value: usize) -> Self {
+        Self::new(value, value)
+    }
+
+    pub fn sample(self, ctx: &mut TestCaseContext) -> usize {
+        noprop::sample_usize_in(ctx, self.min..=self.max)
+    }
+}
+
+#[derive(Debug)]
+pub struct TestNode {
+    pub inner: Node,
+    pub options: TestNodeOptions,
+    pub voter: bool,
+    running: bool,
+    timeout_expire_time: Option<Clock>,
+    storage_finish_time: Option<Clock>,
+    snapshot_finish_time: Option<(Clock, LogPosition, ClusterConfig)>,
+    incoming_messages: BTreeMap<(Clock, u64), Message>,
+    stop_time: Option<Clock>,
+    start_time: Option<Clock>,
+}
+
+impl TestNode {
+    pub fn new(id: NodeId) -> Self {
+        Self {
+            inner: Node::start(id),
+            options: TestNodeOptions::default(),
+            voter: true,
+            running: true,
+            timeout_expire_time: None,
+            storage_finish_time: None,
+            snapshot_finish_time: None,
+            incoming_messages: BTreeMap::new(),
+            stop_time: None,
+            start_time: None,
+        }
+    }
+
+    fn run_tick(&mut self, ctx: &mut TestCaseContext, now: Clock) {
+        if !self.voter {
+            assert!(self.inner.role().is_follower());
+        }
+
+        if !self.running {
+            if self.start_time.take_if(|time| *time <= now).is_some() {
+                self.running = true;
+                while let Some(entry) = self.incoming_messages.first_entry() {
+                    if entry.key().0 < now {
+                        entry.remove();
+                    } else {
+                        break;
+                    }
+                }
+                self.inner = Node::restart(
+                    self.inner.id(),
+                    NodeGeneration::new(self.inner.generation().get().saturating_add(1)),
+                    self.inner.current_term(),
+                    self.inner.voted_for(),
+                    self.inner.log().clone(),
+                );
+            } else {
+                return;
+            }
+        }
+
+        if self.stop_time.is_none() {
+            self.stop_time = Some(now.after(self.options.running_ticks.sample(ctx)));
+        }
+        if self.stop_time.take_if(|time| *time <= now).is_some() {
+            self.running = false;
+            self.timeout_expire_time = None;
+            self.storage_finish_time = None;
+            self.start_time = Some(now.after(self.options.stopping_ticks.sample(ctx)));
+            return;
+        }
+
+        self.storage_finish_time.take_if(|time| *time <= now);
+        if self.storage_finish_time.is_some() {
+            return;
+        }
+
+        if self
+            .timeout_expire_time
+            .take_if(|time| *time <= now)
+            .is_some()
+        {
+            self.inner.handle_election_timeout();
+        }
+        if let Some((_, position, config)) = self
+            .snapshot_finish_time
+            .take_if(|(time, _, _)| *time <= now)
+        {
+            let _ = self.inner.handle_snapshot_installed(position, config);
+        }
+        while let Some(entry) = self.incoming_messages.first_entry() {
+            if entry.key().0 <= now {
+                let message = entry.remove();
+                self.inner
+                    .handle_message(&message)
+                    .expect("harness-produced messages must be valid");
+            } else {
+                break;
+            }
+        }
+
+        if std::mem::take(&mut self.inner.actions_mut().set_election_timeout) {
+            self.reset_election_timeout(ctx, now);
+        }
+        if std::mem::take(&mut self.inner.actions_mut().save_current_term) {
+            self.extend_storage_finish_time(ctx, now, 1);
+        }
+        if std::mem::take(&mut self.inner.actions_mut().save_voted_for) {
+            self.extend_storage_finish_time(ctx, now, 1);
+        }
+        if let Some(entries) = self.inner.actions_mut().append_log_entries.take() {
+            self.extend_storage_finish_time(ctx, now, entries.len());
+        }
+    }
+
+    fn reset_election_timeout(&mut self, ctx: &mut TestCaseContext, now: Clock) {
+        let timeout = match self.inner.role() {
+            Role::Leader => self.options.election_timeout_ticks.min,
+            Role::Candidate => self.options.election_timeout_ticks.sample(ctx),
+            Role::Follower => self.options.election_timeout_ticks.max,
+        };
+        self.timeout_expire_time = Some(now.after(timeout));
+    }
+
+    fn extend_storage_finish_time(&mut self, ctx: &mut TestCaseContext, now: Clock, count: usize) {
+        let remaining_latency = self.storage_finish_time.map_or(0, |time| time.0 - now.0);
+        let additional_latency = self.options.storage_latency_ticks.sample(ctx) * count;
+        self.storage_finish_time = Some(now.after(remaining_latency + additional_latency));
+    }
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct Clock(usize);
+
+impl Clock {
+    pub fn new() -> Self {
+        Self(0)
+    }
+
+    pub fn tick(&mut self) {
+        self.0 += 1;
+    }
+
+    pub fn after(self, ticks: usize) -> Self {
+        Self(self.0.saturating_add(ticks))
+    }
+}

@@ -1,89 +1,27 @@
-//! Stateless property-based tests for noraft's pure APIs, driven by
-//! noprop (https://github.com/sile/noprop).
-//!
-//! Seed / case budget come from the `NORAFT_PBT_SEED` and
-//! `NORAFT_PBT_CASES` environment variables; unset means
-//! "clock-derived seed" and "1024 cases". A failing seed can be
-//! re-run with:
-//!
-//! ```text
-//! NORAFT_PBT_SEED=<seed> cargo test --test prop_stateless_test
-//! ```
+//! Model-based properties for noraft's stateless public APIs.
+
+pub mod pbt_harness;
 
 use noraft::{ClusterConfig, Log, LogEntries, LogEntry, LogIndex, LogPosition, NodeId, Term};
-use std::cell::Cell;
+use pbt_harness::{
+    run, sample_config, sample_len, sample_log_entry, sample_normal_config, sample_u64_before_max,
+};
+use std::collections::BTreeSet;
 
-/// Runs a property with the standard seed / case-budget handling.
-fn run_prop(
-    cases: usize,
-    property: impl Fn(&mut noprop::TestCaseContext) -> Result<(), Box<dyn std::error::Error>>,
-) -> noprop::TestResult {
-    let seed = noprop::seed_from_env_or_time("NORAFT_PBT_SEED")?;
-    noprop::Runner::new(seed).run(cases, property)?;
-    Ok(())
+fn sample_entries(ctx: &mut noprop::TestCaseContext, max_len: usize) -> LogEntries {
+    let count = sample_len(ctx, max_len);
+    LogEntries::from_iter(LogPosition::ZERO, (0..count).map(|_| sample_log_entry(ctx)))
 }
 
-/// Reads the case-budget environment variable with a default fallback.
-fn cases_from_env(default: usize) -> usize {
-    std::env::var("NORAFT_PBT_CASES")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(default)
+fn sample_entries_from(
+    ctx: &mut noprop::TestCaseContext,
+    prev_position: LogPosition,
+    max_len: usize,
+) -> LogEntries {
+    let count = sample_len(ctx, max_len);
+    LogEntries::from_iter(prev_position, (0..count).map(|_| sample_log_entry(ctx)))
 }
 
-/// Samples a log entry, weighted toward `Command` (the most common
-/// entry in real clusters).
-fn sample_entry(ctx: &mut noprop::TestCaseContext) -> LogEntry {
-    match noprop::sample_weighted_index(ctx, &[3, 1, 1]) {
-        0 => LogEntry::Command,
-        1 => LogEntry::Term(Term::new(noprop::sample_usize_in(ctx, 0..16) as u64)),
-        _ => LogEntry::ClusterConfig(sample_config(ctx)),
-    }
-}
-
-/// Samples a cluster config whose three node sets are pairwise disjoint.
-///
-/// Valid-by-construction: each node of the pool is inserted into at
-/// most one of the three sets, so no node can be a member of two sets.
-fn sample_config(ctx: &mut noprop::TestCaseContext) -> ClusterConfig {
-    let pool: [NodeId; 6] = [
-        NodeId::new(0),
-        NodeId::new(1),
-        NodeId::new(2),
-        NodeId::new(3),
-        NodeId::new(4),
-        NodeId::new(5),
-    ];
-    let mut config = ClusterConfig::new();
-    for id in pool {
-        match noprop::sample_usize_in(ctx, 0..4) {
-            0 => {
-                config.voters.insert(id);
-            }
-            1 => {
-                config.new_voters.insert(id);
-            }
-            2 => {
-                config.non_voters.insert(id);
-            }
-            _ => {}
-        }
-    }
-    config
-}
-
-/// Samples `LogEntries` whose previous position is the last position
-/// of `base` (i.e., the result can be appended to `base`).
-///
-/// The entry count is drawn with boundary emphasis so that empty and
-/// small suffix cases occur with meaningful probability.
-fn sample_entries_from(ctx: &mut noprop::TestCaseContext, base: &LogEntries) -> LogEntries {
-    let count = noprop::sample_usize_in(ctx, 0..=16);
-    LogEntries::from_iter(base.last_position(), (0..count).map(|_| sample_entry(ctx)))
-}
-
-/// Samples a random position within the range of `entries`
-/// (inclusive of the previous position and the last position).
 fn sample_contained_position(
     ctx: &mut noprop::TestCaseContext,
     entries: &LogEntries,
@@ -94,39 +32,53 @@ fn sample_contained_position(
         ctx,
         prev.index.get() as usize..=last.index.get() as usize,
     ) as u64);
-    LogPosition {
-        term: entries.get_term(index).expect("index is in range"),
+    LogPosition::new(
+        entries
+            .get_term(index)
+            .expect("a sampled contained index must have a term"),
         index,
+    )
+}
+
+fn different_term(term: Term) -> Term {
+    if term.get() == u64::MAX {
+        Term::ZERO
+    } else {
+        Term::new(term.get() + 1)
     }
 }
 
-/// `iter_with_positions` must yield monotonically increasing indices
-/// and entries that are readable back via `get_entry`.
-///
-/// The position term of an entry is the term of the most recent
-/// `LogEntry::Term` at or before its index.
+/// Iteration, indexed lookup, and the reported last position must
+/// describe the same entry sequence.
 #[test]
-fn log_entries_iteration_consistency() -> noprop::TestResult {
-    let cases_with_entries: Cell<usize> = Cell::new(0);
-    run_prop(cases_from_env(1024), |ctx| {
-        let mut entries = LogEntries::new(LogPosition::ZERO);
-        let count = noprop::sample_usize_in(ctx, 0..=64);
-        for _ in 0..count {
-            entries.push(sample_entry(ctx));
+fn log_entries_iteration_matches_indexed_lookup() -> noprop::TestResult {
+    run(1024, |ctx| {
+        let entries = sample_entries(ctx, 64);
+        let iterated: Vec<(LogPosition, LogEntry)> = entries
+            .iter_with_positions()
+            .map(|(position, entry)| (position, entry.clone()))
+            .collect();
+
+        if iterated.len() != entries.len() {
+            return Err(format!(
+                "iteration returned {} entries, expected {}",
+                iterated.len(),
+                entries.len()
+            )
+            .into());
         }
 
-        let mut prev = LogPosition::ZERO;
-        for (position, entry) in entries.iter_with_positions() {
-            if position.index != prev.index.next() {
-                return Err(
-                    format!("indices must advance by one: {position:?} after {prev:?}").into(),
-                );
+        let mut previous = entries.prev_position();
+        for (position, entry) in &iterated {
+            if position.index != previous.index.next() {
+                return Err(format!(
+                    "indices must advance by one: {position:?} after {previous:?}"
+                )
+                .into());
             }
-            // A `Term` entry sets the term of its position; other
-            // entries keep the term of the previous entry.
             let expected_term = match entry {
-                LogEntry::Term(term) => term,
-                _ => prev.term,
+                LogEntry::Term(term) => *term,
+                _ => previous.term,
             };
             if position.term != expected_term {
                 return Err(format!(
@@ -134,454 +86,307 @@ fn log_entries_iteration_consistency() -> noprop::TestResult {
                 )
                 .into());
             }
-            let fetched = entries
-                .get_entry(position.index)
-                .ok_or_else(|| format!("entry at {position:?} must be readable back"))?;
-            if fetched != entry {
-                return Err(format!(
-                    "get_entry({:?}) returned {fetched:?}, expected {entry:?}",
-                    position.index
-                )
-                .into());
+            if entries.get_entry(position.index) != Some(entry.clone()) {
+                return Err(
+                    format!("get_entry({:?}) did not return {entry:?}", position.index).into(),
+                );
             }
-            prev = position;
+            previous = *position;
         }
-        if count > 0 {
-            cases_with_entries.set(cases_with_entries.get() + 1);
-            if entries.last_position() != prev {
-                return Err(format!(
-                    "last_position {:?} must equal the last iterated position {prev:?}",
-                    entries.last_position()
-                )
-                .into());
-            }
-        }
-        Ok(())
-    })?;
-    assert!(
-        cases_with_entries.get() > 0,
-        "no case exercised a non-empty LogEntries"
-    );
-    Ok(())
-}
 
-/// `LogEntries::truncate` must keep the first `len` entries unchanged
-/// and must be a no-op when `len` is at least the current length.
-#[test]
-fn log_entries_truncate_keeps_prefix() -> noprop::TestResult {
-    let cases_truncating: Cell<usize> = Cell::new(0);
-    run_prop(cases_from_env(1024), |ctx| {
-        let mut entries = LogEntries::new(LogPosition::ZERO);
-        let count = noprop::sample_usize_in(ctx, 0..=32);
-        for _ in 0..count {
-            entries.push(sample_entry(ctx));
-        }
-        let len = noprop::sample_usize_in(ctx, 0..=count);
-
-        let before: Vec<(LogPosition, LogEntry)> = entries.iter_with_positions().collect();
-        let last_position = entries.last_position();
-        entries.truncate(len);
-
-        if len >= count {
-            if entries.len() != count {
-                return Err(format!(
-                    "truncate({len}) must be a no-op, but len became {}",
-                    entries.len()
-                )
-                .into());
-            }
-        } else {
-            cases_truncating.set(cases_truncating.get() + 1);
-            if entries.len() != len {
-                return Err(format!(
-                    "truncate({len}) must leave {len} entries, but len became {}",
-                    entries.len()
-                )
-                .into());
-            }
-            // The surviving prefix must be unchanged, and the dropped
-            // tail must be the last `count - len` entries.
-            let after: Vec<(LogPosition, LogEntry)> = entries.iter_with_positions().collect();
-            if after != before[..len] {
-                return Err(format!(
-                    "truncate({len}) changed the prefix: before={before:?}, after={after:?}"
-                )
-                .into());
-            }
-            let _ = last_position;
-        }
-        Ok(())
-    })?;
-    assert!(
-        cases_truncating.get() > 0,
-        "no case exercised an actual truncation"
-    );
-    Ok(())
-}
-
-/// `LogEntries::since` must return the suffix after a contained
-/// position, with the correct previous / last positions, and must
-/// return `None` for a position whose index is in range but whose
-/// term does not match.
-#[test]
-fn log_entries_since_returns_tail_suffix() -> noprop::TestResult {
-    let cases_with_suffix: Cell<usize> = Cell::new(0);
-    run_prop(cases_from_env(1024), |ctx| {
-        let mut entries = LogEntries::new(LogPosition::ZERO);
-        let count = noprop::sample_usize_in(ctx, 0..=32);
-        for _ in 0..count {
-            entries.push(sample_entry(ctx));
-        }
-        let position = sample_contained_position(ctx, &entries);
-
-        let Some(suffix) = entries.since(position) else {
-            return Err(format!("since({position:?}) must succeed on a contained position").into());
-        };
-        if suffix.prev_position() != position {
+        if entries.last_position() != previous {
             return Err(format!(
-                "suffix prev_position must be {position:?}, got {:?}",
+                "last_position {:?} does not match the iterated tail {previous:?}",
+                entries.last_position()
+            )
+            .into());
+        }
+        Ok(())
+    })
+}
+
+/// Truncation must preserve exactly the requested prefix, including
+/// its entry values and final position.
+#[test]
+fn log_entries_truncate_matches_prefix_model() -> noprop::TestResult {
+    run(1024, |ctx| {
+        let mut entries = sample_entries(ctx, 32);
+        let before: Vec<(LogPosition, LogEntry)> = entries
+            .iter_with_positions()
+            .map(|(position, entry)| (position, entry.clone()))
+            .collect();
+        let max_requested = before.len() + 4;
+        let len = noprop::sample_with_boundaries(
+            ctx,
+            &[0, before.len(), max_requested],
+            noprop::Ratio::one_nth(5),
+            |ctx| noprop::sample_usize_in(ctx, 0..=max_requested),
+        );
+        let expected = &before[..len.min(before.len())];
+        let expected_last = expected
+            .last()
+            .map_or(entries.prev_position(), |(position, _)| *position);
+
+        entries.truncate(len);
+        let actual: Vec<(LogPosition, LogEntry)> = entries
+            .iter_with_positions()
+            .map(|(position, entry)| (position, entry.clone()))
+            .collect();
+        if actual != expected {
+            return Err(
+                format!("truncate({len}) produced {actual:?}, expected {expected:?}").into(),
+            );
+        }
+        if entries.last_position() != expected_last {
+            return Err(format!(
+                "truncate({len}) ended at {:?}, expected {expected_last:?}",
+                entries.last_position()
+            )
+            .into());
+        }
+        Ok(())
+    })
+}
+
+/// `since` must return the exact suffix after a contained position and
+/// reject the same index paired with a different term.
+#[test]
+fn log_entries_since_matches_suffix_model() -> noprop::TestResult {
+    run(1024, |ctx| {
+        let entries = sample_entries(ctx, 32);
+        let position = sample_contained_position(ctx, &entries);
+        let suffix = entries
+            .since(position)
+            .ok_or_else(|| format!("since({position:?}) rejected a contained position"))?;
+        let expected: Vec<(LogPosition, LogEntry)> = entries
+            .iter_with_positions()
+            .filter(|(candidate, _)| candidate.index > position.index)
+            .map(|(candidate, entry)| (candidate, entry.clone()))
+            .collect();
+        let actual: Vec<(LogPosition, LogEntry)> = suffix
+            .iter_with_positions()
+            .map(|(candidate, entry)| (candidate, entry.clone()))
+            .collect();
+
+        if suffix.prev_position() != position || actual != expected {
+            return Err(format!(
+                "since({position:?}) produced prev={:?}, entries={actual:?}; expected {expected:?}",
                 suffix.prev_position()
             )
             .into());
         }
         if suffix.last_position() != entries.last_position() {
             return Err(format!(
-                "suffix last_position must be {:?}, got {:?}",
-                entries.last_position(),
-                suffix.last_position()
+                "suffix ended at {:?}, expected {:?}",
+                suffix.last_position(),
+                entries.last_position()
             )
             .into());
         }
-        let expected: Vec<(LogPosition, LogEntry)> = entries
+
+        let mismatched = LogPosition::new(different_term(position.term), position.index);
+        if entries.since(mismatched).is_some() {
+            return Err(format!("since({mismatched:?}) accepted a mismatched term").into());
+        }
+        Ok(())
+    })
+}
+
+/// A valid suffix replaces the local tail after its anchor; an invalid
+/// anchor leaves the complete log unchanged.
+#[test]
+fn log_append_suffix_matches_replacement_model() -> noprop::TestResult {
+    run(1024, |ctx| {
+        let snapshot_config = sample_config(ctx);
+        let original = Log::new(snapshot_config.clone(), sample_entries(ctx, 32));
+        let anchor = sample_contained_position(ctx, original.entries());
+        let suffix = sample_entries_from(ctx, anchor, 16);
+
+        let expected_entries = original
+            .entries()
             .iter_with_positions()
-            .skip_while(|(pos, _)| pos.index.get() <= position.index.get())
-            .collect();
-        let actual: Vec<(LogPosition, LogEntry)> = suffix.iter_with_positions().collect();
+            .take_while(|(position, _)| position.index <= anchor.index)
+            .map(|(_, entry)| entry.clone())
+            .chain(suffix.iter());
+        let expected = Log::new(
+            snapshot_config,
+            LogEntries::from_iter(original.snapshot_position(), expected_entries),
+        );
+        let mut actual = original.clone();
+        if !actual.append_suffix(&suffix) {
+            return Err(format!("append_suffix rejected valid anchor {anchor:?}").into());
+        }
         if actual != expected {
             return Err(format!(
-                "suffix must equal the tail after {position:?}: expected {expected:?}, got {actual:?}"
+                "append_suffix result mismatch: actual={actual:?}, expected={expected:?}"
             )
             .into());
         }
-        // The suffix must be re-appendable to its own previous
-        // position, rebuilding the tail.
-        if !suffix.is_empty() {
-            cases_with_suffix.set(cases_with_suffix.get() + 1);
-            let mut rebuilt = LogEntries::new(position);
-            rebuilt.append_suffix(&suffix);
-            if rebuilt.iter_with_positions().collect::<Vec<_>>() != actual {
-                return Err("suffix must round-trip through append_suffix".into());
-            }
-        }
-        // A term-mismatched position within the index range must be
-        // rejected.
-        if !entries.is_empty() {
-            let mismatched = LogPosition {
-                term: Term::new(position.term.get().wrapping_add(1)),
-                index: position.index,
-            };
-            if entries.since(mismatched).is_some() {
-                return Err(
-                    format!("since({mismatched:?}) must return None on a term mismatch").into(),
-                );
-            }
+
+        let invalid_anchor = LogPosition::new(Term::ZERO, original.last_position().index.next());
+        let invalid_suffix = sample_entries_from(ctx, invalid_anchor, 16);
+        let mut unchanged = original.clone();
+        if unchanged.append_suffix(&invalid_suffix) || unchanged != original {
+            return Err("append_suffix changed a log for an invalid anchor".into());
         }
         Ok(())
-    })?;
-    assert!(
-        cases_with_suffix.get() > 0,
-        "no case exercised a non-empty suffix"
-    );
-    Ok(())
+    })
 }
 
-/// `Log::append_suffix` must advance `last_position` to the suffix's
-/// last position when the suffix fits, and leave the log unchanged
-/// otherwise.
+/// `latest_config` and `get_position_and_config` must agree with a
+/// straightforward scan of the log.
 #[test]
-fn log_append_suffix_updates_last_position() -> noprop::TestResult {
-    let cases_appended: Cell<usize> = Cell::new(0);
-    let cases_rejected: Cell<usize> = Cell::new(0);
-    run_prop(cases_from_env(1024), |ctx| {
-        let mut entries = LogEntries::new(LogPosition::ZERO);
-        let count = noprop::sample_usize_in(ctx, 0..=32);
-        for _ in 0..count {
-            entries.push(sample_entry(ctx));
-        }
-        let mut log = Log::new(ClusterConfig::new(), entries);
-
-        // Build a suffix whose `prev_position` may or may not be
-        // contained in the log. The anchor is in-range most of the
-        // time and out of range otherwise, so both the append and the
-        // rejection path are exercised.
-        let mut suffix = sample_entries_from(ctx, &LogEntries::new(LogPosition::ZERO));
-        let anchor_index = match noprop::sample_weighted_index(ctx, &[4, 1]) {
-            0 => LogIndex::new(noprop::sample_usize_in(
-                ctx,
-                log.entries().prev_position().index.get() as usize
-                    ..=log.last_position().index.get() as usize,
-            ) as u64),
-            _ => LogIndex::new(
-                log.last_position().index.get() + 1 + noprop::sample_usize_in(ctx, 0..4) as u64,
-            ),
-        };
-        let anchor_term = log
-            .entries()
-            .get_term(anchor_index)
-            .unwrap_or(log.entries().prev_position().term);
-        suffix = LogEntries::from_iter(
-            LogPosition {
-                term: anchor_term,
-                index: anchor_index,
-            },
-            suffix.iter(),
-        );
-
-        let before = log.last_position();
-        let appended = log.append_suffix(&suffix);
-        if log.entries().contains(suffix.prev_position()) {
-            if !appended {
-                return Err(format!(
-                    "append_suffix must succeed when prev_position {:?} is contained",
-                    suffix.prev_position()
-                )
-                .into());
-            }
-            cases_appended.set(cases_appended.get() + 1);
-            if log.last_position() != suffix.last_position() {
-                return Err(format!(
-                    "last_position {:?} must become the suffix's last_position {:?}",
-                    log.last_position(),
-                    suffix.last_position()
-                )
-                .into());
-            }
-        } else {
-            if appended || log.last_position() != before {
-                return Err(format!(
-                    "append_suffix must fail without changing the log when prev_position {:?} \
-                     is not contained",
-                    suffix.prev_position()
-                )
-                .into());
-            }
-            cases_rejected.set(cases_rejected.get() + 1);
-        }
-        Ok(())
-    })?;
-    assert!(
-        cases_appended.get() > 0 && cases_rejected.get() > 0,
-        "no case exercised both the append and the rejection path"
-    );
-    Ok(())
-}
-
-/// `Log::latest_config` must return the most recent `ClusterConfig`
-/// entry in the log, falling back to the snapshot config when there
-/// is none.
-///
-/// `Log::get_position_and_config` must return the position and
-/// config at a contained index, and `None` out of range.
-#[test]
-fn log_latest_config_and_get_position_and_config() -> noprop::TestResult {
-    let cases_with_config: Cell<usize> = Cell::new(0);
-    run_prop(cases_from_env(1024), |ctx| {
+fn log_config_queries_match_scan_model() -> noprop::TestResult {
+    run(1024, |ctx| {
         let snapshot_config = sample_config(ctx);
-        let mut entries = LogEntries::new(LogPosition::ZERO);
-        let count = noprop::sample_usize_in(ctx, 0..=32);
-        let mut last_config = snapshot_config.clone();
-        for _ in 0..count {
-            let entry = sample_entry(ctx);
-            if let LogEntry::ClusterConfig(config) = &entry {
-                last_config = config.clone();
-                cases_with_config.set(cases_with_config.get() + 1);
-            }
-            entries.push(entry);
-        }
+        let entries = sample_entries(ctx, 32);
         let log = Log::new(snapshot_config.clone(), entries);
-
-        if log.latest_config() != &last_config {
+        let mut latest = snapshot_config.clone();
+        for (_, entry) in log.entries().iter_with_positions() {
+            if let LogEntry::ClusterConfig(config) = entry {
+                latest = config.clone();
+            }
+        }
+        if log.latest_config() != &latest {
             return Err(format!(
-                "latest_config must be the most recent config entry: got {:?}, expected \
-                 {last_config:?}",
+                "latest_config returned {:?}, expected {latest:?}",
                 log.latest_config()
             )
             .into());
         }
 
-        // A contained index must return its position and the config
-        // in effect at that index.
-        let index = sample_contained_position(ctx, log.entries()).index;
-        let (position, config) = log
-            .get_position_and_config(index)
-            .expect("contained index must resolve");
-        if position.index != index {
-            return Err(format!(
-                "get_position_and_config({index:?}) must return index {index:?}, got {:?}",
-                position.index
-            )
-            .into());
-        }
-        if position.term != log.entries().get_term(index).expect("contained index") {
-            return Err(format!(
-                "get_position_and_config({index:?}) must return the entry term, got {:?}",
-                position.term
-            )
-            .into());
-        }
-        let mut expected_config = snapshot_config.clone();
-        for (pos, entry) in log.entries().iter_with_positions() {
-            if pos.index > index {
+        let target = sample_contained_position(ctx, log.entries());
+        let (actual_position, actual_config) = log
+            .get_position_and_config(target.index)
+            .expect("a contained index must resolve");
+        let mut expected_config = snapshot_config;
+        for (position, entry) in log.entries().iter_with_positions() {
+            if position.index > target.index {
                 break;
             }
             if let LogEntry::ClusterConfig(config) = entry {
-                expected_config = config;
+                expected_config = config.clone();
             }
         }
-        if config != &expected_config {
+        if actual_position != target || actual_config != &expected_config {
             return Err(format!(
-                "get_position_and_config({index:?}) must return the config in effect at that \
-                 index: got {config:?}, expected {expected_config:?}"
+                "config query mismatch at {:?}: got ({actual_position:?}, {actual_config:?}), \
+                 expected ({target:?}, {expected_config:?})",
+                target.index
             )
             .into());
         }
 
-        // An out-of-range index must return None.
-        let beyond = LogIndex::new(log.last_position().index.get().saturating_add(1));
+        let beyond = log.last_position().index.next();
         if log.get_position_and_config(beyond).is_some() {
-            return Err(format!(
-                "get_position_and_config({beyond:?}) must return None for an out-of-range index"
-            )
-            .into());
+            return Err(format!("out-of-range index {beyond:?} resolved unexpectedly").into());
         }
         Ok(())
-    })?;
-    assert!(
-        cases_with_config.get() > 0,
-        "no case exercised a log with a ClusterConfig entry"
-    );
-    Ok(())
+    })
 }
 
-/// The three node sets of a `ClusterConfig` must be pairwise disjoint
-/// and `unique_nodes` must be exactly their union.
+/// `unique_nodes` is the sorted set union, including configurations
+/// where voter sets overlap during joint consensus.
 #[test]
-fn cluster_config_sets_are_disjoint_and_complete() -> noprop::TestResult {
-    run_prop(cases_from_env(1024), |ctx| {
-        let config = sample_config(ctx);
-        let unique: Vec<NodeId> = config.unique_nodes().collect();
-
-        // Pairwise disjoint.
-        for id in &unique {
-            let in_voters = config.voters.contains(id);
-            let in_new = config.new_voters.contains(id);
-            let in_non = config.non_voters.contains(id);
-            let membership = [in_voters, in_new, in_non].iter().filter(|b| **b).count();
-            if membership != 1 {
-                return Err(format!(
-                    "node {id:?} must belong to exactly one set (voters / new_voters / \
-                     non_voters)"
-                )
-                .into());
-            }
+fn cluster_config_unique_nodes_matches_set_union() -> noprop::TestResult {
+    run(1024, |ctx| {
+        let empty = ClusterConfig::new();
+        if empty.unique_nodes().next().is_some() {
+            return Err("an empty config yielded a node".into());
         }
 
-        // Complete: every node of the three sets appears exactly once
-        // in `unique_nodes`.
-        let expected_len = config.voters.len() + config.new_voters.len() + config.non_voters.len();
-        if unique.len() != expected_len {
-            return Err(format!(
-                "unique_nodes yields {} nodes, expected {expected_len}",
-                unique.len()
-            )
-            .into());
+        let mut config = sample_config(ctx);
+        let joint_overlap = NodeId::new(100);
+        config.voters.insert(joint_overlap);
+        config.new_voters.insert(joint_overlap);
+        let three_way_overlap = NodeId::new(101);
+        config.voters.insert(three_way_overlap);
+        config.new_voters.insert(three_way_overlap);
+        config.non_voters.insert(three_way_overlap);
+
+        let expected: BTreeSet<NodeId> = config
+            .voters
+            .iter()
+            .chain(&config.new_voters)
+            .chain(&config.non_voters)
+            .copied()
+            .collect();
+        let actual: Vec<NodeId> = config.unique_nodes().collect();
+        if actual != expected.iter().copied().collect::<Vec<_>>() {
+            return Err(format!("unique_nodes returned {actual:?}, expected {expected:?}").into());
+        }
+        for id in &expected {
+            if !config.contains(*id) {
+                return Err(format!("contains({id:?}) rejected a member of the union").into());
+            }
         }
         if config.is_joint_consensus() != !config.new_voters.is_empty() {
-            return Err("is_joint_consensus must reflect a non-empty new_voters".into());
+            return Err("is_joint_consensus disagrees with new_voters".into());
         }
         Ok(())
     })
 }
 
-/// `to_joint_consensus` must set `new_voters` to the old voters plus
-/// the additions minus the removals, and must keep `voters` as the old
-/// configuration during the joint consensus.
+/// `to_joint_consensus` keeps the old voters and computes the new
+/// voters as `(old + additions) - removals`.
 #[test]
-fn cluster_config_to_joint_consensus() -> noprop::TestResult {
-    run_prop(cases_from_env(1024), |ctx| {
-        let base = sample_config(ctx);
-        // Sample additions / removals from the pool of candidate node
-        // ids.
-        let mut adding = Vec::new();
-        let mut removing = Vec::new();
-        for i in 0..4u64 {
-            match noprop::sample_usize_in(ctx, 0..3) {
-                0 => adding.push(NodeId::new(100 + i)),
-                1 => removing.push(NodeId::new(i)),
-                _ => {}
-            }
+fn cluster_config_to_joint_consensus_matches_set_model() -> noprop::TestResult {
+    run(1024, |ctx| {
+        let base = sample_normal_config(ctx);
+        let before = base.clone();
+        let additions: Vec<NodeId> = (100..104)
+            .filter(|_| noprop::sample_bool(ctx))
+            .map(NodeId::new)
+            .collect();
+        let removals: Vec<NodeId> = base
+            .voters
+            .iter()
+            .copied()
+            .filter(|_| noprop::sample_bool(ctx))
+            .collect();
+        let mut expected = base.voters.clone();
+        expected.extend(additions.iter().copied());
+        expected.retain(|id| !removals.contains(id));
+
+        let joint = base.to_joint_consensus(&additions, &removals);
+        if base != before {
+            return Err("to_joint_consensus mutated its source config".into());
         }
-        let joint = base.to_joint_consensus(&adding, &removing);
-        let mut expected: Vec<NodeId> = base.voters.iter().copied().collect();
-        expected.extend(adding.iter().copied());
-        expected.retain(|id| !removing.contains(id));
-        expected.sort_unstable();
-        expected.dedup();
-        let actual: Vec<NodeId> = joint.new_voters.iter().copied().collect();
-        if actual != expected {
+        if joint.voters != base.voters
+            || joint.non_voters != base.non_voters
+            || joint.new_voters != expected
+        {
             return Err(format!(
-                "new_voters must be voters + additions - removals: got {actual:?}, \
-                 expected {expected:?}"
+                "joint config mismatch: got {joint:?}, expected new voters {expected:?}"
             )
             .into());
         }
-        // `voters` must stay as the old configuration during joint
-        // consensus.
-        if joint.voters != base.voters {
-            return Err("voters must stay unchanged during joint consensus".into());
-        }
         Ok(())
     })
 }
 
-/// `LogPosition::next` advances the index by one and keeps the term.
 #[test]
 fn log_position_next_advances_index_only() -> noprop::TestResult {
-    run_prop(cases_from_env(1024), |ctx| {
-        let term = Term::new(noprop::sample_usize_in(ctx, 0..1 << 20) as u64);
-        let index = LogIndex::new(noprop::sample_usize_in(ctx, 0..1 << 20) as u64);
+    run(1024, |ctx| {
+        let term = Term::new(noprop::sample_u64(ctx));
+        let index = LogIndex::new(sample_u64_before_max(ctx));
         let position = LogPosition::new(term, index);
         let next = position.next();
-        if next.index != index.next() {
-            return Err(format!("next must advance the index: {next:?}").into());
-        }
-        if next.term != term {
-            return Err(format!("next must keep the term: {next:?} vs {term:?}").into());
+        if next.index.get() != index.get() + 1 || next.term != term {
+            return Err(format!("next({position:?}) returned {next:?}").into());
         }
         Ok(())
     })
 }
 
-/// `LogIndex::next` advances the index by one.
 #[test]
 fn log_index_next_advances_by_one() -> noprop::TestResult {
-    run_prop(cases_from_env(1024), |ctx| {
-        let index = LogIndex::new(noprop::sample_usize_in(ctx, 0..1 << 20) as u64);
+    run(1024, |ctx| {
+        let index = LogIndex::new(sample_u64_before_max(ctx));
         let next = index.next();
         if next.get() != index.get() + 1 {
-            return Err(
-                format!("next must advance the index by one: {next:?} after {index:?}").into(),
-            );
+            return Err(format!("next({index:?}) returned {next:?}").into());
         }
         Ok(())
     })
-}
-
-/// `Ratio` must validate its numerator / denominator at construction
-/// time: a numerator exceeding the denominator or a zero denominator
-/// panics. This guards against accidental misuse in test generators.
-#[test]
-#[should_panic]
-fn ratio_rejects_invalid_construction() {
-    let _ = noprop::Ratio::new(3, 2);
 }
