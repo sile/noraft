@@ -5,13 +5,12 @@
 //! The oracle retains leaders and committed entries across the complete
 //! case so sequential violations cannot disappear with current state.
 
-#[path = "helpers/pbt.rs"]
-pub mod pbt;
+pub mod helpers;
 
+use helpers::pbt::run_config;
 use noraft::{
     Action, Log, LogEntry, LogIndex, LogPosition, Message, Node, NodeGeneration, NodeId, Role, Term,
 };
-use pbt::run_config;
 use std::cell::Cell;
 use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
@@ -23,6 +22,7 @@ const MAX_STEPS: usize = 200;
 enum Cmd {
     TickElection(NodeId),
     DeliverNext(NodeId),
+    DuplicateNext(NodeId),
     DropNext(NodeId),
     Crash(NodeId),
     Restart(NodeId),
@@ -34,6 +34,7 @@ impl fmt::Display for Cmd {
         let (name, id) = match self {
             Self::TickElection(id) => ("TickElection", id),
             Self::DeliverNext(id) => ("DeliverNext", id),
+            Self::DuplicateNext(id) => ("DuplicateNext", id),
             Self::DropNext(id) => ("DropNext", id),
             Self::Crash(id) => ("Crash", id),
             Self::Restart(id) => ("Restart", id),
@@ -47,6 +48,7 @@ impl fmt::Display for Cmd {
 enum CmdKind {
     TickElection,
     DeliverNext,
+    DuplicateNext,
     DropNext,
     Crash,
     Restart,
@@ -179,6 +181,8 @@ impl Cluster {
         if !queued.is_empty() {
             kinds.push(CmdKind::DeliverNext);
             weights.push(12);
+            kinds.push(CmdKind::DuplicateNext);
+            weights.push(1);
             kinds.push(CmdKind::DropNext);
             weights.push(1);
         }
@@ -199,6 +203,7 @@ impl Cluster {
         match kind {
             CmdKind::TickElection => Cmd::TickElection(noprop::sample_choice(ctx, &running)),
             CmdKind::DeliverNext => Cmd::DeliverNext(noprop::sample_choice(ctx, &queued)),
+            CmdKind::DuplicateNext => Cmd::DuplicateNext(noprop::sample_choice(ctx, &queued)),
             CmdKind::DropNext => Cmd::DropNext(noprop::sample_choice(ctx, &queued)),
             CmdKind::Crash => Cmd::Crash(noprop::sample_choice(ctx, &running)),
             CmdKind::Restart => Cmd::Restart(noprop::sample_choice(ctx, &crashed)),
@@ -228,6 +233,24 @@ impl Cluster {
                     .map_err(|error| {
                         format!(
                             "node {} rejected a harness-produced message {message:?}: {error:?}",
+                            u64::from(id)
+                        )
+                    })?;
+                self.drain_actions(id)
+            }
+            Cmd::DuplicateNext(id) => {
+                let message = self
+                    .queues
+                    .get(&id)
+                    .and_then(|queue| queue.front().cloned())
+                    .expect("commands only select non-empty queues");
+                self.nodes
+                    .get_mut(&id)
+                    .expect("queues only exist for running nodes")
+                    .handle_message(&message)
+                    .map_err(|error| {
+                        format!(
+                            "node {} rejected a duplicated harness message {message:?}: {error:?}",
                             u64::from(id)
                         )
                     })?;
@@ -499,6 +522,7 @@ fn cluster_invariants_hold() -> noprop::TestResult {
     let cases_with_leader_history = Cell::new(0usize);
     let cases_with_crash = Cell::new(0usize);
     let cases_with_restart = Cell::new(0usize);
+    let cases_with_duplicate = Cell::new(0usize);
     let cases_with_multiple_leader_terms = Cell::new(0usize);
     let mut runner = noprop::Runner::new(config.seed);
 
@@ -510,12 +534,14 @@ fn cluster_invariants_hold() -> noprop::TestResult {
         let mut history = Vec::new();
         let mut crashed = false;
         let mut restarted = false;
+        let mut duplicated = false;
         invariants.check(&cluster)?;
 
         for step in 0..sample_steps(ctx) {
             let command = cluster.sample_command(ctx);
             crashed |= matches!(command, Cmd::Crash(_));
             restarted |= matches!(command, Cmd::Restart(_));
+            duplicated |= matches!(command, Cmd::DuplicateNext(_));
             cluster.apply(command).map_err(|error| {
                 format!("command failed at step {step}: {error}; history={history:?}")
             })?;
@@ -541,6 +567,9 @@ fn cluster_invariants_hold() -> noprop::TestResult {
         if restarted {
             cases_with_restart.set(cases_with_restart.get() + 1);
         }
+        if duplicated {
+            cases_with_duplicate.set(cases_with_duplicate.get() + 1);
+        }
         if invariants.leaders_by_term.len() > 1 {
             cases_with_multiple_leader_terms.set(cases_with_multiple_leader_terms.get() + 1);
         }
@@ -555,6 +584,10 @@ fn cluster_invariants_hold() -> noprop::TestResult {
         ),
         (cases_with_crash.get(), "an effective crash"),
         (cases_with_restart.get(), "an effective restart"),
+        (
+            cases_with_duplicate.get(),
+            "an effective duplicated message delivery",
+        ),
         (
             cases_with_multiple_leader_terms.get(),
             "leaders in multiple terms",

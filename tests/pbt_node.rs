@@ -1,12 +1,11 @@
 //! Stateful properties for valid single-node cluster transitions.
 
-#[path = "helpers/pbt.rs"]
-pub mod pbt;
+pub mod helpers;
 
+use helpers::pbt::{run, sample_len};
 use noraft::{
     ClusterConfig, CommitStatus, LogIndex, LogPosition, Message, Node, NodeId, Role, Term,
 };
-use pbt::{run, sample_len};
 
 const MAX_STEPS: usize = 200;
 

@@ -1,10 +1,9 @@
 //! Model-based PBTs for noraft log APIs.
 
-#[path = "helpers/pbt.rs"]
-pub mod pbt;
+pub mod helpers;
 
+use helpers::pbt::{run, sample_config, sample_len, sample_log_entry, sample_u64_before_max};
 use noraft::{Log, LogEntries, LogEntry, LogIndex, LogPosition, Term};
-use pbt::{run, sample_config, sample_len, sample_log_entry, sample_u64_before_max};
 
 fn sample_entries(ctx: &mut noprop::TestCaseContext, max_len: usize) -> LogEntries {
     let count = sample_len(ctx, max_len);

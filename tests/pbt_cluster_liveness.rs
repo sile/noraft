@@ -4,14 +4,11 @@
 //! via the shared runner. CI therefore uses a fresh time-derived seed
 //! unless `NORAFT_PBT_SEED` is explicitly set for reproduction.
 
-#[path = "helpers/pbt.rs"]
-pub mod pbt;
-#[path = "helpers/pbt_scenario.rs"]
-pub mod pbt_scenario;
+pub mod helpers;
 
+use helpers::pbt::run;
+use helpers::pbt_scenario::{MinMax, TestCluster, assert_all_terminal};
 use noraft::{LogPosition, NodeId};
-use pbt::run;
-use pbt_scenario::{MinMax, TestCluster, assert_all_terminal};
 
 /// Command proposals commit under stable links, the commit indices
 /// converge, and the leader does not change (term stays 1).

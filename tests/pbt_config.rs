@@ -1,10 +1,9 @@
 //! Model-based PBTs for noraft cluster configurations.
 
-#[path = "helpers/pbt.rs"]
-pub mod pbt;
+pub mod helpers;
 
+use helpers::pbt::{run, sample_config, sample_normal_config};
 use noraft::{ClusterConfig, NodeId};
-use pbt::{run, sample_config, sample_normal_config};
 use std::collections::BTreeSet;
 
 /// `unique_nodes` is the sorted set union, including configurations

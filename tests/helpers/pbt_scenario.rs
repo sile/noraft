@@ -2,7 +2,8 @@
 
 use noprop::TestCaseContext;
 use noraft::{
-    ClusterConfig, CommitStatus, LogPosition, Message, Node, NodeGeneration, NodeId, Role,
+    ClusterConfig, CommitStatus, Log, LogEntries, LogPosition, Message, Node, NodeGeneration,
+    NodeId, Role, Term,
 };
 use std::collections::BTreeMap;
 
@@ -12,6 +13,10 @@ pub struct TestCluster {
     pub clock: Clock,
     pub default_link_options: TestLinkOptions,
     seqno: u64,
+    snapshot_requests: usize,
+    snapshot_drops: usize,
+    snapshots_to_drop: usize,
+    leaders_by_term: BTreeMap<Term, NodeId>,
 }
 
 impl TestCluster {
@@ -21,21 +26,52 @@ impl TestCluster {
             clock: Clock::new(),
             default_link_options: TestLinkOptions::default(),
             seqno: 0,
+            snapshot_requests: 0,
+            snapshot_drops: 0,
+            snapshots_to_drop: 0,
+            leaders_by_term: BTreeMap::new(),
         }
     }
 
     pub fn leader_node(&self) -> Option<&Node> {
         self.nodes
             .iter()
-            .find(|node| node.inner.role().is_leader())
+            .find(|node| node.running && node.inner.role().is_leader())
             .map(|node| &node.inner)
     }
 
     pub fn leader_node_mut(&mut self) -> Option<&mut Node> {
         self.nodes
             .iter_mut()
-            .find(|node| node.inner.role().is_leader())
+            .find(|node| node.running && node.inner.role().is_leader())
             .map(|node| &mut node.inner)
+    }
+
+    /// Forces the next `count` snapshot transfers to be dropped.
+    pub fn drop_next_snapshots(&mut self, count: usize) {
+        self.snapshots_to_drop = self.snapshots_to_drop.saturating_add(count);
+    }
+
+    pub fn snapshot_requests(&self) -> usize {
+        self.snapshot_requests
+    }
+
+    pub fn snapshot_drops(&self) -> usize {
+        self.snapshot_drops
+    }
+
+    pub fn snapshot_installations_succeeded(&self) -> usize {
+        self.nodes
+            .iter()
+            .map(|node| node.snapshot_installations_succeeded)
+            .sum()
+    }
+
+    pub fn snapshot_installations_rejected(&self) -> usize {
+        self.nodes
+            .iter()
+            .map(|node| node.snapshot_installations_rejected)
+            .sum()
     }
 
     pub fn random_node_mut(&mut self, ctx: &mut TestCaseContext) -> &mut Node {
@@ -83,6 +119,7 @@ impl TestCluster {
                 messages.push((source, destination, message));
             }
             for destination in actions.install_snapshots {
+                self.snapshot_requests = self.snapshot_requests.saturating_add(1);
                 snapshots.push((
                     source,
                     destination,
@@ -98,6 +135,7 @@ impl TestCluster {
         for (source, destination, position, config) in snapshots {
             self.send_snapshot(ctx, source, destination, position, config);
         }
+        self.check_election_safety();
     }
 
     fn send_message(
@@ -131,6 +169,15 @@ impl TestCluster {
         position: LogPosition,
         config: ClusterConfig,
     ) {
+        let forced_drop = self.snapshots_to_drop > 0;
+        if forced_drop {
+            self.snapshots_to_drop -= 1;
+        }
+        if forced_drop || noprop::sample_ratio(ctx, self.default_link_options.drop_rate) {
+            self.snapshot_drops = self.snapshot_drops.saturating_add(1);
+            return;
+        }
+
         for node in &mut self.nodes {
             if node.inner.id() == destination {
                 if node.snapshot_finish_time.is_some() {
@@ -143,6 +190,22 @@ impl TestCluster {
                     config,
                 ));
                 return;
+            }
+        }
+    }
+
+    fn check_election_safety(&mut self) {
+        for node in &self.nodes {
+            if !node.inner.role().is_leader() {
+                continue;
+            }
+            let id = node.inner.id();
+            let term = node.inner.current_term();
+            if let Some(previous) = self.leaders_by_term.insert(term, id) {
+                assert_eq!(
+                    previous, id,
+                    "election safety violated: two leaders observed in term {term:?}"
+                );
             }
         }
     }
@@ -274,6 +337,8 @@ pub struct TestNode {
     timeout_expire_time: Option<Clock>,
     storage_finish_time: Option<Clock>,
     snapshot_finish_time: Option<(Clock, LogPosition, ClusterConfig)>,
+    snapshot_installations_succeeded: usize,
+    snapshot_installations_rejected: usize,
     incoming_messages: BTreeMap<(Clock, u64), Message>,
     stop_time: Option<Clock>,
     start_time: Option<Clock>,
@@ -289,10 +354,24 @@ impl TestNode {
             timeout_expire_time: None,
             storage_finish_time: None,
             snapshot_finish_time: None,
+            snapshot_installations_succeeded: 0,
+            snapshot_installations_rejected: 0,
             incoming_messages: BTreeMap::new(),
             stop_time: None,
             start_time: None,
         }
+    }
+
+    /// Restarts the node after discarding all durable and in-flight state.
+    pub fn lose_storage(&mut self) {
+        let id = self.inner.id();
+        let generation = NodeGeneration::new(self.inner.generation().get().saturating_add(1));
+        let log = Log::new(ClusterConfig::new(), LogEntries::new(LogPosition::ZERO));
+        self.inner = Node::restart(id, generation, Term::ZERO, None, log);
+        self.timeout_expire_time = None;
+        self.storage_finish_time = None;
+        self.snapshot_finish_time = None;
+        self.incoming_messages.clear();
     }
 
     fn run_tick(&mut self, ctx: &mut TestCaseContext, now: Clock) {
@@ -329,6 +408,7 @@ impl TestNode {
             self.running = false;
             self.timeout_expire_time = None;
             self.storage_finish_time = None;
+            self.snapshot_finish_time = None;
             self.start_time = Some(now.after(self.options.stopping_ticks.sample(ctx)));
             return;
         }
@@ -349,7 +429,13 @@ impl TestNode {
             .snapshot_finish_time
             .take_if(|(time, _, _)| *time <= now)
         {
-            let _ = self.inner.handle_snapshot_installed(position, config);
+            if self.inner.handle_snapshot_installed(position, config) {
+                self.snapshot_installations_succeeded =
+                    self.snapshot_installations_succeeded.saturating_add(1);
+            } else {
+                self.snapshot_installations_rejected =
+                    self.snapshot_installations_rejected.saturating_add(1);
+            }
         }
         while let Some(entry) = self.incoming_messages.first_entry() {
             if entry.key().0 <= now {

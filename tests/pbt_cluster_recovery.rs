@@ -4,17 +4,52 @@
 //! via the shared runner. CI therefore uses a fresh time-derived seed
 //! unless `NORAFT_PBT_SEED` is explicitly set for reproduction.
 
-#[path = "helpers/pbt.rs"]
-pub mod pbt;
-#[path = "helpers/pbt_scenario.rs"]
-pub mod pbt_scenario;
+pub mod helpers;
 
-use noraft::{
-    ClusterConfig, Log, LogEntries, LogIndex, LogPosition, Node, NodeGeneration, NodeId, Term,
-};
-use pbt::{run, run_config};
-use pbt_scenario::{MinMax, TestCluster, assert_all_terminal, wait_until_terminal};
+use helpers::pbt::{run, run_config};
+use helpers::pbt_scenario::{MinMax, TestCluster, assert_all_terminal, wait_until_terminal};
+use noraft::{LogIndex, LogPosition, NodeId};
 use std::cell::Cell;
+
+fn check_snapshot_compatible_logs(cluster: &TestCluster) -> Result<(), String> {
+    for left_index in 0..cluster.nodes.len() {
+        for right_index in left_index + 1..cluster.nodes.len() {
+            let left = cluster.nodes[left_index].inner.log();
+            let right = cluster.nodes[right_index].inner.log();
+            let shared_anchor = left
+                .snapshot_position()
+                .index
+                .max(right.snapshot_position().index);
+            if left.entries().get_term(shared_anchor) != right.entries().get_term(shared_anchor) {
+                return Err(format!(
+                    "snapshot anchors disagree for nodes {left_index} and {right_index} at \
+                     {shared_anchor:?}: left={left:?}, right={right:?}"
+                ));
+            }
+
+            let shared_last = left.last_position().index.min(right.last_position().index);
+            let mut index = shared_anchor;
+            while index < shared_last {
+                index = index.next();
+                let left_entry = (
+                    left.entries().get_term(index),
+                    left.entries().get_entry(index),
+                );
+                let right_entry = (
+                    right.entries().get_term(index),
+                    right.entries().get_entry(index),
+                );
+                if left_entry != right_entry {
+                    return Err(format!(
+                        "log suffixes disagree for nodes {left_index} and {right_index} at \
+                         {index:?}: left={left_entry:?}, right={right_entry:?}"
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
 
 /// Command proposals commit while a node periodically restarts, and
 /// the run must exercise at least one restart.
@@ -134,12 +169,7 @@ fn proposals_commit_after_storage_repair() -> noprop::TestResult {
                 // Reset the non-leader nodes: their storage is lost.
                 for node in cluster.nodes.iter_mut() {
                     if !node.inner.role().is_leader() {
-                        let generation =
-                            NodeGeneration::new(node.inner.generation().get().saturating_add(1));
-                        let log =
-                            Log::new(ClusterConfig::new(), LogEntries::new(LogPosition::ZERO));
-                        node.inner =
-                            Node::restart(node.inner.id(), generation, Term::ZERO, None, log);
+                        node.lose_storage();
                     }
                 }
                 cases_with_repair.set(cases_with_repair.get() + 1);
@@ -205,6 +235,10 @@ fn proposals_commit_after_snapshot_repair() -> noprop::TestResult {
         let proposals = noprop::sample_usize_in(ctx, 4..=32);
         let snapshot_at = noprop::sample_usize_in(ctx, 1..proposals - 1);
         let repair_at = noprop::sample_usize_in(ctx, snapshot_at + 1..proposals);
+        // Both followers will need a snapshot after losing storage.
+        // Dropping their first transfers makes a later successful
+        // installation evidence that the leader retried.
+        let forced_snapshot_drops = 2;
         let mut positions = Vec::new();
         let mut snapshot_index = LogIndex::ZERO;
         for i in 0..proposals {
@@ -241,14 +275,10 @@ fn proposals_commit_after_snapshot_repair() -> noprop::TestResult {
                 // Reset the non-leader nodes: their storage is lost.
                 for node in cluster.nodes.iter_mut() {
                     if !node.inner.role().is_leader() {
-                        let generation =
-                            NodeGeneration::new(node.inner.generation().get().saturating_add(1));
-                        let log =
-                            Log::new(ClusterConfig::new(), LogEntries::new(LogPosition::ZERO));
-                        node.inner =
-                            Node::restart(node.inner.id(), generation, Term::ZERO, None, log);
+                        node.lose_storage();
                     }
                 }
+                cluster.drop_next_snapshots(forced_snapshot_drops);
             }
 
             let found = cluster.run_while_leader_absent(ctx, cluster.clock.after(10_000));
@@ -288,11 +318,39 @@ fn proposals_commit_after_snapshot_repair() -> noprop::TestResult {
         }
 
         let satisfied = cluster.run_until(ctx, cluster.clock.after(1_000_000), |cluster| {
-            cluster.nodes[0].inner.commit_index() == cluster.nodes[1].inner.commit_index()
-                && cluster.nodes[0].inner.commit_index() == cluster.nodes[2].inner.commit_index()
+            let reference = &cluster.nodes[0].inner;
+            cluster.nodes.iter().skip(1).all(|node| {
+                node.inner.commit_index() == reference.commit_index()
+                    && node.inner.log().last_position() == reference.log().last_position()
+            })
         });
         if !satisfied {
-            return Err("commit indices are not synchronized".into());
+            return Err("log tails and commit indices are not synchronized".into());
+        }
+        check_snapshot_compatible_logs(&cluster)?;
+        if cluster.snapshot_requests() <= forced_snapshot_drops {
+            return Err(format!(
+                "snapshot was not retried after {forced_snapshot_drops} forced drops: requests={}",
+                cluster.snapshot_requests()
+            )
+            .into());
+        }
+        if cluster.snapshot_drops() < forced_snapshot_drops {
+            return Err(format!(
+                "only {} of {forced_snapshot_drops} forced snapshot drops were observed",
+                cluster.snapshot_drops()
+            )
+            .into());
+        }
+        if cluster.snapshot_installations_succeeded() == 0 {
+            return Err("no remote snapshot installation completed".into());
+        }
+        if cluster.snapshot_installations_rejected() != 0 {
+            return Err(format!(
+                "{} remote snapshot installations were rejected",
+                cluster.snapshot_installations_rejected()
+            )
+            .into());
         }
         Ok(())
     })?;
