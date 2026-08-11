@@ -4,11 +4,10 @@
 //! via the shared runner. CI therefore uses a fresh time-derived seed
 //! unless `NORAFT_PBT_SEED` is explicitly set for reproduction.
 
-pub mod helpers;
+pub mod pbt_harness;
 
-use helpers::pbt::{run, run_config};
-use helpers::pbt_scenario::{MinMax, TestCluster, assert_all_terminal, wait_until_terminal};
 use noraft::{LogIndex, LogPosition, NodeId};
+use pbt_harness::{MinMax, TestCluster, assert_all_terminal, run, run_config, wait_until_terminal};
 use std::cell::Cell;
 
 fn check_snapshot_compatible_logs(cluster: &TestCluster) -> Result<(), String> {

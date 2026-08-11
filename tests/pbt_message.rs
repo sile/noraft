@@ -1,9 +1,9 @@
 //! Model-based PBTs for public message transport helpers.
 
-pub mod helpers;
+pub mod pbt_harness;
 
-use helpers::pbt::{run, sample_len, sample_log_entry};
 use noraft::{LogEntries, LogIndex, LogPosition, Message, NodeId, Term};
+use pbt_harness::{run, sample_len, sample_log_entry};
 
 /// Stripping an AppendEntries prefix must preserve message metadata and
 /// produce the exact unsent suffix for every boundary-sized request.
