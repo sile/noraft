@@ -23,7 +23,6 @@ fn proposals_commit_across_node_restarts() -> noprop::TestResult {
         // commit, so the cluster keeps making progress.
         cluster.nodes[0].options.running_ticks = MinMax::new(800, 5000);
         cluster.nodes[0].options.stopping_ticks = MinMax::new(800, 5000);
-        let initial_restarts = cluster.nodes[0].restarts();
 
         let position = cluster.random_node_mut(ctx).create_cluster(&node_ids);
         assert_ne!(position, LogPosition::INVALID);
@@ -51,7 +50,7 @@ fn proposals_commit_across_node_restarts() -> noprop::TestResult {
         // start cadence is bounded), and the wait bounds the liveness
         // claim: the cluster must not stall during the restart cycle.
         let restarted = cluster.run_until(ctx, cluster.clock.after(50_000), |cluster| {
-            cluster.nodes[0].restarts() > initial_restarts
+            cluster.nodes[0].restarts() > 0
         });
         if !restarted {
             return Err("node 0 did not restart within the budget".into());

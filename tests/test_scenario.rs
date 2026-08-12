@@ -226,55 +226,6 @@ fn leader_commits_after_shrinking_to_self_only_voter() {
 }
 
 #[test]
-fn append_entries_reply_below_match_index_is_ignored() {
-    let initial_voters = [id(0), id(1)];
-    let mut leader = TestNode::asserted_start(id(0), &initial_voters);
-    let mut follower = TestNode::asserted_start(id(1), &[]);
-
-    leader.handle_election_timeout();
-    assert_eq!(leader.role(), Role::Candidate);
-    assert_action!(leader, set_election_timeout());
-    assert_action!(leader, save_current_term());
-    assert_action!(leader, save_voted_for());
-    let Some(Action::BroadcastMessage(call @ Message::RequestVoteCall { .. })) =
-        leader.actions_mut().next()
-    else {
-        panic!("Expected RequestVoteCall message");
-    };
-    let reply = follower.asserted_handle_request_vote_call_success(&call);
-    let call = leader.asserted_handle_request_vote_reply_majority_vote_granted(&reply);
-    let reply = follower.asserted_handle_append_entries_call_failure(&call);
-    let call = leader.asserted_handle_append_entries_reply_failure(&reply);
-    let reply = follower.asserted_handle_append_entries_call_success(&call);
-    leader.asserted_handle_append_entries_reply_success(&reply, true, false);
-
-    let follower_last = follower.log().last_position();
-    assert!(follower_last.index > LogIndex::ZERO);
-    let commit_before = leader.commit_index();
-    let baseline = leader
-        .metrics()
-        .append_entries_replies_ignored_behind_match_index;
-
-    let stale_reply = Message::AppendEntriesReply {
-        from: follower.id(),
-        term: leader.current_term(),
-        last_position: log_pos(follower_last.term, i(0)),
-    };
-    leader
-        .handle_message(&stale_reply)
-        .expect("delayed reply must be ignored, not error");
-
-    assert_eq!(
-        leader
-            .metrics()
-            .append_entries_replies_ignored_behind_match_index,
-        baseline + 1
-    );
-    assert_eq!(leader.commit_index(), commit_before);
-    assert_no_action!(leader);
-}
-
-#[test]
 fn create_three_nodes_cluster() {
     let mut cluster = ThreeNodeCluster::new();
     cluster.init_cluster();

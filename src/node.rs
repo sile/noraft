@@ -279,10 +279,9 @@ impl Node {
     ///   preceding storage [`Action`]s in the same batch (`SaveCurrentTerm`,
     ///   `SaveVotedFor`, `AppendLogEntries`). See [`Actions`] for the ordering
     ///   contract that makes this well-defined.
-    /// - A node whose persistent state is suspected of loss or corruption must not
-    ///   be brought back into the cluster with [`Node::restart`]. Detection and
-    ///   handling of that case are described in the [Signs that log loss may
-    ///   have occurred](#signs-that-log-loss-may-have-occurred) section below.
+    /// - A node whose persistent state is suspected of loss or corruption must
+    ///   not be restarted into the cluster; see [Signs that log loss may have
+    ///   occurred](#signs-that-log-loss-may-have-occurred) below.
     /// - If any of the above requirements are violated, the situation is outside
     ///   the support scope of this crate and neither safety nor liveness is
     ///   guaranteed.
@@ -716,6 +715,10 @@ impl Node {
     }
 
     fn rebuild_quorum(&mut self) {
+        let self_id = self.id;
+        let self_last = self.log.last_position().index;
+        let config = self.log.latest_config();
+
         let RoleState::Leader {
             quorum, followers, ..
         } = &mut self.role
@@ -723,28 +726,9 @@ impl Node {
             unreachable!();
         };
 
-        let config = self.log.latest_config();
-        Self::rebuild_quorum_inner(
-            quorum,
-            followers,
-            config,
-            self.id,
-            self.log.last_position().index,
-        );
-    }
-
-    fn rebuild_quorum_inner(
-        quorum: &mut Quorum,
-        followers: &BTreeMap<NodeId, Follower>,
-        config: &ClusterConfig,
-        self_id: NodeId,
-        self_last: LogIndex,
-    ) {
         *quorum = Quorum::new(config);
-
         quorum.update_match_index(config, self_id, LogIndex::ZERO, self_last);
-
-        for (&id, follower) in followers {
+        for (&id, follower) in &*followers {
             quorum.update_match_index(config, id, LogIndex::ZERO, follower.match_index);
         }
     }
@@ -1744,6 +1728,7 @@ mod tests {
             let f = followers.get_mut(&NodeId::new(1)).unwrap();
             f.match_index = LogIndex::new(5);
         }
+        let commit_before = node.commit_index();
         let reply = Message::append_entries_reply(
             node.current_term(),
             NodeId::new(1),
@@ -1755,6 +1740,10 @@ mod tests {
                 .append_entries_replies_ignored_behind_match_index,
             1
         );
+        // Dropping the delayed reply must not advance the commit index or
+        // emit any new action.
+        assert_eq!(node.commit_index(), commit_before);
+        assert!(node.actions_mut().next().is_none());
     }
 
     #[test]
