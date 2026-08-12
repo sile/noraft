@@ -314,6 +314,12 @@ struct InvariantState {
     // leader.
     committed: BTreeMap<LogIndex, (LogPosition, LogEntry, Term)>,
     leader_with_committed_history_seen: bool,
+    // Highest `follower_match_index` observed under a given tenure,
+    // keyed by (leader id, term). Used to detect regressions within a
+    // single tenure — the persistence contract on `Node::restart`
+    // makes `Follower::match_index` monotonically non-decreasing for
+    // as long as the leader keeps its role in the same term.
+    follower_match_indexes: BTreeMap<(NodeId, Term), BTreeMap<NodeId, LogIndex>>,
 }
 
 impl InvariantState {
@@ -323,6 +329,7 @@ impl InvariantState {
         self.check_leader_append_only(cluster)?;
         self.check_state_machine_safety(cluster)?;
         self.check_leader_completeness(cluster)?;
+        self.check_follower_match_index_monotonic(cluster)?;
         Ok(())
     }
 
@@ -492,6 +499,44 @@ impl InvariantState {
                         u64::from(*id)
                     ));
                 }
+            }
+        }
+        Ok(())
+    }
+
+    /// For every live leader, verify that `Node::follower_match_index`
+    /// never regresses across steps within the same (leader id, term)
+    /// tenure. The pair uniquely identifies a leader tenure because
+    /// `transition_to_leader` always increases the term, so distinct
+    /// tenures never share a key.
+    fn check_follower_match_index_monotonic(&mut self, cluster: &Cluster) -> Result<(), String> {
+        for (leader_id, node) in &cluster.nodes {
+            if node.role() != Role::Leader {
+                continue;
+            }
+            let term = node.current_term();
+            let recorded = self
+                .follower_match_indexes
+                .entry((*leader_id, term))
+                .or_default();
+            for follower_id in node.config().unique_nodes() {
+                if follower_id == *leader_id {
+                    continue;
+                }
+                let Some(current) = node.follower_match_index(follower_id) else {
+                    continue;
+                };
+                if let Some(previous) = recorded.get(&follower_id)
+                    && current < *previous
+                {
+                    return Err(format!(
+                        "follower_match_index regressed within a single tenure: leader {} in \
+                         {term:?}, follower {}: previous={previous:?}, current={current:?}",
+                        u64::from(*leader_id),
+                        u64::from(follower_id)
+                    ));
+                }
+                recorded.insert(follower_id, current);
             }
         }
         Ok(())
