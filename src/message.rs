@@ -1,7 +1,7 @@
 use crate::{
     Term,
     log::{LogEntries, LogIndex, LogPosition},
-    node::{NodeGeneration, NodeId},
+    node::NodeId,
 };
 
 /// Message for RPC.
@@ -63,15 +63,20 @@ pub enum Message {
         /// Term of the sender.
         term: Term,
 
-        /// Generation of the sender.
-        generation: NodeGeneration,
-
         /// Last log position of the follower.
         ///
         /// Instead of replying a boolean `success` as defined in the Raft paper,
         /// this crate replies the last log position of the follower.
         /// With this adjustment, the leader can quickly determine the appropriate match index of the follower,
         /// even if the follower is significantly behind the leader.
+        ///
+        /// A leader discards this reply as delayed when `last_position.index`
+        /// is smaller than the `match_index` it already holds for the sender
+        /// during the same leader's tenure. The
+        /// [`NodeMetrics::append_entries_replies_ignored_behind_match_index`]
+        /// counter is incremented in that case.
+        ///
+        /// [`NodeMetrics::append_entries_replies_ignored_behind_match_index`]: crate::NodeMetrics::append_entries_replies_ignored_behind_match_index
         last_position: LogPosition,
     },
 }
@@ -169,13 +174,11 @@ impl Message {
     pub(crate) fn append_entries_reply(
         term: Term,
         from: NodeId,
-        generation: NodeGeneration,
         last_position: LogPosition,
     ) -> Self {
         Self::AppendEntriesReply {
             from,
             term,
-            generation,
             last_position,
         }
     }
@@ -236,12 +239,7 @@ impl Message {
                 *term = (*term).max(last_included_position.term);
                 entries.handle_snapshot_installed(last_included_position);
             }
-            Message::AppendEntriesReply {
-                term: _,
-                generation: _,
-                last_position,
-                ..
-            } => {
+            Message::AppendEntriesReply { last_position, .. } => {
                 if last_position.index < last_included_position.index {
                     *last_position = last_included_position;
                 }
@@ -394,23 +392,13 @@ mod tests {
 
     #[test]
     fn handle_snapshot_installed_keeps_append_entries_reply_term() {
-        let mut message = Message::append_entries_reply(
-            Term::new(10),
-            NodeId::new(1),
-            NodeGeneration::new(2),
-            pos(10, 3),
-        );
+        let mut message = Message::append_entries_reply(Term::new(10), NodeId::new(1), pos(10, 3));
 
         message.handle_snapshot_installed(pos(12, 5));
 
         assert_eq!(
             message,
-            Message::append_entries_reply(
-                Term::new(10),
-                NodeId::new(1),
-                NodeGeneration::new(2),
-                pos(12, 5),
-            )
+            Message::append_entries_reply(Term::new(10), NodeId::new(1), pos(12, 5))
         );
     }
 

@@ -70,40 +70,6 @@ impl core::ops::SubAssign for NodeId {
     }
 }
 
-/// Node generation ([`u64`]).
-///
-/// The crate user is responsible for supplying a unique generation on restart.
-/// The generation should be monotonically increasing for the same node.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct NodeGeneration(u64);
-
-impl NodeGeneration {
-    /// The initial generation.
-    pub const ZERO: Self = Self(0);
-
-    /// Makes a new [`NodeGeneration`] instance.
-    pub const fn new(generation: u64) -> Self {
-        Self(generation)
-    }
-
-    /// Returns the value of this generation.
-    pub const fn get(self) -> u64 {
-        self.0
-    }
-}
-
-impl From<u64> for NodeGeneration {
-    fn from(value: u64) -> Self {
-        Self::new(value)
-    }
-}
-
-impl From<NodeGeneration> for u64 {
-    fn from(value: NodeGeneration) -> Self {
-        value.get()
-    }
-}
-
 /// Error returned by fallible node operations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Error {
@@ -215,13 +181,16 @@ pub struct NodeMetrics {
     pub append_entries_replies_ignored_from_unknown_nodes: u64,
 
     /// Number of times a follower reported a last log index smaller than the
-    /// index that the leader had already acknowledged for that follower.
+    /// index that the leader had already acknowledged for that follower during
+    /// the same leader's tenure.
     ///
     /// Under normal operation this counter increases occasionally due to
     /// message reordering. Sustained or acute growth during a single leader's
     /// tenure, combined with a follower whose `match_index` does not advance,
-    /// can indicate log reordering, incorrect persistence ordering, or a
-    /// missing log tail on the follower.
+    /// can indicate log reordering, incorrect persistence ordering, or a lost
+    /// log tail on the follower. See the "Signs that log loss may have
+    /// occurred" section on [`Node::restart`] for how to interpret sustained
+    /// growth.
     pub append_entries_replies_ignored_behind_match_index: u64,
 
     /// Number of times a follower reported a last log index greater than the
@@ -246,7 +215,6 @@ pub struct NodeMetrics {
 #[derive(Debug, Clone)]
 pub struct Node {
     id: NodeId,
-    generation: NodeGeneration,
     voted_for: Option<NodeId>,
     current_term: Term,
     log: Log,
@@ -262,6 +230,9 @@ impl Node {
     /// To create a new cluster, please call [`Node::create_cluster()`] after starting the node.
     ///
     /// If the node has already been part of a cluster, please use [`Node::restart()`] instead.
+    /// The "Persistence requirements" section on [`Node::restart`] documents
+    /// the contract that any process running a [`Node`] must satisfy,
+    /// including newly-started ones.
     ///
     /// # Examples
     ///
@@ -289,29 +260,85 @@ impl Node {
     /// // [NOTE] To complete the cluster creation, the user needs to handle the queued actions.
     /// ```
     pub fn start(id: NodeId) -> Self {
-        Self::new(id, NodeGeneration::ZERO)
+        Self::new(id)
     }
 
     /// Restarts a node.
     ///
     /// `current_term`, `voted_for`, and `log` are restored from persistent storage.
-    /// The generation must be a value that is unique across restarts of the same node,
-    /// and should be monotonically increasing.
-    /// It can be derived from persistent storage or an external source such as a system clock,
-    /// as long as it satisfies the uniqueness and monotonicity requirements.
-    /// Note that managing the persistent storage is outside the scope of this crate.
     ///
-    /// # Notes
+    /// # Persistence requirements
     ///
-    /// Raft algorithm assumes the persistent storage is reliable.
-    /// So, for example, if the local log of the node has corrupted or lost some log tail entries,
-    /// it is safest to remove the node from the cluster then add it back as a new node.
+    /// The Raft algorithm relies on the persistent state being reliable. This crate
+    /// makes the reliance explicit at the API boundary:
     ///
-    /// In practice, such storage failures are usually tolerable when the majority of nodes in the cluster
-    /// are healthy (i.e., the restarted node can restored its previous state).
+    /// - `current_term`, `voted_for`, and `log` must be restored without loss from
+    ///   the state that noraft last requested to be persisted.
+    /// - Before sending an outbound message that a batch of [`Action`]s yielded,
+    ///   the crate user must complete the persistence requested by the
+    ///   preceding storage [`Action`]s in the same batch (`SaveCurrentTerm`,
+    ///   `SaveVotedFor`, `AppendLogEntries`). See [`Actions`] for the ordering
+    ///   contract that makes this well-defined.
+    /// - A node whose persistent state is suspected of loss or corruption must
+    ///   not be restarted into the cluster; see [Signs that log loss may have
+    ///   occurred](#signs-that-log-loss-may-have-occurred) below.
+    /// - If any of the above requirements are violated, the situation is outside
+    ///   the support scope of this crate and neither safety nor liveness is
+    ///   guaranteed.
     ///
-    /// But be careful, whether the degraded safety guarantee is acceptable or not highly depends on
-    /// the application.
+    /// noraft cannot verify the integrity of the storage itself. Checksums,
+    /// redundancy, corruption detection, and the decision to discard a node
+    /// belong to the crate user.
+    ///
+    /// # Signs that log loss may have occurred
+    ///
+    /// If the tail of a node's log is lost and the node restarts while the same
+    /// leader is still in office, the leader still holds the pre-failure
+    /// `match_index` for that node. Any subsequent `AppendEntries` reply carrying
+    /// a smaller last log index is ignored as a delayed reply, so the restarted
+    /// node's log synchronization may be retried repeatedly without progress.
+    ///
+    /// This state is not a confirmed diagnosis of a lost log tail. Message loss
+    /// or delay, and stalls in the persistence pipeline, can also produce the
+    /// same symptom. Treat it as a situation that warrants investigation.
+    ///
+    /// The crate user should investigate in the following order:
+    ///
+    /// 1. Confirm that `AppendEntries` deliveries to the restarted node and its
+    ///    persistence requests are still making progress.
+    /// 2. Confirm from the integration layer's own bookkeeping that the leader
+    ///    and the term have not changed across the failure boundary (noraft
+    ///    itself does not retain this information across restarts).
+    /// 3. Compare the restarted node's local last index with the leader's view
+    ///    of that node's replication progress. noraft does not currently expose
+    ///    a per-follower `match_index` accessor, so the integration layer needs
+    ///    to observe replication from its transport log or from the replies it
+    ///    forwards.
+    /// 4. Check whether the leader's
+    ///    [`NodeMetrics::append_entries_replies_ignored_behind_match_index`]
+    ///    counter (the number of `AppendEntries` replies ignored for reporting a
+    ///    last log index smaller than `match_index`) is growing continuously.
+    /// 5. If the local last index is smaller, inspect the storage log, the
+    ///    checksums, and the failure history.
+    ///
+    /// [`NodeMetrics::append_entries_replies_ignored_behind_match_index`] is a
+    /// leader-wide aggregate counter and does not identify which follower is
+    /// responsible. Treat it as an auxiliary signal to combine with the stalled
+    /// restarted node and the transport log the integration layer keeps.
+    ///
+    /// noraft does not attempt any automatic recovery from this state. The
+    /// leader keeps dropping the follower's replies until the operator
+    /// intervenes or a leader change resets `match_index`. Once log loss or
+    /// corruption is confirmed, the affected node must not be reused as-is to
+    /// catch up: stop and isolate it, remove it from the cluster configuration,
+    /// and re-add it as a fresh node backed by healthy storage if needed.
+    ///
+    /// If a leader change happens during the outage, the follower's
+    /// `match_index` is reset by the new leader, so the stall does not appear
+    /// and log loss can escape observation. Successful catch-up also does not
+    /// prove storage integrity, so the decision to reuse a node after an
+    /// abnormal termination must ultimately rest on the storage guarantees the
+    /// crate user provides.
     ///
     /// # Examples
     /// ```
@@ -325,22 +352,15 @@ impl Node {
     ///
     /// // Restarts a node.
     /// let snapshot_index = log.snapshot_position().index;
-    /// let generation = noraft::NodeGeneration::new(1);
-    /// let node = noraft::Node::restart(noraft::NodeId::new(0), generation, current_term, voted_for, log);
+    /// let node = noraft::Node::restart(noraft::NodeId::new(0), current_term, voted_for, log);
     /// assert!(node.role().is_follower());
     /// assert_eq!(node.commit_index(), snapshot_index);
     ///
     /// // Unlike `Node::start()`, the restarted node has actions to execute.
     /// assert!(!node.actions().is_empty());
     /// ```
-    pub fn restart(
-        id: NodeId,
-        generation: NodeGeneration,
-        current_term: Term,
-        voted_for: Option<NodeId>,
-        log: Log,
-    ) -> Self {
-        let mut node = Self::new(id, generation);
+    pub fn restart(id: NodeId, current_term: Term, voted_for: Option<NodeId>, log: Log) -> Self {
+        let mut node = Self::new(id);
 
         node.current_term = current_term;
         node.voted_for = voted_for;
@@ -398,11 +418,10 @@ impl Node {
         self.log.last_position()
     }
 
-    fn new(id: NodeId, generation: NodeGeneration) -> Self {
+    fn new(id: NodeId) -> Self {
         let config = ClusterConfig::new();
         Self {
             id,
-            generation,
             voted_for: None,
             current_term: Term::ZERO,
             log: Log::new(config, LogEntries::new(LogPosition::ZERO)),
@@ -416,11 +435,6 @@ impl Node {
     /// Returns the identifier of this node.
     pub fn id(&self) -> NodeId {
         self.id
-    }
-
-    /// Returns the generation of this node.
-    pub fn generation(&self) -> NodeGeneration {
-        self.generation
     }
 
     /// Returns the role of this node.
@@ -676,6 +690,13 @@ impl Node {
         self.log.last_position()
     }
 
+    // Preserves the `match_index` of existing followers and only inserts a
+    // fresh `Follower::new()` for newly added members. Followers dropped from
+    // the latest configuration are removed.
+    //
+    // Keeping existing entries untouched is what makes `match_index`
+    // monotonically non-decreasing within a single leader's tenure, which the
+    // behind-match_index check in `handle_append_entries_reply` relies on.
     fn rebuild_followers(&mut self) {
         let RoleState::Leader { followers, .. } = &mut self.role else {
             unreachable!();
@@ -683,7 +704,6 @@ impl Node {
 
         let config = self.log.latest_config();
 
-        // Add new followers.
         for id in config.unique_nodes() {
             if id == self.id || followers.contains_key(&id) {
                 continue;
@@ -691,11 +711,14 @@ impl Node {
             followers.insert(id, Follower::new());
         }
 
-        // Remove followers not in the latest configuration.
         followers.retain(|id, _| config.contains(*id));
     }
 
     fn rebuild_quorum(&mut self) {
+        let self_id = self.id;
+        let self_last = self.log.last_position().index;
+        let config = self.log.latest_config();
+
         let RoleState::Leader {
             quorum, followers, ..
         } = &mut self.role
@@ -703,28 +726,9 @@ impl Node {
             unreachable!();
         };
 
-        let config = self.log.latest_config();
-        Self::rebuild_quorum_inner(
-            quorum,
-            followers,
-            config,
-            self.id,
-            self.log.last_position().index,
-        );
-    }
-
-    fn rebuild_quorum_inner(
-        quorum: &mut Quorum,
-        followers: &BTreeMap<NodeId, Follower>,
-        config: &ClusterConfig,
-        self_id: NodeId,
-        self_last: LogIndex,
-    ) {
         *quorum = Quorum::new(config);
-
         quorum.update_match_index(config, self_id, LogIndex::ZERO, self_last);
-
-        for (&id, follower) in followers {
+        for (&id, follower) in &*followers {
             quorum.update_match_index(config, id, LogIndex::ZERO, follower.match_index);
         }
     }
@@ -1062,9 +1066,8 @@ impl Node {
             Message::AppendEntriesReply {
                 from,
                 term,
-                generation,
                 last_position,
-            } => self.handle_append_entries_reply(*from, *term, *generation, *last_position),
+            } => self.handle_append_entries_reply(*from, *term, *last_position),
         }
 
         Ok(())
@@ -1212,7 +1215,6 @@ impl Node {
         &mut self,
         from: NodeId,
         term: Term,
-        generation: NodeGeneration,
         follower_last_position: LogPosition,
     ) {
         if term < self.current_term {
@@ -1245,52 +1247,17 @@ impl Node {
             return;
         };
 
-        if generation < follower.generation {
-            // Delayed reply from an old generation.
-            return;
-        }
-        if generation == follower.generation && follower_last_position.index < follower.match_index
-        {
+        if follower_last_position.index < follower.match_index {
             self.metrics
                 .append_entries_replies_ignored_behind_match_index = self
                 .metrics
                 .append_entries_replies_ignored_behind_match_index
                 .saturating_add(1);
-            // Delayed reply behind the acknowledged match index.
+            // Delayed reply behind the acknowledged match index. The
+            // persistence contract on `Node::restart` guarantees this cannot
+            // happen legitimately within a single leader's tenure.
             return;
         }
-
-        let mut should_rebuild_quorum = false;
-        if generation > follower.generation {
-            follower.generation = generation;
-            if follower_last_position.index < follower.match_index {
-                follower.match_index = follower_last_position.index;
-                should_rebuild_quorum = true;
-            }
-        }
-
-        if should_rebuild_quorum {
-            // Generation update can decrease match_index, and `Quorum::update_match_index()`
-            // only supports monotonic increases, so a full rebuild is required.
-            //
-            // [NOTE]
-            // The Raft algorithm assumes that storage is reliable.
-            // Therefore, theoretically, this case should not occur.
-            // However, in practice, it is possible for the follower's log to be fully or partially lost.
-            // To recover log entries as much as possible in such cases,
-            // this crate allows proceeding even if the above condition is met.
-            // But be cautious, as there is a risk of compromising the properties guaranteed by
-            // the Raft algorithm.
-            Self::rebuild_quorum_inner(
-                quorum,
-                followers,
-                self.log.latest_config(),
-                self.id,
-                self.log.last_position().index,
-            );
-        }
-
-        let follower = followers.get_mut(&from).expect("infallible");
 
         if !self.log.entries().contains(follower_last_position) {
             if let Some(term) = self.log.entries().get_term(follower_last_position.index) {
@@ -1359,12 +1326,8 @@ impl Node {
     }
 
     fn reply_append_entries(&mut self, to: NodeId) {
-        let reply = Message::append_entries_reply(
-            self.current_term,
-            self.id,
-            self.generation,
-            self.log.last_position(),
-        );
+        let reply =
+            Message::append_entries_reply(self.current_term, self.id, self.log.last_position());
         self.actions.set(Action::SendMessage(to, reply));
     }
 
@@ -1446,6 +1409,9 @@ impl Node {
             msg.handle_snapshot_installed(last_included_position);
         }
 
+        // Per-follower `match_index` is intentionally not updated here: what a
+        // follower actually holds is only known from its `AppendEntriesReply`,
+        // and taking a snapshot on the leader does not change that observation.
         true
     }
 
@@ -1480,14 +1446,12 @@ enum RoleState {
 #[derive(Debug, Clone)]
 struct Follower {
     pub match_index: LogIndex,
-    pub generation: NodeGeneration,
 }
 
 impl Follower {
     pub fn new() -> Self {
         Self {
             match_index: LogIndex::new(0),
-            generation: NodeGeneration::ZERO,
         }
     }
 }
@@ -1518,13 +1482,7 @@ mod tests {
             LogPosition::ZERO,
             core::iter::once(LogEntry::ClusterConfig(cfg.clone())),
         );
-        Node::restart(
-            id,
-            NodeGeneration::ZERO,
-            Term::new(term),
-            voted_for,
-            Log::new(cfg, entries),
-        )
+        Node::restart(id, Term::new(term), voted_for, Log::new(cfg, entries))
     }
 
     fn drain(node: &mut Node) {
@@ -1724,7 +1682,6 @@ mod tests {
         let reply = Message::append_entries_reply(
             Term::new(node.current_term().get() - 1),
             NodeId::new(1),
-            NodeGeneration::ZERO,
             node.log().last_position(),
         );
         node.handle_message(&reply).unwrap();
@@ -1738,12 +1695,7 @@ mod tests {
     fn append_entries_replies_ignored_while_not_leader_counter() {
         let mut node = follower(NodeId::new(0), &[NodeId::new(0), NodeId::new(1)], 3, None);
         drain(&mut node);
-        let reply = Message::append_entries_reply(
-            Term::new(3),
-            NodeId::new(1),
-            NodeGeneration::ZERO,
-            pos(3, 1),
-        );
+        let reply = Message::append_entries_reply(Term::new(3), NodeId::new(1), pos(3, 1));
         node.handle_message(&reply).unwrap();
         assert_eq!(
             node.metrics()
@@ -1758,7 +1710,6 @@ mod tests {
         let reply = Message::append_entries_reply(
             node.current_term(),
             NodeId::new(9),
-            NodeGeneration::ZERO,
             node.log().last_position(),
         );
         node.handle_message(&reply).unwrap();
@@ -1777,10 +1728,10 @@ mod tests {
             let f = followers.get_mut(&NodeId::new(1)).unwrap();
             f.match_index = LogIndex::new(5);
         }
+        let commit_before = node.commit_index();
         let reply = Message::append_entries_reply(
             node.current_term(),
             NodeId::new(1),
-            NodeGeneration::ZERO,
             pos(node.current_term().get(), 3),
         );
         node.handle_message(&reply).unwrap();
@@ -1789,6 +1740,10 @@ mod tests {
                 .append_entries_replies_ignored_behind_match_index,
             1
         );
+        // Dropping the delayed reply must not advance the commit index or
+        // emit any new action.
+        assert_eq!(node.commit_index(), commit_before);
+        assert!(node.actions_mut().next().is_none());
     }
 
     #[test]
@@ -1798,7 +1753,6 @@ mod tests {
         let reply = Message::append_entries_reply(
             node.current_term(),
             NodeId::new(1),
-            NodeGeneration::ZERO,
             pos(node.current_term().get(), leader_last + 10),
         );
         node.handle_message(&reply).unwrap();
@@ -1814,7 +1768,6 @@ mod tests {
         let reply = Message::append_entries_reply(
             node.current_term(),
             NodeId::new(1),
-            NodeGeneration::ZERO,
             LogPosition {
                 term: Term::new(999),
                 index: last_index,
@@ -1841,13 +1794,7 @@ mod tests {
             LogPosition::ZERO,
             core::iter::once(LogEntry::ClusterConfig(cfg.clone())),
         );
-        let mut node = Node::restart(
-            NodeId::new(9),
-            NodeGeneration::ZERO,
-            Term::ZERO,
-            None,
-            Log::new(cfg, entries),
-        );
+        let mut node = Node::restart(NodeId::new(9), Term::ZERO, None, Log::new(cfg, entries));
         drain(&mut node);
         node.handle_election_timeout();
         assert_eq!(node.metrics().elections_started, 0);

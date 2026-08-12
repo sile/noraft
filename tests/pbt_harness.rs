@@ -2,8 +2,7 @@
 
 use noprop::TestCaseContext;
 use noraft::{
-    ClusterConfig, CommitStatus, Log, LogEntries, LogEntry, LogPosition, Message, Node,
-    NodeGeneration, NodeId, Role, Term,
+    ClusterConfig, CommitStatus, LogEntry, LogPosition, Message, Node, NodeId, Role, Term,
 };
 use std::collections::BTreeMap;
 use std::io::{Error, ErrorKind};
@@ -142,9 +141,6 @@ pub struct TestCluster {
     pub clock: Clock,
     pub default_link_options: TestLinkOptions,
     seqno: u64,
-    snapshot_requests: usize,
-    snapshot_drops: usize,
-    snapshots_to_drop: usize,
     leaders_by_term: BTreeMap<Term, NodeId>,
 }
 
@@ -155,9 +151,6 @@ impl TestCluster {
             clock: Clock::new(),
             default_link_options: TestLinkOptions::default(),
             seqno: 0,
-            snapshot_requests: 0,
-            snapshot_drops: 0,
-            snapshots_to_drop: 0,
             leaders_by_term: BTreeMap::new(),
         }
     }
@@ -174,33 +167,6 @@ impl TestCluster {
             .iter_mut()
             .find(|node| node.running && node.inner.role().is_leader())
             .map(|node| &mut node.inner)
-    }
-
-    /// Forces the next `count` snapshot transfers to be dropped.
-    pub fn drop_next_snapshots(&mut self, count: usize) {
-        self.snapshots_to_drop = self.snapshots_to_drop.saturating_add(count);
-    }
-
-    pub fn snapshot_requests(&self) -> usize {
-        self.snapshot_requests
-    }
-
-    pub fn snapshot_drops(&self) -> usize {
-        self.snapshot_drops
-    }
-
-    pub fn snapshot_installations_succeeded(&self) -> usize {
-        self.nodes
-            .iter()
-            .map(|node| node.snapshot_installations_succeeded)
-            .sum()
-    }
-
-    pub fn snapshot_installations_rejected(&self) -> usize {
-        self.nodes
-            .iter()
-            .map(|node| node.snapshot_installations_rejected)
-            .sum()
     }
 
     pub fn random_node_mut(&mut self, ctx: &mut TestCaseContext) -> &mut Node {
@@ -248,7 +214,6 @@ impl TestCluster {
                 messages.push((source, destination, message));
             }
             for destination in actions.install_snapshots {
-                self.snapshot_requests = self.snapshot_requests.saturating_add(1);
                 snapshots.push((
                     source,
                     destination,
@@ -298,12 +263,7 @@ impl TestCluster {
         position: LogPosition,
         config: ClusterConfig,
     ) {
-        let forced_drop = self.snapshots_to_drop > 0;
-        if forced_drop {
-            self.snapshots_to_drop -= 1;
-        }
-        if forced_drop || noprop::sample_ratio(ctx, self.default_link_options.drop_rate) {
-            self.snapshot_drops = self.snapshot_drops.saturating_add(1);
+        if noprop::sample_ratio(ctx, self.default_link_options.drop_rate) {
             return;
         }
 
@@ -466,11 +426,10 @@ pub struct TestNode {
     timeout_expire_time: Option<Clock>,
     storage_finish_time: Option<Clock>,
     snapshot_finish_time: Option<(Clock, LogPosition, ClusterConfig)>,
-    snapshot_installations_succeeded: usize,
-    snapshot_installations_rejected: usize,
     incoming_messages: BTreeMap<(Clock, u64), Message>,
     stop_time: Option<Clock>,
     start_time: Option<Clock>,
+    restarts: u64,
 }
 
 impl TestNode {
@@ -483,24 +442,18 @@ impl TestNode {
             timeout_expire_time: None,
             storage_finish_time: None,
             snapshot_finish_time: None,
-            snapshot_installations_succeeded: 0,
-            snapshot_installations_rejected: 0,
             incoming_messages: BTreeMap::new(),
             stop_time: None,
             start_time: None,
+            restarts: 0,
         }
     }
 
-    /// Restarts the node after discarding all durable and in-flight state.
-    pub fn lose_storage(&mut self) {
-        let id = self.inner.id();
-        let generation = NodeGeneration::new(self.inner.generation().get().saturating_add(1));
-        let log = Log::new(ClusterConfig::new(), LogEntries::new(LogPosition::ZERO));
-        self.inner = Node::restart(id, generation, Term::ZERO, None, log);
-        self.timeout_expire_time = None;
-        self.storage_finish_time = None;
-        self.snapshot_finish_time = None;
-        self.incoming_messages.clear();
+    /// Monotonically increasing count of the times this node has been
+    /// restarted through `Node::restart` (excluding the initial `Node::start`
+    /// in `TestNode::new`).
+    pub fn restarts(&self) -> u64 {
+        self.restarts
     }
 
     fn run_tick(&mut self, ctx: &mut TestCaseContext, now: Clock) {
@@ -520,11 +473,11 @@ impl TestNode {
                 }
                 self.inner = Node::restart(
                     self.inner.id(),
-                    NodeGeneration::new(self.inner.generation().get().saturating_add(1)),
                     self.inner.current_term(),
                     self.inner.voted_for(),
                     self.inner.log().clone(),
                 );
+                self.restarts = self.restarts.saturating_add(1);
             } else {
                 return;
             }
@@ -558,13 +511,7 @@ impl TestNode {
             .snapshot_finish_time
             .take_if(|(time, _, _)| *time <= now)
         {
-            if self.inner.handle_snapshot_installed(position, config) {
-                self.snapshot_installations_succeeded =
-                    self.snapshot_installations_succeeded.saturating_add(1);
-            } else {
-                self.snapshot_installations_rejected =
-                    self.snapshot_installations_rejected.saturating_add(1);
-            }
+            self.inner.handle_snapshot_installed(position, config);
         }
         while let Some(entry) = self.incoming_messages.first_entry() {
             if entry.key().0 <= now {
