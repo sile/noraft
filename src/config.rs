@@ -58,9 +58,14 @@ pub struct ClusterConfig {
     ///
     /// When adding more than half of the current number of nodes to a cluster that has a large snapshot or many log entries,
     /// it is recommended to first add the new nodes as non-voters to avoid blocking subsequent log commits.
-    /// Allow these nodes to catch up with the leader before promoting them to voters.
+    /// Allow these nodes to catch up with the leader before promoting them to voters;
+    /// the leader exposes each follower's replication progress through
+    /// [`Node::follower_match_index`] so that the integration layer can decide
+    /// when the non-voter is close enough to be safely promoted.
     ///
     /// Note that adding or removing non-voters does not require a joint consensus.
+    ///
+    /// [`Node::follower_match_index`]: crate::Node::follower_match_index
     pub non_voters: BTreeSet<NodeId>,
 }
 

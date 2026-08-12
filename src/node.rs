@@ -310,10 +310,13 @@ impl Node {
     ///    and the term have not changed across the failure boundary (noraft
     ///    itself does not retain this information across restarts).
     /// 3. Compare the restarted node's local last index with the leader's view
-    ///    of that node's replication progress. noraft does not currently expose
-    ///    a per-follower `match_index` accessor, so the integration layer needs
-    ///    to observe replication from its transport log or from the replies it
-    ///    forwards.
+    ///    of that node's replication progress: query the current leader with
+    ///    [`Node::follower_match_index`] for the restarted node's id. A local
+    ///    last index that is strictly smaller than the returned `match_index`
+    ///    means the follower cannot still hold the log tail the current-tenure
+    ///    leader has already acknowledged. Note that a `None` result — the
+    ///    queried node is no longer leader, the tenure has changed, or the id
+    ///    is not tracked — leaves this step inconclusive.
     /// 4. Check whether the leader's
     ///    [`NodeMetrics::append_entries_replies_ignored_behind_match_index`]
     ///    counter (the number of `AppendEntries` replies ignored for reporting a
@@ -511,6 +514,98 @@ impl Node {
     /// how to interpret their values.
     pub fn metrics(&self) -> &NodeMetrics {
         &self.metrics
+    }
+
+    /// Returns the `match_index` this node, acting as leader, currently tracks
+    /// for the follower identified by `id`.
+    ///
+    /// `Some(match_index)` is returned when all of the following hold:
+    ///
+    /// - `self.role()` is [`Role::Leader`].
+    /// - `id` appears in `self.config().unique_nodes()` (i.e. it is a voter,
+    ///   a `new_voters`-only node in a joint consensus, or a non-voter) and
+    ///   is not `self.id()`.
+    ///
+    /// In every other case (any follower or candidate role, an unknown `id`,
+    /// `self.id()` itself, or a node that has been dropped from the current
+    /// configuration) [`None`] is returned.
+    ///
+    /// The value is the largest `last_position.index` this leader has observed
+    /// from a successful `AppendEntries` reply from that follower during the
+    /// current leader tenure. It grows monotonically for as long as the node
+    /// remains leader, and it is reset to [`LogIndex::ZERO`] whenever the node
+    /// transitions to leader — including a re-election of the same node —
+    /// because [`Node::restart`] does not carry `match_index` across a leader
+    /// change.
+    ///
+    /// # Interpreting the value
+    ///
+    /// - The value only says that a successful reply was received. It is not a
+    ///   claim about what the follower has already committed nor about what its
+    ///   state machine has applied.
+    /// - Provided the persistence contract on [`Node::restart`] (see the
+    ///   "Persistence requirements" section) is honored on the follower side,
+    ///   `match_index` is a lower bound on the log the follower has already
+    ///   made durable. If the contract is violated (for example a reply is sent
+    ///   before its preceding `AppendLogEntries` `Action` is persisted), the
+    ///   lower-bound interpretation no longer holds.
+    /// - The value cannot detect every kind of divergence on its own. In
+    ///   particular:
+    ///     - A leader change during the outage resets `match_index` back to 0
+    ///       on the next leader.
+    ///     - The counter is an index only; it cannot distinguish an entry
+    ///       whose term or payload has since been overwritten.
+    ///     - A complete loss of persistent storage is handled by the
+    ///       "Signs that log loss may have occurred" section on
+    ///       [`Node::restart`], not by this value alone.
+    ///
+    /// # Deciding when to promote a non-voter
+    ///
+    /// [`ClusterConfig::non_voters`] recommends adding a new node as a
+    /// non-voter first, letting it catch up, and then promoting it to a voter.
+    /// This method lets the integration layer observe that catch-up directly:
+    /// once `follower_match_index(new_node)` is close enough to
+    /// `self.log().last_position().index` (the exact threshold is an
+    /// integration-side policy), the node is ready to be promoted with
+    /// [`Node::propose_config`].
+    ///
+    /// # Diagnosing suspected log loss before rejoining
+    ///
+    /// The "Signs that log loss may have occurred" section on [`Node::restart`]
+    /// covers the *after-the-fact* case where a restarted node has already
+    /// rejoined and its replication has stalled. This method also enables a
+    /// *before-rejoining* check: given a still-isolated node whose persistent
+    /// state was recovered from disk, an operator can query the current leader
+    /// for that node's `match_index` and refuse to bring the node back if its
+    /// local log is shorter than what the leader has already acknowledged.
+    ///
+    /// The concrete procedure is:
+    ///
+    /// 1. Read `local_last_index` from the recovered persistent storage.
+    /// 2. Ask the current leader instance for `Node::id`, `Node::current_term`,
+    ///    and `Node::follower_match_index(target)` in the same tenure. Because
+    ///    they are consecutive `&self` calls on the same [`Node`], the three
+    ///    values naturally form a single snapshot; every leader tenure starts
+    ///    with a fresh per-follower `match_index` (initialized to 0), so the
+    ///    returned value is guaranteed to belong to the current tenure.
+    /// 3. If `local_last_index < follower_match_index`, the follower cannot
+    ///    still hold a log tail that the current-tenure leader has already
+    ///    seen. Isolate the node and refuse to restart it.
+    ///
+    /// The converse does not hold: `local_last_index >= follower_match_index`
+    /// is not a proof of storage integrity. A leader change during the outage,
+    /// or a leader that has not yet learned the follower's pre-failure
+    /// progress, can hide the loss. Continuously mirroring the value into
+    /// external monitoring gives more coverage.
+    ///
+    /// This method is a signal; it is not a decision procedure for whether a
+    /// node is safe to restart. The final call to isolate, discard, or re-add
+    /// belongs to the integration layer's storage guarantees.
+    pub fn follower_match_index(&self, id: NodeId) -> Option<LogIndex> {
+        let RoleState::Leader { followers, .. } = &self.role else {
+            return None;
+        };
+        followers.get(&id).map(|f| f.match_index)
     }
 
     fn transition_to_leader(&mut self) {
@@ -1839,5 +1934,138 @@ mod tests {
         let msg = Message::request_vote_call(Term::new(1), NodeId::new(0), pos(0, 0));
         node.handle_message(&msg).unwrap();
         assert_eq!(node.metrics().self_messages_ignored, u64::MAX);
+    }
+
+    #[test]
+    fn follower_match_index_returns_none_for_non_leader_roles() {
+        let f = follower(NodeId::new(0), &[NodeId::new(0), NodeId::new(1)], 1, None);
+        assert_eq!(f.follower_match_index(NodeId::new(0)), None);
+        assert_eq!(f.follower_match_index(NodeId::new(1)), None);
+
+        let c = candidate_with(NodeId::new(0), &[NodeId::new(1)]);
+        assert!(c.role().is_candidate());
+        assert_eq!(c.follower_match_index(NodeId::new(0)), None);
+        assert_eq!(c.follower_match_index(NodeId::new(1)), None);
+    }
+
+    #[test]
+    fn follower_match_index_returns_none_for_unknown_and_self_on_leader() {
+        let leader = leader_with(NodeId::new(0), &[NodeId::new(1)]);
+        assert_eq!(leader.follower_match_index(NodeId::new(0)), None);
+        assert_eq!(leader.follower_match_index(NodeId::new(99)), None);
+    }
+
+    #[test]
+    fn follower_match_index_starts_at_zero_for_tracked_voters() {
+        let leader = leader_with(NodeId::new(0), &[NodeId::new(1), NodeId::new(2)]);
+        assert_eq!(
+            leader.follower_match_index(NodeId::new(1)),
+            Some(LogIndex::new(0))
+        );
+        assert_eq!(
+            leader.follower_match_index(NodeId::new(2)),
+            Some(LogIndex::new(0))
+        );
+    }
+
+    #[test]
+    fn follower_match_index_starts_at_zero_for_non_voter_and_new_voter() {
+        // Solo-voter leader so config changes commit immediately.
+        let mut leader = leader_with(NodeId::new(0), &[]);
+        drain(&mut leader);
+
+        // Non-voter is tracked as soon as the config change is applied.
+        let mut cfg = leader.config().clone();
+        cfg.non_voters.insert(NodeId::new(1));
+        assert_ne!(leader.propose_config(cfg), LogPosition::INVALID);
+        drain(&mut leader);
+        assert_eq!(
+            leader.follower_match_index(NodeId::new(1)),
+            Some(LogIndex::new(0))
+        );
+
+        // A new_voters-only node in a joint consensus is also tracked.
+        let joint = leader.config().to_joint_consensus(&[NodeId::new(2)], &[]);
+        assert_ne!(leader.propose_config(joint), LogPosition::INVALID);
+        drain(&mut leader);
+        assert_eq!(
+            leader.follower_match_index(NodeId::new(2)),
+            Some(LogIndex::new(0))
+        );
+    }
+
+    #[test]
+    fn follower_match_index_advances_on_successful_reply() {
+        let mut leader = leader_with(NodeId::new(0), &[NodeId::new(1)]);
+        let follower_id = NodeId::new(1);
+        assert_eq!(
+            leader.follower_match_index(follower_id),
+            Some(LogIndex::new(0))
+        );
+        let last = leader.log().last_position();
+        let reply = Message::append_entries_reply(leader.current_term(), follower_id, last);
+        leader.handle_message(&reply).unwrap();
+        assert_eq!(leader.follower_match_index(follower_id), Some(last.index));
+    }
+
+    #[test]
+    fn follower_match_index_does_not_regress_on_delayed_reply() {
+        let mut leader = leader_with(NodeId::new(0), &[NodeId::new(1)]);
+        // Manually advance follower.match_index so a smaller last_position looks stale.
+        if let RoleState::Leader { followers, .. } = &mut leader.role {
+            let f = followers.get_mut(&NodeId::new(1)).unwrap();
+            f.match_index = LogIndex::new(5);
+        }
+        assert_eq!(
+            leader.follower_match_index(NodeId::new(1)),
+            Some(LogIndex::new(5))
+        );
+        let reply = Message::append_entries_reply(
+            leader.current_term(),
+            NodeId::new(1),
+            pos(leader.current_term().get(), 3),
+        );
+        leader.handle_message(&reply).unwrap();
+        assert_eq!(
+            leader.follower_match_index(NodeId::new(1)),
+            Some(LogIndex::new(5))
+        );
+    }
+
+    #[test]
+    fn follower_match_index_returns_none_after_removed_from_config() {
+        // Solo-voter leader so config changes commit immediately.
+        let mut leader = leader_with(NodeId::new(0), &[]);
+        drain(&mut leader);
+
+        let mut cfg = leader.config().clone();
+        cfg.non_voters.insert(NodeId::new(1));
+        assert_ne!(leader.propose_config(cfg), LogPosition::INVALID);
+        drain(&mut leader);
+        assert!(leader.follower_match_index(NodeId::new(1)).is_some());
+
+        let mut cfg = leader.config().clone();
+        cfg.non_voters.clear();
+        assert_ne!(leader.propose_config(cfg), LogPosition::INVALID);
+        drain(&mut leader);
+        assert_eq!(leader.follower_match_index(NodeId::new(1)), None);
+    }
+
+    #[test]
+    fn follower_match_index_forgets_previous_values_after_stepdown() {
+        let mut leader = leader_with(NodeId::new(0), &[NodeId::new(1)]);
+        let follower_id = NodeId::new(1);
+
+        let last = leader.log().last_position();
+        let reply = Message::append_entries_reply(leader.current_term(), follower_id, last);
+        leader.handle_message(&reply).unwrap();
+        assert_eq!(leader.follower_match_index(follower_id), Some(last.index));
+
+        // Step down via a higher-term RequestVote.
+        let higher = Term::new(leader.current_term().get() + 10);
+        let msg = Message::request_vote_call(higher, follower_id, pos(higher.get(), 1));
+        leader.handle_message(&msg).unwrap();
+        assert!(leader.role().is_follower());
+        assert_eq!(leader.follower_match_index(follower_id), None);
     }
 }
