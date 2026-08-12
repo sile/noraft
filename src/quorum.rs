@@ -165,7 +165,8 @@ mod tests {
         assert_eq!(q.smallest_majority_index(), idx(0));
 
         // Advancing a voter already inside the top-k updates its entry in
-        // place, so the min moves from (10, 4) to (15, 3).
+        // place: node 3 moves from (0, 3) to (15, 3), and the set's min
+        // shifts from (0, 3) to (10, 4).
         q.update_match_index(&c, id(3), idx(0), idx(15));
         assert_eq!(
             q.majority_indices.iter().copied().collect::<Vec<_>>(),
@@ -268,10 +269,13 @@ mod tests {
         // New majority top-k excludes the min, so its floor is 50.
         assert_eq!(q.smallest_majority_index(), idx(0));
 
-        // The shared voter (3) advances in both sets simultaneously.
+        // The shared voter (3) advances: in the old set it evicts (0, 2),
+        // while in the new set (30, 3) is a no-op because 30 <= the new
+        // set's current min 50 (early return in update_majority).
         q.update_match_index(&c, id(3), idx(0), idx(30));
         // Old majority min is now min of (100 for id 1, 30 for id 3) = 30.
-        // New majority top-k is {(30,3), (50,4), (60,5)} → min 30.
+        // The new top-k stays {(50,4), (60,5)} (min 50); the joint min 30
+        // comes from the old set {(30,3), (100,1)}.
         assert_eq!(q.smallest_majority_index(), idx(30));
     }
 
