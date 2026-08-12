@@ -69,6 +69,14 @@ pub enum Message {
         /// this crate replies the last log position of the follower.
         /// With this adjustment, the leader can quickly determine the appropriate match index of the follower,
         /// even if the follower is significantly behind the leader.
+        ///
+        /// A leader discards this reply as delayed when `last_position.index`
+        /// is smaller than the `match_index` it already holds for the sender
+        /// during the same leader's tenure. The
+        /// [`NodeMetrics::append_entries_replies_ignored_behind_match_index`]
+        /// counter is incremented in that case.
+        ///
+        /// [`NodeMetrics::append_entries_replies_ignored_behind_match_index`]: crate::NodeMetrics::append_entries_replies_ignored_behind_match_index
         last_position: LogPosition,
     },
 }
@@ -231,11 +239,7 @@ impl Message {
                 *term = (*term).max(last_included_position.term);
                 entries.handle_snapshot_installed(last_included_position);
             }
-            Message::AppendEntriesReply {
-                term: _,
-                last_position,
-                ..
-            } => {
+            Message::AppendEntriesReply { last_position, .. } => {
                 if last_position.index < last_included_position.index {
                     *last_position = last_included_position;
                 }
@@ -394,7 +398,7 @@ mod tests {
 
         assert_eq!(
             message,
-            Message::append_entries_reply(Term::new(10), NodeId::new(1), pos(12, 5),)
+            Message::append_entries_reply(Term::new(10), NodeId::new(1), pos(12, 5))
         );
     }
 

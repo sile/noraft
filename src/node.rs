@@ -188,8 +188,9 @@ pub struct NodeMetrics {
     /// message reordering. Sustained or acute growth during a single leader's
     /// tenure, combined with a follower whose `match_index` does not advance,
     /// can indicate log reordering, incorrect persistence ordering, or a lost
-    /// log tail on the follower. See the section "Signs that log loss may have
-    /// occurred" on [`Node::restart`] for how to investigate.
+    /// log tail on the follower. See the "Signs that log loss may have
+    /// occurred" section on [`Node::restart`] for how to interpret sustained
+    /// growth.
     pub append_entries_replies_ignored_behind_match_index: u64,
 
     /// Number of times a follower reported a last log index greater than the
@@ -229,6 +230,9 @@ impl Node {
     /// To create a new cluster, please call [`Node::create_cluster()`] after starting the node.
     ///
     /// If the node has already been part of a cluster, please use [`Node::restart()`] instead.
+    /// The "Persistence requirements" section on [`Node::restart`] documents
+    /// the contract that any process running a [`Node`] must satisfy,
+    /// including newly-started ones.
     ///
     /// # Examples
     ///
@@ -270,12 +274,15 @@ impl Node {
     ///
     /// - `current_term`, `voted_for`, and `log` must be restored without loss from
     ///   the state that noraft last requested to be persisted.
-    /// - Before sending a message, the crate user must complete the persistence
-    ///   requested by the corresponding [`Action`].
+    /// - Before sending an outbound message that a batch of [`Action`]s yielded,
+    ///   the crate user must complete the persistence requested by the
+    ///   preceding storage [`Action`]s in the same batch (`SaveCurrentTerm`,
+    ///   `SaveVotedFor`, `AppendLogEntries`). See [`Actions`] for the ordering
+    ///   contract that makes this well-defined.
     /// - A node whose persistent state is suspected of loss or corruption must not
-    ///   be brought back into the cluster with [`Node::restart`]. See the section
-    ///   "Signs that log loss may have occurred" below for how to detect and
-    ///   respond to such a case.
+    ///   be brought back into the cluster with [`Node::restart`]. Detection and
+    ///   handling of that case are described in the [Signs that log loss may
+    ///   have occurred](#signs-that-log-loss-may-have-occurred) section below.
     /// - If any of the above requirements are violated, the situation is outside
     ///   the support scope of this crate and neither safety nor liveness is
     ///   guaranteed.
@@ -300,10 +307,14 @@ impl Node {
     ///
     /// 1. Confirm that `AppendEntries` deliveries to the restarted node and its
     ///    persistence requests are still making progress.
-    /// 2. Confirm that the leader and the term have not changed across the
-    ///    failure boundary.
-    /// 3. Compare the restarted node's local last index with the `match_index`
-    ///    that the leader holds for it.
+    /// 2. Confirm from the integration layer's own bookkeeping that the leader
+    ///    and the term have not changed across the failure boundary (noraft
+    ///    itself does not retain this information across restarts).
+    /// 3. Compare the restarted node's local last index with the leader's view
+    ///    of that node's replication progress. noraft does not currently expose
+    ///    a per-follower `match_index` accessor, so the integration layer needs
+    ///    to observe replication from its transport log or from the replies it
+    ///    forwards.
     /// 4. Check whether the leader's
     ///    [`NodeMetrics::append_entries_replies_ignored_behind_match_index`]
     ///    counter (the number of `AppendEntries` replies ignored for reporting a
@@ -314,12 +325,14 @@ impl Node {
     /// [`NodeMetrics::append_entries_replies_ignored_behind_match_index`] is a
     /// leader-wide aggregate counter and does not identify which follower is
     /// responsible. Treat it as an auxiliary signal to combine with the stalled
-    /// restarted node, the leader's `match_index`, and the transport log.
+    /// restarted node and the transport log the integration layer keeps.
     ///
-    /// Once log loss or corruption is confirmed, the affected node must not be
-    /// reused as-is to catch up. Stop and isolate it, remove it from the cluster
-    /// configuration, and re-add it as a fresh node backed by healthy storage
-    /// if needed.
+    /// noraft does not attempt any automatic recovery from this state. The
+    /// leader keeps dropping the follower's replies until the operator
+    /// intervenes or a leader change resets `match_index`. Once log loss or
+    /// corruption is confirmed, the affected node must not be reused as-is to
+    /// catch up: stop and isolate it, remove it from the cluster configuration,
+    /// and re-add it as a fresh node backed by healthy storage if needed.
     ///
     /// If a leader change happens during the outage, the follower's
     /// `match_index` is reset by the new leader, so the stall does not appear
@@ -678,6 +691,13 @@ impl Node {
         self.log.last_position()
     }
 
+    // Preserves the `match_index` of existing followers and only inserts a
+    // fresh `Follower::new()` for newly added members. Followers dropped from
+    // the latest configuration are removed.
+    //
+    // Keeping existing entries untouched is what makes `match_index`
+    // monotonically non-decreasing within a single leader's tenure, which the
+    // behind-match_index check in `handle_append_entries_reply` relies on.
     fn rebuild_followers(&mut self) {
         let RoleState::Leader { followers, .. } = &mut self.role else {
             unreachable!();
@@ -685,7 +705,6 @@ impl Node {
 
         let config = self.log.latest_config();
 
-        // Add new followers.
         for id in config.unique_nodes() {
             if id == self.id || followers.contains_key(&id) {
                 continue;
@@ -693,7 +712,6 @@ impl Node {
             followers.insert(id, Follower::new());
         }
 
-        // Remove followers not in the latest configuration.
         followers.retain(|id, _| config.contains(*id));
     }
 
@@ -1251,10 +1269,9 @@ impl Node {
                 .metrics
                 .append_entries_replies_ignored_behind_match_index
                 .saturating_add(1);
-            // Delayed reply behind the acknowledged match index.
-            // The persistent state is required by contract to be preserved
-            // across restarts, so a follower cannot legitimately regress
-            // below its own `match_index` during the same leader's tenure.
+            // Delayed reply behind the acknowledged match index. The
+            // persistence contract on `Node::restart` guarantees this cannot
+            // happen legitimately within a single leader's tenure.
             return;
         }
 
@@ -1408,6 +1425,9 @@ impl Node {
             msg.handle_snapshot_installed(last_included_position);
         }
 
+        // Per-follower `match_index` is intentionally not updated here: what a
+        // follower actually holds is only known from its `AppendEntriesReply`,
+        // and taking a snapshot on the leader does not change that observation.
         true
     }
 

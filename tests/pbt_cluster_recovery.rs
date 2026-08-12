@@ -1,4 +1,4 @@
-//! Recovery PBTs for restarts, storage loss, snapshots, and divergent logs.
+//! Recovery PBTs for restarts and divergent logs.
 //!
 //! Every test obtains its seed through `noprop::seed_from_env_or_time`
 //! via the shared runner. CI therefore uses a fresh time-derived seed

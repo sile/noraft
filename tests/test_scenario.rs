@@ -248,7 +248,6 @@ fn append_entries_reply_below_match_index_is_ignored() {
     let reply = follower.asserted_handle_append_entries_call_success(&call);
     leader.asserted_handle_append_entries_reply_success(&reply, true, false);
 
-    // The leader has now acknowledged the initial config replication.
     let follower_last = follower.log().last_position();
     assert!(follower_last.index > LogIndex::ZERO);
     let commit_before = leader.commit_index();

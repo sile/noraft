@@ -492,7 +492,9 @@ impl TestNode {
         }
     }
 
-    /// Number of times this node has been restarted (never resets).
+    /// Monotonically increasing count of the times this node has been
+    /// restarted through `Node::restart` (excluding the initial `Node::start`
+    /// in `TestNode::new`).
     pub fn restarts(&self) -> u64 {
         self.restarts
     }
