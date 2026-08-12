@@ -191,7 +191,7 @@ pub struct NodeMetrics {
     /// log tail on the follower. See the "Signs that log loss may have
     /// occurred" section on [`Node::restart`] for how to interpret sustained
     /// growth, and [`Node::follower_match_index`] for reading the per-follower
-    /// value this counter guards.
+    /// value against which the reported index is compared.
     pub append_entries_replies_ignored_behind_match_index: u64,
 
     /// Number of times a follower reported a last log index greater than the
@@ -532,9 +532,11 @@ impl Node {
     /// `self.id()` itself, or a node that has been dropped from the current
     /// configuration) [`None`] is returned.
     ///
-    /// The value is the largest `last_position.index` this leader has observed
-    /// from an `AppendEntries` reply that was contained in its own log and not
-    /// older than the previously recorded `match_index` for that follower. It
+    /// The value is the maximum of [`LogIndex::ZERO`] and the
+    /// `last_position.index` values from `AppendEntries` replies that this
+    /// leader accepted as positions contained in its own log. Thus,
+    /// [`LogIndex::ZERO`] may mean that no reply has been accepted yet or that
+    /// accepted replies have only reported the sentinel position. The value
     /// grows monotonically for as long as (a) the node remains leader in the
     /// same tenure and (b) the follower stays continuously in the
     /// configuration. Every new leader tenure starts with an empty per-follower
@@ -546,19 +548,20 @@ impl Node {
     ///
     /// # Interpreting the value
     ///
-    /// - The value only says that a reply was received and accepted. It is not
-    ///   a claim about what the follower has already committed nor about what
-    ///   its state machine has applied.
+    /// - A value above [`LogIndex::ZERO`] only says that a reply was received
+    ///   and accepted. It is not a claim about what the follower has already
+    ///   committed nor about what its state machine has applied.
     /// - Provided the persistence contract on [`Node::restart`] (see the
     ///   "Persistence requirements" section) is honored on the follower side,
     ///   `match_index` is a lower bound on the log the follower has already
     ///   made durable. If the contract is violated (for example a reply is sent
     ///   before its preceding `AppendLogEntries` `Action` is persisted), the
     ///   lower-bound interpretation no longer holds.
-    /// - When this leader has advanced its `snapshot_position` past the value,
-    ///   the follower is being caught up via [`Action::InstallSnapshot`] rather
-    ///   than `AppendEntries`; `handle_snapshot_installed` does not touch the
-    ///   per-follower `match_index` on the leader side.
+    /// - If replication recovery reaches a follower position older than the
+    ///   leader's current `snapshot_position`, the leader requests
+    ///   [`Action::InstallSnapshot`]. Completing that installation does not
+    ///   itself advance the leader's per-follower `match_index`; a later
+    ///   accepted `AppendEntries` reply does.
     /// - The value only carries meaning within the current tenure. Do not
     ///   cache and compare it across tenures: a leader change resets it back
     ///   to 0 on the next leader, and it does not record the term or content
@@ -568,10 +571,11 @@ impl Node {
     ///   "Signs that log loss may have occurred" section on [`Node::restart`],
     ///   not by this value alone.
     /// - See also
-    ///   [`NodeMetrics::append_entries_replies_ignored_behind_match_index`]:
-    ///   the counter and this value share the same `Follower::match_index`
-    ///   state, and the counter increments exactly when a reply would have
-    ///   otherwise pushed this value backwards.
+    ///   [`NodeMetrics::append_entries_replies_ignored_behind_match_index`].
+    ///   While this node is leader, the counter increments when a tracked
+    ///   follower's current-term reply reports an index below the value
+    ///   currently tracked for it. The reply is ignored, leaving this value
+    ///   unchanged.
     ///
     /// # Deciding when to promote a non-voter
     ///
@@ -579,9 +583,8 @@ impl Node {
     /// non-voter first, letting it catch up, and then promoting it to a voter.
     /// This method lets the integration layer observe that catch-up directly:
     /// once `follower_match_index(new_node)` is close enough to
-    /// `self.log().last_position().index` (the exact threshold is an
-    /// integration-side policy), the node is ready to be promoted with
-    /// [`Node::propose_config`].
+    /// `self.log().last_position().index` under an integration-side policy,
+    /// the integration can propose its promotion with [`Node::propose_config`].
     ///
     /// # Diagnosing suspected log loss before rejoining
     ///
@@ -596,10 +599,12 @@ impl Node {
     /// The concrete procedure is:
     ///
     /// 1. Read `local_last_index` from the recovered persistent storage.
-    /// 2. Ask the current leader instance for `Node::id`, `Node::current_term`,
-    ///    and `Node::follower_match_index(target)` in the same tenure. Rust's
-    ///    aliasing rules guarantee no mutation can interleave the three
-    ///    `&self` reads on the same borrow, so they form a single snapshot.
+    /// 2. Read `Node::id`, `Node::current_term`, and
+    ///    `Node::follower_match_index(target)` from the current leader while
+    ///    holding one continuous shared borrow or the same synchronization
+    ///    guard. Acquiring access separately for each call does not form a
+    ///    single snapshot because the integration may process a state change
+    ///    between calls.
     /// 3. If `local_last_index < follower_match_index`, the follower cannot
     ///    still hold a log tail that the current-tenure leader has already
     ///    seen. Isolate the node and refuse to restart it.
@@ -801,10 +806,9 @@ impl Node {
     //
     // Preserving existing entries here provides continuity of `match_index`
     // across configuration changes while a follower stays continuously in the
-    // configuration. Monotonicity of `match_index` itself is enforced by
-    // `handle_append_entries_reply`, which skips replies whose `last_position`
-    // is behind the recorded `match_index` and only advances on strictly
-    // greater indices.
+    // configuration. `handle_append_entries_reply` keeps `match_index`
+    // monotonic by advancing it only on strictly greater indices. Replies
+    // behind the recorded value are discarded before replication recovery.
     fn rebuild_followers(&mut self) {
         let self_id = self.id;
         let config = self.log.latest_config();
@@ -1372,10 +1376,9 @@ impl Node {
                 .metrics
                 .append_entries_replies_ignored_behind_match_index
                 .saturating_add(1);
-            // Delayed reply behind the acknowledged match index. Skipping it
-            // here is what keeps the per-follower `match_index` monotonically
-            // non-decreasing within a single leader tenure while the follower
-            // stays continuously in the configuration.
+            // This delayed reply is behind the acknowledged match index.
+            // Discard it instead of attempting replication recovery from an
+            // obsolete follower position.
             return;
         }
 

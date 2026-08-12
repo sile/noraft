@@ -60,8 +60,8 @@ pub struct ClusterConfig {
     /// it is recommended to first add the new nodes as non-voters to avoid blocking subsequent log commits.
     /// Allow these nodes to catch up with the leader before promoting them to voters;
     /// the leader exposes each follower's replication progress through
-    /// [`Node::follower_match_index`] so that the integration layer can decide
-    /// when the non-voter is close enough to be safely promoted.
+    /// [`Node::follower_match_index`] so that the integration layer can apply
+    /// its own promotion policy once the non-voter has caught up sufficiently.
     ///
     /// Note that adding or removing non-voters does not require a joint consensus.
     ///
