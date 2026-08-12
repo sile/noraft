@@ -314,6 +314,13 @@ struct InvariantState {
     // leader.
     committed: BTreeMap<LogIndex, (LogPosition, LogEntry, Term)>,
     leader_with_committed_history_seen: bool,
+    // Highest match_index observed per (leader, term) tenure, used by
+    // `check_follower_match_index_monotonic` to detect within-tenure
+    // regressions. Safe only while `Cmd` does not include membership
+    // changes: a follower dropped from the configuration and later
+    // re-added during the same tenure would legitimately reset its
+    // match_index to 0 and trigger a false positive here.
+    follower_match_indexes: BTreeMap<(NodeId, Term), BTreeMap<NodeId, LogIndex>>,
 }
 
 impl InvariantState {
@@ -323,6 +330,7 @@ impl InvariantState {
         self.check_leader_append_only(cluster)?;
         self.check_state_machine_safety(cluster)?;
         self.check_leader_completeness(cluster)?;
+        self.check_follower_match_index_monotonic(cluster)?;
         Ok(())
     }
 
@@ -496,6 +504,40 @@ impl InvariantState {
         }
         Ok(())
     }
+
+    // Within a single (leader, term) tenure, `follower_match_index` must not
+    // regress. `(leader_id, term)` uniquely identifies a tenure because every
+    // path to `transition_to_leader` goes through `transition_to_candidate`,
+    // which bumps `current_term`.
+    fn check_follower_match_index_monotonic(&mut self, cluster: &Cluster) -> Result<(), String> {
+        for (leader_id, node) in &cluster.nodes {
+            if node.role() != Role::Leader {
+                continue;
+            }
+            let term = node.current_term();
+            let recorded = self
+                .follower_match_indexes
+                .entry((*leader_id, term))
+                .or_default();
+            for follower_id in node.peers() {
+                let Some(current) = node.follower_match_index(follower_id) else {
+                    continue;
+                };
+                if let Some(previous) = recorded.get(&follower_id)
+                    && current < *previous
+                {
+                    return Err(format!(
+                        "follower_match_index regressed within a single tenure: leader {} in \
+                         {term:?}, follower {}: previous={previous:?}, current={current:?}",
+                        u64::from(*leader_id),
+                        u64::from(follower_id)
+                    ));
+                }
+                recorded.insert(follower_id, current);
+            }
+        }
+        Ok(())
+    }
 }
 
 fn sample_steps(ctx: &mut noprop::TestCaseContext) -> usize {
@@ -508,8 +550,9 @@ fn sample_steps(ctx: &mut noprop::TestCaseContext) -> usize {
 }
 
 /// The Raft election-safety, log-matching, leader-append-only,
-/// state-machine-safety, and leader-completeness properties hold after
-/// every state-dependent cluster command.
+/// state-machine-safety, and leader-completeness properties, plus the
+/// within-tenure monotonicity of `Node::follower_match_index`, hold
+/// after every state-dependent cluster command.
 #[test]
 fn cluster_invariants_hold() -> noprop::TestResult {
     let config = run_config(128)?;
