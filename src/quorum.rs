@@ -293,6 +293,28 @@ mod tests {
     }
 
     #[test]
+    fn advancing_in_set_non_min_voter_removes_its_old_entry() {
+        let c = cfg(&[1, 2, 3, 4, 5], &[], &[]);
+        let mut q = Quorum::new(&c);
+        q.update_match_index(&c, id(4), idx(0), idx(10));
+        assert_eq!(
+            q.majority_indices.iter().copied().collect::<Vec<_>>(),
+            [(idx(0), id(2)), (idx(0), id(3)), (idx(10), id(4))]
+        );
+
+        // (0, 3) is in the set but is not the minimum. Only the exact
+        // set contents distinguish the removal path from the
+        // pop-first fallback: with the removal broken, (0, 2) would be
+        // evicted and the result would still have size 3 and min 0.
+        q.update_match_index(&c, id(3), idx(0), idx(5));
+        assert_eq!(
+            q.majority_indices.iter().copied().collect::<Vec<_>>(),
+            [(idx(0), id(2)), (idx(5), id(3)), (idx(10), id(4))]
+        );
+        assert_eq!(q.smallest_majority_index(), idx(0));
+    }
+
+    #[test]
     fn advancing_a_voter_outside_top_k_evicts_the_min() {
         let c = cfg(&[1, 2, 3, 4, 5], &[], &[]);
         let mut q = Quorum::new(&c);
