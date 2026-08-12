@@ -613,6 +613,8 @@ impl Node {
         let RoleState::Leader { followers, .. } = &self.role else {
             return None;
         };
+        // `followers` mirrors `config().unique_nodes()` minus `self.id`; the
+        // invariant is upheld by `rebuild_followers` and checked there.
         followers.get(&id).map(|f| f.match_index)
     }
 
@@ -804,20 +806,31 @@ impl Node {
     // is behind the recorded `match_index` and only advances on strictly
     // greater indices.
     fn rebuild_followers(&mut self) {
+        let self_id = self.id;
+        let config = self.log.latest_config();
+        let expected_len = config.unique_nodes().filter(|n| *n != self_id).count();
+
         let RoleState::Leader { followers, .. } = &mut self.role else {
             unreachable!();
         };
 
-        let config = self.log.latest_config();
-
         for id in config.unique_nodes() {
-            if id == self.id || followers.contains_key(&id) {
+            if id == self_id || followers.contains_key(&id) {
                 continue;
             }
             followers.insert(id, Follower::new());
         }
 
         followers.retain(|id, _| config.contains(*id));
+
+        // Uphold the invariant that `Node::follower_match_index` relies on:
+        // `followers` mirrors `config.unique_nodes()` minus `self.id`.
+        debug_assert_eq!(followers.len(), expected_len);
+        debug_assert!(
+            followers
+                .keys()
+                .all(|id| *id != self_id && config.contains(*id))
+        );
     }
 
     fn rebuild_quorum(&mut self) {
@@ -2097,5 +2110,47 @@ mod tests {
             .expect("higher-term RequestVote must be accepted");
         assert!(leader.role().is_follower());
         assert_eq!(leader.follower_match_index(follower_id), None);
+    }
+
+    #[test]
+    fn follower_match_index_resets_to_zero_on_reelection() {
+        let mut leader = leader_with(NodeId::new(0), &[NodeId::new(1)]);
+        let follower_id = NodeId::new(1);
+
+        // Advance the follower's match_index in the first tenure.
+        let last = leader.log().last_position();
+        assert!(last.index.get() > 0);
+        let reply = Message::append_entries_reply(leader.current_term(), follower_id, last);
+        leader
+            .handle_message(&reply)
+            .expect("append reply must be accepted");
+        assert_eq!(leader.follower_match_index(follower_id), Some(last.index));
+
+        // Step down via a higher-term RequestVote.
+        let higher = Term::new(leader.current_term().get() + 10);
+        let stepdown = Message::request_vote_call(higher, follower_id, pos(higher.get(), 1));
+        leader
+            .handle_message(&stepdown)
+            .expect("higher-term RequestVote must be accepted");
+        assert!(leader.role().is_follower());
+
+        // Re-elect the same node: election_timeout → candidate, then a vote
+        // from the other member turns it back into leader in a fresh tenure.
+        drain(&mut leader);
+        leader.handle_election_timeout();
+        assert!(leader.role().is_candidate());
+        drain(&mut leader);
+        let vote = Message::request_vote_reply(leader.current_term(), follower_id, true);
+        leader
+            .handle_message(&vote)
+            .expect("vote reply must be accepted");
+        assert!(leader.role().is_leader());
+
+        // A fresh tenure starts every follower's match_index back at zero,
+        // even for the same follower id that previously reached `last.index`.
+        assert_eq!(
+            leader.follower_match_index(follower_id),
+            Some(LogIndex::new(0))
+        );
     }
 }
