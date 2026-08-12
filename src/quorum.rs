@@ -68,6 +68,13 @@ fn update_majority<T: Ord>(
 ) {
     debug_assert!(old_entry.0 <= new_entry.0);
 
+    if old_entry == new_entry {
+        // A no-op update must not touch the set: otherwise the removal
+        // below would drop an in-set entry and shrink the set below the
+        // majority quota when that entry is not the current minimum.
+        return;
+    }
+
     // This set keeps only the current majority-sized top entries, not every
     // node. The incremental update is valid only while each node's index moves
     // monotonically forward; if an index can decrease, rebuild the whole quorum.
@@ -85,6 +92,8 @@ fn update_majority<T: Ord>(
 mod tests {
     use super::*;
     use alloc::collections::BTreeMap;
+    use alloc::format;
+    use alloc::string::String;
     use alloc::vec::Vec;
 
     fn id(n: u64) -> NodeId {
@@ -109,13 +118,111 @@ mod tests {
         c
     }
 
-    // Naive top-k min over the current index of every voter, used as an
-    // oracle for `Quorum::smallest_majority_index`.
-    fn naive_smallest_majority(voters: &BTreeMap<u64, u64>) -> u64 {
-        let mut sorted: Vec<u64> = voters.values().copied().collect();
-        sorted.sort_unstable_by(|a, b| b.cmp(a));
-        let majority = voters.len() / 2 + 1;
-        sorted[majority - 1]
+    // Naive oracle: the k-th largest index, where k = n/2 + 1. The input
+    // must be non-empty, matching the caller's contract that every voter
+    // set holds at least one member.
+    fn naive_majority_min(indices: &[u64]) -> u64 {
+        let mut sorted = indices.to_vec();
+        sorted.sort_unstable();
+        let majority = sorted.len() / 2 + 1;
+        sorted[sorted.len() - majority]
+    }
+
+    // Samples the next index of a node: a no-op (same index), a small
+    // advance, or the u64::MAX boundary.
+    fn sample_advance(ctx: &mut noprop::TestCaseContext, old: u64) -> u64 {
+        noprop::sample_with_boundaries(
+            ctx,
+            &[old, old.saturating_add(1), u64::MAX],
+            noprop::Ratio::one_nth(5),
+            |ctx| {
+                noprop::sample_usize_in(ctx, old as usize..=old.saturating_add(16) as usize) as u64
+            },
+        )
+    }
+
+    // Samples a count that gets extra weight on even sizes, the
+    // singleton, and the maximum.
+    fn sample_voter_count(ctx: &mut noprop::TestCaseContext, max: usize) -> usize {
+        noprop::sample_with_boundaries(ctx, &[1, 2, 4, max], noprop::Ratio::one_nth(5), |ctx| {
+            noprop::sample_usize_in(ctx, 1..=max)
+        })
+    }
+
+    fn sample_non_voter_count(ctx: &mut noprop::TestCaseContext) -> usize {
+        noprop::sample_with_boundaries(ctx, &[0, 1, 4], noprop::Ratio::one_nth(5), |ctx| {
+            noprop::sample_usize_in(ctx, 0..=4)
+        })
+    }
+
+    // Samples `count` distinct ids in `0..domain`. Callers keep `count`
+    // at most half of `domain`, so the retry loop is short.
+    fn sample_distinct_ids(
+        ctx: &mut noprop::TestCaseContext,
+        count: usize,
+        domain: usize,
+    ) -> Vec<u64> {
+        let mut ids = Vec::with_capacity(count);
+        while ids.len() < count {
+            let candidate = noprop::sample_usize_in(ctx, 0..domain) as u64;
+            if !ids.contains(&candidate) {
+                ids.push(candidate);
+            }
+        }
+        ids
+    }
+
+    // Samples a bounded update count while giving empty, singleton, and
+    // maximum lengths explicit probability.
+    fn sample_steps(ctx: &mut noprop::TestCaseContext, max: usize) -> usize {
+        noprop::sample_with_boundaries(ctx, &[0, 1, max], noprop::Ratio::one_nth(5), |ctx| {
+            noprop::sample_usize_in(ctx, 2..max)
+        })
+    }
+
+    // Compares `Quorum` against the naive model: `smallest_majority_index`
+    // must equal the k-th largest index of each voter set, and each set
+    // must hold exactly its majority quota. The quota is asserted
+    // independently of the oracle so that a change to the majority
+    // formula cannot silently break the comparison.
+    fn check_against_naive(
+        q: &Quorum,
+        voters: &[u64],
+        new_voters: &[u64],
+        current: &BTreeMap<u64, u64>,
+        step: usize,
+    ) -> Result<(), String> {
+        let voter_indices: Vec<u64> = voters.iter().map(|id| current[id]).collect();
+        let mut expected = naive_majority_min(&voter_indices);
+        if !new_voters.is_empty() {
+            let new_indices: Vec<u64> = new_voters.iter().map(|id| current[id]).collect();
+            expected = expected.min(naive_majority_min(&new_indices));
+        }
+        let actual = q.smallest_majority_index().get();
+        if actual != expected {
+            return Err(format!(
+                "step {step}: smallest_majority_index = {actual}, expected {expected}"
+            ));
+        }
+        if q.majority_indices.len() != voters.len() / 2 + 1 {
+            return Err(format!(
+                "step {step}: majority set size = {}, expected {}",
+                q.majority_indices.len(),
+                voters.len() / 2 + 1
+            ));
+        }
+        if new_voters.is_empty() {
+            if !q.new_majority_indices.is_empty() {
+                return Err(format!("step {step}: new majority set must be empty"));
+            }
+        } else if q.new_majority_indices.len() != new_voters.len() / 2 + 1 {
+            return Err(format!(
+                "step {step}: new majority set size = {}, expected {}",
+                q.new_majority_indices.len(),
+                new_voters.len() / 2 + 1
+            ));
+        }
+        Ok(())
     }
 
     #[test]
@@ -130,10 +237,59 @@ mod tests {
         let q = Quorum::new(&cfg(&[1], &[], &[]));
         assert_eq!(q.majority_indices.len(), 1);
 
+        // Even voter counts: the majority is n/2 + 1, not n/2.
+        let q = Quorum::new(&cfg(&[1, 2], &[], &[]));
+        assert_eq!(q.majority_indices.len(), 2);
+
+        let q = Quorum::new(&cfg(&[1, 2, 3, 4], &[], &[]));
+        assert_eq!(q.majority_indices.len(), 3);
+
         // In joint consensus each voter set has its own majority quota.
         let q = Quorum::new(&cfg(&[1, 2, 3], &[1, 2, 3, 4, 5], &[]));
         assert_eq!(q.majority_indices.len(), 2);
         assert_eq!(q.new_majority_indices.len(), 3);
+
+        let q = Quorum::new(&cfg(&[1, 2, 3, 4], &[1, 2, 3, 4, 5, 6], &[]));
+        assert_eq!(q.majority_indices.len(), 3);
+        assert_eq!(q.new_majority_indices.len(), 4);
+    }
+
+    #[test]
+    fn even_voter_majority_requires_half_plus_one() {
+        // Two voters: both must advance before the majority moves.
+        let c = cfg(&[1, 2], &[], &[]);
+        let mut q = Quorum::new(&c);
+        q.update_match_index(&c, id(1), idx(0), idx(10));
+        assert_eq!(q.smallest_majority_index(), idx(0));
+        q.update_match_index(&c, id(2), idx(0), idx(20));
+        assert_eq!(q.smallest_majority_index(), idx(10));
+
+        // Four voters: three must advance, two are not enough.
+        let c = cfg(&[1, 2, 3, 4], &[], &[]);
+        let mut q = Quorum::new(&c);
+        q.update_match_index(&c, id(1), idx(0), idx(10));
+        q.update_match_index(&c, id(2), idx(0), idx(20));
+        assert_eq!(q.smallest_majority_index(), idx(0));
+        q.update_match_index(&c, id(3), idx(0), idx(30));
+        assert_eq!(q.smallest_majority_index(), idx(10));
+    }
+
+    #[test]
+    fn in_set_voter_same_index_update_is_a_no_op() {
+        let c = cfg(&[1, 2, 3], &[], &[]);
+        let mut q = Quorum::new(&c);
+        q.update_match_index(&c, id(1), idx(0), idx(10));
+
+        // Re-applying the current index of an in-set, non-min voter must
+        // keep the set intact: without the no-op guard in
+        // `update_majority`, the removal would shrink the set below the
+        // majority quota.
+        q.update_match_index(&c, id(2), idx(0), idx(0));
+        assert_eq!(
+            q.majority_indices.iter().copied().collect::<Vec<_>>(),
+            [(idx(0), id(2)), (idx(10), id(1))]
+        );
+        assert_eq!(q.smallest_majority_index(), idx(0));
     }
 
     #[test]
@@ -279,36 +435,79 @@ mod tests {
         assert_eq!(q.smallest_majority_index(), idx(30));
     }
 
+    // Model-based property: `Quorum::smallest_majority_index` always
+    // equals the k-th largest index among the voters (k = n/2 + 1) of
+    // each voter set, for random configurations (1..=8 voters with even
+    // sizes biased, optional joint consensus with overlapping voter
+    // sets, and disjoint non-voters) and random monotonically increasing
+    // update sequences, including no-op and u64::MAX updates.
+    //
+    // `Quorum` is crate-private, so unlike the other PBTs this property
+    // lives here instead of tests/pbt_*.rs and follows the crate's
+    // NORAFT_PBT_SEED reproduction convention directly.
     #[test]
-    fn smallest_majority_matches_naive_top_k() {
-        let voters = [1u64, 2, 3, 4, 5];
-        let c = cfg(&voters, &[], &[]);
-        let mut q = Quorum::new(&c);
-        let mut current: BTreeMap<u64, u64> = voters.iter().map(|&v| (v, 0)).collect();
+    fn quorum_matches_naive_model() -> noprop::TestResult {
+        let seed = noprop::seed_from_env_or_time("NORAFT_PBT_SEED")?;
+        let advanced_min_cases = core::cell::Cell::new(0usize);
+        let joint_cases = core::cell::Cell::new(0usize);
+        let non_voter_update_cases = core::cell::Cell::new(0usize);
+        let mut runner = noprop::Runner::new(seed);
 
-        // Interleaved advances of different voters, including one that
-        // moves twice; the incremental result must always match a naive
-        // top-k over every voter's latest index.
-        let updates: &[(u64, u64)] = &[
-            (1, 5),
-            (2, 10),
-            (3, 15),
-            (4, 20),
-            (5, 25),
-            (1, 30),
-            (3, 40),
-            (2, 35),
-        ];
+        runner.run(1024, |ctx| {
+            let voter_count = sample_voter_count(ctx, 8);
+            let voters: Vec<u64> = sample_distinct_ids(ctx, voter_count, 16);
+            let new_voter_count = sample_voter_count(ctx, 8) - 1;
+            let new_voters: Vec<u64> = sample_distinct_ids(ctx, new_voter_count, 16);
+            let non_voter_count = sample_non_voter_count(ctx);
+            let non_voters: Vec<u64> = sample_distinct_ids(ctx, non_voter_count, 8)
+                .into_iter()
+                .map(|id| id + 16)
+                .collect();
+            let config = cfg(&voters, &new_voters, &non_voters);
+            let pool: Vec<u64> = voters.iter().chain(&new_voters).copied().collect();
+            let mut current: BTreeMap<u64, u64> = pool.iter().map(|&id| (id, 0)).collect();
 
-        for &(node, new_index) in updates {
-            let old = current[&node];
-            q.update_match_index(&c, id(node), idx(old), idx(new_index));
-            current.insert(node, new_index);
-            assert_eq!(
-                q.smallest_majority_index().get(),
-                naive_smallest_majority(&current),
-                "after updating node {node} to {new_index}"
-            );
-        }
+            let mut q = Quorum::new(&config);
+            check_against_naive(&q, &voters, &new_voters, &current, 0)?;
+
+            let steps = sample_steps(ctx, 64);
+            for step in 1..=steps {
+                if !non_voters.is_empty() && noprop::sample_ratio(ctx, noprop::Ratio::new(1, 5)) {
+                    let node_id = noprop::sample_choice(ctx, &non_voters);
+                    let index = sample_advance(ctx, 0);
+                    q.update_match_index(&config, id(node_id), idx(0), idx(index));
+                    non_voter_update_cases.set(non_voter_update_cases.get() + 1);
+                } else {
+                    let node_id = noprop::sample_choice(ctx, &pool);
+                    let old = current[&node_id];
+                    let index = sample_advance(ctx, old);
+                    q.update_match_index(&config, id(node_id), idx(old), idx(index));
+                    current.insert(node_id, index);
+                }
+                check_against_naive(&q, &voters, &new_voters, &current, step)?;
+            }
+
+            if q.smallest_majority_index().get() > 0 {
+                advanced_min_cases.set(advanced_min_cases.get() + 1);
+            }
+            if !new_voters.is_empty() {
+                joint_cases.set(joint_cases.get() + 1);
+            }
+            Ok(())
+        })?;
+
+        assert!(
+            advanced_min_cases.get() > 0,
+            "no case advanced the smallest majority index\n{runner}"
+        );
+        assert!(
+            joint_cases.get() > 0,
+            "no case exercised a joint consensus configuration\n{runner}"
+        );
+        assert!(
+            non_voter_update_cases.get() > 0,
+            "no case exercised a non-voter update\n{runner}"
+        );
+        Ok(())
     }
 }
