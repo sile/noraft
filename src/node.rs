@@ -190,7 +190,8 @@ pub struct NodeMetrics {
     /// can indicate log reordering, incorrect persistence ordering, or a lost
     /// log tail on the follower. See the "Signs that log loss may have
     /// occurred" section on [`Node::restart`] for how to interpret sustained
-    /// growth.
+    /// growth, and [`Node::follower_match_index`] for reading the per-follower
+    /// value this counter guards.
     pub append_entries_replies_ignored_behind_match_index: u64,
 
     /// Number of times a follower reported a last log index greater than the
@@ -315,8 +316,9 @@ impl Node {
     ///    last index that is strictly smaller than the returned `match_index`
     ///    means the follower cannot still hold the log tail the current-tenure
     ///    leader has already acknowledged. Note that a `None` result — the
-    ///    queried node is no longer leader, the tenure has changed, or the id
-    ///    is not tracked — leaves this step inconclusive.
+    ///    queried node is not currently a leader, or the id is not tracked as
+    ///    a follower on this leader (self id, unknown, or removed from the
+    ///    configuration) — leaves this step inconclusive.
     /// 4. Check whether the leader's
     ///    [`NodeMetrics::append_entries_replies_ignored_behind_match_index`]
     ///    counter (the number of `AppendEntries` replies ignored for reporting a
@@ -531,33 +533,45 @@ impl Node {
     /// configuration) [`None`] is returned.
     ///
     /// The value is the largest `last_position.index` this leader has observed
-    /// from a successful `AppendEntries` reply from that follower during the
-    /// current leader tenure. It grows monotonically for as long as the node
-    /// remains leader, and it is reset to [`LogIndex::ZERO`] whenever the node
-    /// transitions to leader — including a re-election of the same node —
-    /// because [`Node::restart`] does not carry `match_index` across a leader
-    /// change.
+    /// from an `AppendEntries` reply that was contained in its own log and not
+    /// older than the previously recorded `match_index` for that follower. It
+    /// grows monotonically for as long as (a) the node remains leader in the
+    /// same tenure and (b) the follower stays continuously in the
+    /// configuration. Every new leader tenure starts with an empty per-follower
+    /// map (built in `transition_to_leader`), so the value is reset to
+    /// [`LogIndex::ZERO`] whenever the node transitions to leader, including a
+    /// re-election of the same node. If a follower is dropped from the
+    /// configuration and later re-added within the same tenure, its
+    /// `match_index` restarts from [`LogIndex::ZERO`] as well.
     ///
     /// # Interpreting the value
     ///
-    /// - The value only says that a successful reply was received. It is not a
-    ///   claim about what the follower has already committed nor about what its
-    ///   state machine has applied.
+    /// - The value only says that a reply was received and accepted. It is not
+    ///   a claim about what the follower has already committed nor about what
+    ///   its state machine has applied.
     /// - Provided the persistence contract on [`Node::restart`] (see the
     ///   "Persistence requirements" section) is honored on the follower side,
     ///   `match_index` is a lower bound on the log the follower has already
     ///   made durable. If the contract is violated (for example a reply is sent
     ///   before its preceding `AppendLogEntries` `Action` is persisted), the
     ///   lower-bound interpretation no longer holds.
-    /// - The value cannot detect every kind of divergence on its own. In
-    ///   particular:
-    ///     - A leader change during the outage resets `match_index` back to 0
-    ///       on the next leader.
-    ///     - The counter is an index only; it cannot distinguish an entry
-    ///       whose term or payload has since been overwritten.
-    ///     - A complete loss of persistent storage is handled by the
-    ///       "Signs that log loss may have occurred" section on
-    ///       [`Node::restart`], not by this value alone.
+    /// - When this leader has advanced its `snapshot_position` past the value,
+    ///   the follower is being caught up via [`Action::InstallSnapshot`] rather
+    ///   than `AppendEntries`; `handle_snapshot_installed` does not touch the
+    ///   per-follower `match_index` on the leader side.
+    /// - The value only carries meaning within the current tenure. Do not
+    ///   cache and compare it across tenures: a leader change resets it back
+    ///   to 0 on the next leader, and it does not record the term or content
+    ///   of the entry at that index (so it cannot distinguish an entry that
+    ///   has since been overwritten by a later leader).
+    /// - A complete loss of persistent storage is handled by the
+    ///   "Signs that log loss may have occurred" section on [`Node::restart`],
+    ///   not by this value alone.
+    /// - See also
+    ///   [`NodeMetrics::append_entries_replies_ignored_behind_match_index`]:
+    ///   the counter and this value share the same `Follower::match_index`
+    ///   state, and the counter increments exactly when a reply would have
+    ///   otherwise pushed this value backwards.
     ///
     /// # Deciding when to promote a non-voter
     ///
@@ -583,11 +597,9 @@ impl Node {
     ///
     /// 1. Read `local_last_index` from the recovered persistent storage.
     /// 2. Ask the current leader instance for `Node::id`, `Node::current_term`,
-    ///    and `Node::follower_match_index(target)` in the same tenure. Because
-    ///    they are consecutive `&self` calls on the same [`Node`], the three
-    ///    values naturally form a single snapshot; every leader tenure starts
-    ///    with a fresh per-follower `match_index` (initialized to 0), so the
-    ///    returned value is guaranteed to belong to the current tenure.
+    ///    and `Node::follower_match_index(target)` in the same tenure. Rust's
+    ///    aliasing rules guarantee no mutation can interleave the three
+    ///    `&self` reads on the same borrow, so they form a single snapshot.
     /// 3. If `local_last_index < follower_match_index`, the follower cannot
     ///    still hold a log tail that the current-tenure leader has already
     ///    seen. Isolate the node and refuse to restart it.
@@ -597,10 +609,6 @@ impl Node {
     /// or a leader that has not yet learned the follower's pre-failure
     /// progress, can hide the loss. Continuously mirroring the value into
     /// external monitoring gives more coverage.
-    ///
-    /// This method is a signal; it is not a decision procedure for whether a
-    /// node is safe to restart. The final call to isolate, discard, or re-add
-    /// belongs to the integration layer's storage guarantees.
     pub fn follower_match_index(&self, id: NodeId) -> Option<LogIndex> {
         let RoleState::Leader { followers, .. } = &self.role else {
             return None;
@@ -789,9 +797,12 @@ impl Node {
     // fresh `Follower::new()` for newly added members. Followers dropped from
     // the latest configuration are removed.
     //
-    // Keeping existing entries untouched is what makes `match_index`
-    // monotonically non-decreasing within a single leader's tenure, which the
-    // behind-match_index check in `handle_append_entries_reply` relies on.
+    // Preserving existing entries here provides continuity of `match_index`
+    // across configuration changes while a follower stays continuously in the
+    // configuration. Monotonicity of `match_index` itself is enforced by
+    // `handle_append_entries_reply`, which skips replies whose `last_position`
+    // is behind the recorded `match_index` and only advances on strictly
+    // greater indices.
     fn rebuild_followers(&mut self) {
         let RoleState::Leader { followers, .. } = &mut self.role else {
             unreachable!();
@@ -1348,9 +1359,10 @@ impl Node {
                 .metrics
                 .append_entries_replies_ignored_behind_match_index
                 .saturating_add(1);
-            // Delayed reply behind the acknowledged match index. The
-            // persistence contract on `Node::restart` guarantees this cannot
-            // happen legitimately within a single leader's tenure.
+            // Delayed reply behind the acknowledged match index. Skipping it
+            // here is what keeps the per-follower `match_index` monotonically
+            // non-decreasing within a single leader tenure while the follower
+            // stays continuously in the configuration.
             return;
         }
 
@@ -1507,6 +1519,11 @@ impl Node {
         // Per-follower `match_index` is intentionally not updated here: what a
         // follower actually holds is only known from its `AppendEntriesReply`,
         // and taking a snapshot on the leader does not change that observation.
+        // The follower map itself also does not need rebuilding on the leader:
+        // `is_valid_snapshot` requires `commit_index >= last_included_position.index`
+        // for a leader, and the surviving `LogEntries` still carries every
+        // `ClusterConfig` entry that has affected `latest_config()`, so the
+        // config seen by `rebuild_followers` is unchanged across the install.
         true
     }
 
@@ -1970,11 +1987,12 @@ mod tests {
 
     #[test]
     fn follower_match_index_starts_at_zero_for_non_voter_and_new_voter() {
-        // Solo-voter leader so config changes commit immediately.
         let mut leader = leader_with(NodeId::new(0), &[]);
         drain(&mut leader);
 
-        // Non-voter is tracked as soon as the config change is applied.
+        // Adding a non-voter keeps the leader as a solo voter, so the
+        // config change commits immediately and the new non-voter shows
+        // up as a tracked follower with match_index = 0.
         let mut cfg = leader.config().clone();
         cfg.non_voters.insert(NodeId::new(1));
         assert_ne!(leader.propose_config(cfg), LogPosition::INVALID);
@@ -1984,7 +2002,12 @@ mod tests {
             Some(LogIndex::new(0))
         );
 
-        // A new_voters-only node in a joint consensus is also tracked.
+        // Proposing a joint consensus that adds a new voter takes the
+        // leader out of solo-voter mode, so the joint entry stays
+        // uncommitted until the new voter replies. Tracking of the new
+        // voter starts at the moment `rebuild_followers` sees the joint
+        // config, not when the entry commits, so `follower_match_index`
+        // already returns Some(0) here.
         let joint = leader.config().to_joint_consensus(&[NodeId::new(2)], &[]);
         assert_ne!(leader.propose_config(joint), LogPosition::INVALID);
         drain(&mut leader);
@@ -1998,13 +2021,12 @@ mod tests {
     fn follower_match_index_advances_on_successful_reply() {
         let mut leader = leader_with(NodeId::new(0), &[NodeId::new(1)]);
         let follower_id = NodeId::new(1);
-        assert_eq!(
-            leader.follower_match_index(follower_id),
-            Some(LogIndex::new(0))
-        );
         let last = leader.log().last_position();
+        assert!(last.index.get() > 0);
         let reply = Message::append_entries_reply(leader.current_term(), follower_id, last);
-        leader.handle_message(&reply).unwrap();
+        leader
+            .handle_message(&reply)
+            .expect("append reply must be accepted");
         assert_eq!(leader.follower_match_index(follower_id), Some(last.index));
     }
 
@@ -2013,7 +2035,9 @@ mod tests {
         let mut leader = leader_with(NodeId::new(0), &[NodeId::new(1)]);
         // Manually advance follower.match_index so a smaller last_position looks stale.
         if let RoleState::Leader { followers, .. } = &mut leader.role {
-            let f = followers.get_mut(&NodeId::new(1)).unwrap();
+            let f = followers
+                .get_mut(&NodeId::new(1))
+                .expect("follower 1 must be tracked");
             f.match_index = LogIndex::new(5);
         }
         assert_eq!(
@@ -2025,7 +2049,9 @@ mod tests {
             NodeId::new(1),
             pos(leader.current_term().get(), 3),
         );
-        leader.handle_message(&reply).unwrap();
+        leader
+            .handle_message(&reply)
+            .expect("stale reply must be silently dropped");
         assert_eq!(
             leader.follower_match_index(NodeId::new(1)),
             Some(LogIndex::new(5))
@@ -2052,19 +2078,23 @@ mod tests {
     }
 
     #[test]
-    fn follower_match_index_forgets_previous_values_after_stepdown() {
+    fn follower_match_index_returns_none_after_stepdown() {
         let mut leader = leader_with(NodeId::new(0), &[NodeId::new(1)]);
         let follower_id = NodeId::new(1);
 
         let last = leader.log().last_position();
         let reply = Message::append_entries_reply(leader.current_term(), follower_id, last);
-        leader.handle_message(&reply).unwrap();
+        leader
+            .handle_message(&reply)
+            .expect("append reply must be accepted");
         assert_eq!(leader.follower_match_index(follower_id), Some(last.index));
 
         // Step down via a higher-term RequestVote.
         let higher = Term::new(leader.current_term().get() + 10);
         let msg = Message::request_vote_call(higher, follower_id, pos(higher.get(), 1));
-        leader.handle_message(&msg).unwrap();
+        leader
+            .handle_message(&msg)
+            .expect("higher-term RequestVote must be accepted");
         assert!(leader.role().is_follower());
         assert_eq!(leader.follower_match_index(follower_id), None);
     }
