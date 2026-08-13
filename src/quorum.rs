@@ -54,11 +54,9 @@ impl Quorum {
     }
 
     pub fn smallest_majority_index(&self) -> LogIndex {
-        let i0 = self
-            .majority_indices
-            .first()
-            .map(|(i, _)| *i)
-            .expect("Quorum was constructed without any voter");
+        let Some(i0) = self.majority_indices.first().map(|(i, _)| *i) else {
+            panic!("Quorum was constructed without any voter");
+        };
         if let Some(i1) = self.new_majority_indices.first().map(|(i, _)| *i) {
             i0.min(i1)
         } else {
