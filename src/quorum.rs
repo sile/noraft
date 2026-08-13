@@ -9,6 +9,10 @@ pub struct Quorum {
 
 impl Quorum {
     pub fn new(config: &ClusterConfig) -> Self {
+        debug_assert!(
+            !config.voters.is_empty(),
+            "a quorum requires at least one voter"
+        );
         let majority_indices = config
             .voters
             .iter()
@@ -318,8 +322,9 @@ mod tests {
     fn advancing_a_voter_outside_top_k_evicts_the_min() {
         let c = cfg(&[1, 2, 3, 4, 5], &[], &[]);
         let mut q = Quorum::new(&c);
-        // BTreeSet<NodeId> yields ids in ascending order, so the initial
-        // top-k picks the three smallest ids.
+        // `Quorum::new` takes the first majority-sized entries of
+        // `config.voters` (a BTreeSet<NodeId>, iterated in ascending id
+        // order), so the initial top-k holds the three smallest ids.
         assert_eq!(
             q.majority_indices.iter().copied().collect::<Vec<_>>(),
             [(idx(0), id(1)), (idx(0), id(2)), (idx(0), id(3))]
