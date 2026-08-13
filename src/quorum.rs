@@ -76,6 +76,12 @@ fn update_majority<T: Ord>(
         // A no-op update must not touch the set: otherwise the removal
         // below would drop an in-set entry and shrink the set below the
         // majority quota when that entry is not the current minimum.
+        //
+        // No current caller in this crate reaches this branch (every
+        // callsite either supplies `old_index = LogIndex::ZERO` with a
+        // fresh follower or requires `old < new` via a preceding strict
+        // check). It is kept as a defensive guard for future callers and
+        // is exercised by the model-based PBT.
         return;
     }
 
@@ -150,6 +156,16 @@ mod tests {
     fn sample_voter_count(ctx: &mut noprop::TestCaseContext, max: usize) -> usize {
         noprop::sample_with_boundaries(ctx, &[1, 2, 4, max], noprop::Ratio::one_nth(5), |ctx| {
             noprop::sample_usize_in(ctx, 1..=max)
+        })
+    }
+
+    // Same shape as `sample_voter_count` but allows 0 (non-joint runs)
+    // and shifts the extra weight to the non-joint boundary, the
+    // singleton, and the maximum. Kept separate so that changing the
+    // voter sampler cannot silently distort the new-voter distribution.
+    fn sample_new_voter_count(ctx: &mut noprop::TestCaseContext, max: usize) -> usize {
+        noprop::sample_with_boundaries(ctx, &[0, 1, 2, max], noprop::Ratio::one_nth(5), |ctx| {
+            noprop::sample_usize_in(ctx, 0..=max)
         })
     }
 
@@ -229,6 +245,17 @@ mod tests {
         Ok(())
     }
 
+    // Guards against silently removing the `debug_assert!` in
+    // `Quorum::new`: without it a caller passing an empty voter set
+    // would build a broken `Quorum` and blow up later inside
+    // `smallest_majority_index`'s `unreachable!()`.
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "at least one voter")]
+    fn empty_voters_config_is_rejected() {
+        let _ = Quorum::new(&cfg(&[], &[], &[]));
+    }
+
     #[test]
     fn majority_size_matches_voter_count() {
         let q = Quorum::new(&cfg(&[1, 2, 3, 4, 5], &[], &[]));
@@ -280,18 +307,26 @@ mod tests {
 
     #[test]
     fn in_set_voter_same_index_update_is_a_no_op() {
-        let c = cfg(&[1, 2, 3], &[], &[]);
+        // The scenario must exercise the path guarded *only* by the no-op
+        // check in `update_majority` (i.e. an in-set, non-min voter is
+        // re-applied at the same index that is strictly greater than the
+        // set's current min). If the guard is removed, `insert` becomes a
+        // no-op while `remove(&old_entry)` succeeds, shrinking the set
+        // below the majority quota.
+        let c = cfg(&[1, 2, 3, 4, 5], &[], &[]);
         let mut q = Quorum::new(&c);
-        q.update_match_index(&c, id(1), idx(0), idx(10));
-
-        // Re-applying the current index of an in-set, non-min voter must
-        // keep the set intact: without the no-op guard in
-        // `update_majority`, the removal would shrink the set below the
-        // majority quota.
-        q.update_match_index(&c, id(2), idx(0), idx(0));
+        q.update_match_index(&c, id(4), idx(0), idx(10));
         assert_eq!(
             q.majority_indices.iter().copied().collect::<Vec<_>>(),
-            [(idx(0), id(2)), (idx(10), id(1))]
+            [(idx(0), id(2)), (idx(0), id(3)), (idx(10), id(4))]
+        );
+
+        // `(10, 4)` is in the set and is not the min. Re-applying the same
+        // index must leave the set intact.
+        q.update_match_index(&c, id(4), idx(10), idx(10));
+        assert_eq!(
+            q.majority_indices.iter().copied().collect::<Vec<_>>(),
+            [(idx(0), id(2)), (idx(0), id(3)), (idx(10), id(4))]
         );
         assert_eq!(q.smallest_majority_index(), idx(0));
     }
@@ -477,13 +512,14 @@ mod tests {
         let seed = noprop::seed_from_env_or_time("NORAFT_PBT_SEED")?;
         let advanced_min_cases = core::cell::Cell::new(0usize);
         let joint_cases = core::cell::Cell::new(0usize);
+        let non_joint_cases = core::cell::Cell::new(0usize);
         let non_voter_update_cases = core::cell::Cell::new(0usize);
         let mut runner = noprop::Runner::new(seed);
 
         runner.run(1024, |ctx| {
             let voter_count = sample_voter_count(ctx, 8);
             let voters: Vec<u64> = sample_distinct_ids(ctx, voter_count, 16);
-            let new_voter_count = sample_voter_count(ctx, 8) - 1;
+            let new_voter_count = sample_new_voter_count(ctx, 8);
             let new_voters: Vec<u64> = sample_distinct_ids(ctx, new_voter_count, 16);
             let non_voter_count = sample_non_voter_count(ctx);
             let non_voters: Vec<u64> = sample_distinct_ids(ctx, non_voter_count, 8)
@@ -517,7 +553,9 @@ mod tests {
             if q.smallest_majority_index().get() > 0 {
                 advanced_min_cases.set(advanced_min_cases.get() + 1);
             }
-            if !new_voters.is_empty() {
+            if new_voters.is_empty() {
+                non_joint_cases.set(non_joint_cases.get() + 1);
+            } else {
                 joint_cases.set(joint_cases.get() + 1);
             }
             Ok(())
@@ -530,6 +568,10 @@ mod tests {
         assert!(
             joint_cases.get() > 0,
             "no case exercised a joint consensus configuration\n{runner}"
+        );
+        assert!(
+            non_joint_cases.get() > 0,
+            "no case exercised a non-joint configuration\n{runner}"
         );
         assert!(
             non_voter_update_cases.get() > 0,
