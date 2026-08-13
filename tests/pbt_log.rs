@@ -45,6 +45,18 @@ fn different_term(term: Term) -> Term {
     }
 }
 
+/// Sampler for [`LogIndex`] that stresses both the ZERO and `u64::MAX`
+/// boundaries, so property tests exercise the `None` branches of the
+/// checked operators.
+fn sample_log_index_full_range(ctx: &mut noprop::TestCaseContext) -> LogIndex {
+    LogIndex::new(noprop::sample_with_boundaries(
+        ctx,
+        &[0, 1, u64::MAX - 1, u64::MAX],
+        noprop::Ratio::one_nth(5),
+        noprop::sample_u64,
+    ))
+}
+
 /// Iteration, indexed lookup, and the reported last position must
 /// describe the same entry sequence.
 #[test]
@@ -303,6 +315,96 @@ fn log_index_next_advances_by_one() -> noprop::TestResult {
         let next = index.next();
         if next.get() != index.get() + 1 {
             return Err(format!("next({index:?}) returned {next:?}").into());
+        }
+        Ok(())
+    })
+}
+
+/// `checked_next` must agree with `checked_add(LogIndex::new(1))` for every
+/// input, including the `u64::MAX` boundary where both return `None`.
+#[test]
+fn log_index_checked_next_matches_checked_add_one() -> noprop::TestResult {
+    run(1024, |ctx| {
+        let x = sample_log_index_full_range(ctx);
+        let actual = x.checked_next();
+        let expected = x.checked_add(LogIndex::new(1));
+        if actual != expected {
+            return Err(format!(
+                "checked_next({x:?}) = {actual:?}, but checked_add(x, 1) = {expected:?}"
+            )
+            .into());
+        }
+        Ok(())
+    })
+}
+
+/// `checked_add` must be commutative and mirror `u64::checked_add`
+/// bit-for-bit, including the `None` branch.
+#[test]
+fn log_index_checked_add_matches_u64_and_is_commutative() -> noprop::TestResult {
+    run(1024, |ctx| {
+        let a = sample_log_index_full_range(ctx);
+        let b = sample_log_index_full_range(ctx);
+        let expected = a.get().checked_add(b.get()).map(LogIndex::new);
+        let ab = a.checked_add(b);
+        if ab != expected {
+            return Err(
+                format!("checked_add({a:?}, {b:?}) = {ab:?}, expected {expected:?}").into(),
+            );
+        }
+        let ba = b.checked_add(a);
+        if ba != expected {
+            return Err(format!(
+                "checked_add is not commutative: {a:?} + {b:?} = {ab:?}, \
+                 {b:?} + {a:?} = {ba:?}"
+            )
+            .into());
+        }
+        Ok(())
+    })
+}
+
+/// `checked_sub` must mirror `u64::checked_sub` and be the exact inverse of
+/// `checked_add` whenever the subtraction succeeds.
+#[test]
+fn log_index_checked_sub_matches_u64_and_inverts_checked_add() -> noprop::TestResult {
+    run(1024, |ctx| {
+        let a = sample_log_index_full_range(ctx);
+        let b = sample_log_index_full_range(ctx);
+        let expected = a.get().checked_sub(b.get()).map(LogIndex::new);
+        let actual = a.checked_sub(b);
+        if actual != expected {
+            return Err(
+                format!("checked_sub({a:?}, {b:?}) = {actual:?}, expected {expected:?}").into(),
+            );
+        }
+        if let Some(diff) = actual {
+            let round_trip = diff.checked_add(b);
+            if round_trip != Some(a) {
+                return Err(format!(
+                    "({a:?} - {b:?}) + {b:?} = {round_trip:?}, expected Some({a:?})"
+                )
+                .into());
+            }
+        }
+        Ok(())
+    })
+}
+
+/// `LogPosition::checked_next` must advance only the index (leaving the
+/// term untouched) and return `None` exactly when the index would overflow.
+#[test]
+fn log_position_checked_next_advances_index_only_or_returns_none() -> noprop::TestResult {
+    run(1024, |ctx| {
+        let term = Term::new(noprop::sample_u64(ctx));
+        let index = sample_log_index_full_range(ctx);
+        let position = LogPosition::new(term, index);
+        let actual = position.checked_next();
+        let expected = index.checked_next().map(|i| LogPosition::new(term, i));
+        if actual != expected {
+            return Err(
+                format!("checked_next({position:?}) = {actual:?}, expected {expected:?}").into(),
+            );
         }
         Ok(())
     })
