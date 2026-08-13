@@ -195,6 +195,12 @@ impl LogEntries {
     }
 
     /// Returns the number of entries in this [`LogEntries`] instance.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the number of entries exceeds [`usize::MAX`], which can only
+    /// happen on targets where `usize` is narrower than 64 bits (e.g. 32-bit
+    /// platforms).
     pub fn len(&self) -> usize {
         let len = self.last_position.index.get() - self.prev_position.index.get();
         // Keeping more entries than `usize::MAX` is outside the supported
@@ -462,6 +468,10 @@ impl LogEntries {
     /// assert_eq!(entries.len(), 0);
     /// assert_eq!(entries.get_entry(noraft::LogIndex::new(1)), None);
     /// ```
+    ///
+    /// # Panics
+    ///
+    /// Inherits the [`Self::len`] panic condition (see its documentation).
     pub fn truncate(&mut self, len: usize) {
         if self.len() <= len {
             return;
@@ -517,6 +527,13 @@ impl LogEntries {
     ///
     /// assert_eq!(entries.since(pos(0, 3)), None); // Term mismatch.
     /// ```
+    ///
+    /// # Overflow
+    ///
+    /// If `new_prev_position.index` equals `LogIndex::new(u64::MAX)`,
+    /// computing the range boundary panics in debug builds and wraps in
+    /// release builds. Guard untrusted values with
+    /// [`LogIndex::checked_next`] beforehand.
     pub fn since(&self, new_prev_position: LogPosition) -> Option<Self> {
         if !self.contains(new_prev_position) {
             return None;
@@ -718,6 +735,12 @@ impl LogIndex {
     /// let index = noraft::LogIndex::new(3);
     /// assert_eq!(index.next(), noraft::LogIndex::new(4));
     /// ```
+    ///
+    /// # Overflow
+    ///
+    /// The increment panics in debug builds and wraps in release builds if
+    /// `self` equals `LogIndex::new(u64::MAX)`. Use [`Self::checked_next`]
+    /// to propagate the overflow.
     pub const fn next(self) -> Self {
         Self(self.0 + 1)
     }
@@ -872,6 +895,12 @@ impl LogPosition {
     ///     noraft::LogPosition::new(noraft::Term::new(2), noraft::LogIndex::new(8)),
     /// );
     /// ```
+    ///
+    /// # Overflow
+    ///
+    /// The increment panics in debug builds and wraps in release builds if
+    /// `self.index` equals `LogIndex::new(u64::MAX)`. Use
+    /// [`Self::checked_next`] to propagate the overflow.
     pub const fn next(self) -> Self {
         Self::new(self.term, self.index.next())
     }
