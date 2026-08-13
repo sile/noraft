@@ -219,13 +219,12 @@ impl LogEntries {
 
     /// Returns an iterator over the entries in this [`LogEntries`] instance.
     ///
-    /// # Panics
+    /// # Overflow
     ///
-    /// Panics if [`prev_position()`][Self::prev_position] holds
-    /// [`LogIndex::new(u64::MAX)`][LogIndex::new], because computing the
-    /// iteration range would overflow. Such a value can be observed when the
-    /// instance was built from an untrusted source with
-    /// [`LogEntries::new`] or [`LogEntries::from_iter`].
+    /// If `prev_position().index` equals `LogIndex::new(u64::MAX)`, computing
+    /// the iteration range panics in debug builds and wraps in release
+    /// builds. Guard untrusted values with [`LogIndex::checked_next`]
+    /// beforehand.
     pub fn iter(&self) -> impl '_ + Iterator<Item = LogEntry> {
         (self.prev_position.index.get() + 1..=self.last_position.index.get()).map(|i| {
             let i = LogIndex::new(i);
@@ -265,13 +264,11 @@ impl LogEntries {
     /// assert_eq!(iter.next(), None);
     /// ```
     ///
-    /// # Panics
+    /// # Overflow
     ///
-    /// Panics if [`prev_position()`][Self::prev_position] holds
-    /// [`LogIndex::new(u64::MAX)`][LogIndex::new], because computing the
-    /// iteration range would overflow. Such a value can be observed when the
-    /// instance was built from an untrusted source with
-    /// [`LogEntries::new`] or [`LogEntries::from_iter`].
+    /// If `prev_position().index` equals `LogIndex::new(u64::MAX)`, computing
+    /// the base index panics in debug builds and wraps in release builds.
+    /// Guard untrusted values with [`LogIndex::checked_next`] beforehand.
     pub fn iter_with_positions(&self) -> impl '_ + Iterator<Item = (LogPosition, LogEntry)> {
         let base_index = self.prev_position.index.get() + 1;
         let mut term = self.prev_position.term;
@@ -415,13 +412,11 @@ impl LogEntries {
     /// );
     /// ```
     ///
-    /// # Panics
+    /// # Overflow
     ///
-    /// Panics if the resulting log index would exceed [`u64::MAX`]. Such an
-    /// overflow can occur when [`last_position()`][Self::last_position] already
-    /// holds [`LogIndex::new(u64::MAX)`][LogIndex::new], which is possible when
-    /// the instance was built from an untrusted source with
-    /// [`LogEntries::new`] or [`LogEntries::from_iter`].
+    /// If `last_position().index` equals `LogIndex::new(u64::MAX)`, advancing
+    /// the position panics in debug builds and wraps in release builds.
+    /// Guard untrusted values with [`LogIndex::checked_next`] beforehand.
     pub fn push(&mut self, entry: LogEntry) {
         self.last_position = self.last_position.next();
         match entry {
@@ -745,7 +740,7 @@ impl LogIndex {
         }
     }
 
-    /// Checked addition. Returns [`None`] if the sum would overflow.
+    /// Checked addition. Computes `self + rhs`, returning [`None`] if overflow occurred.
     ///
     /// # Examples
     ///
@@ -766,7 +761,7 @@ impl LogIndex {
         }
     }
 
-    /// Checked subtraction. Returns [`None`] if the result would underflow.
+    /// Checked subtraction. Computes `self - rhs`, returning [`None`] if overflow occurred.
     ///
     /// # Examples
     ///
@@ -777,10 +772,8 @@ impl LogIndex {
     ///     Some(noraft::LogIndex::new(4))
     /// );
     ///
-    /// assert_eq!(
-    ///     noraft::LogIndex::ZERO.checked_sub(noraft::LogIndex::new(1)),
-    ///     None,
-    /// );
+    /// let zero = noraft::LogIndex::ZERO;
+    /// assert_eq!(zero.checked_sub(noraft::LogIndex::new(1)), None);
     /// ```
     pub const fn checked_sub(self, rhs: Self) -> Option<Self> {
         match self.0.checked_sub(rhs.0) {
@@ -1435,30 +1428,32 @@ mod tests {
     }
 
     #[test]
-    fn log_index_checked_next_boundary() {
+    fn log_index_checked_next() {
+        assert_eq!(LogIndex::ZERO.checked_next(), Some(i(1)));
         assert_eq!(i(3).checked_next(), Some(i(4)));
         assert_eq!(i(u64::MAX - 1).checked_next(), Some(i(u64::MAX)));
         assert_eq!(i(u64::MAX).checked_next(), None);
     }
 
     #[test]
-    fn log_index_checked_add_boundary() {
+    fn log_index_checked_add() {
         assert_eq!(i(3).checked_add(i(4)), Some(i(7)));
         assert_eq!(i(u64::MAX).checked_add(LogIndex::ZERO), Some(i(u64::MAX)));
+        assert_eq!(LogIndex::ZERO.checked_add(i(u64::MAX)), Some(i(u64::MAX)));
         assert_eq!(i(u64::MAX).checked_add(i(1)), None);
         assert_eq!(i(u64::MAX / 2 + 1).checked_add(i(u64::MAX / 2 + 1)), None);
     }
 
     #[test]
-    fn log_index_checked_sub_boundary() {
+    fn log_index_checked_sub() {
         assert_eq!(i(7).checked_sub(i(3)), Some(i(4)));
         assert_eq!(i(1).checked_sub(i(1)), Some(LogIndex::ZERO));
         assert_eq!(LogIndex::ZERO.checked_sub(i(1)), None);
-        assert_eq!(i(u64::MAX).checked_sub(i(u64::MAX)), Some(LogIndex::ZERO));
+        assert_eq!(i(u64::MAX - 1).checked_sub(i(u64::MAX)), None);
     }
 
     #[test]
-    fn log_position_checked_next_boundary() {
+    fn log_position_checked_next() {
         assert_eq!(pos(2, 7).checked_next(), Some(pos(2, 8)));
         assert_eq!(pos(2, u64::MAX - 1).checked_next(), Some(pos(2, u64::MAX)));
         assert_eq!(pos(2, u64::MAX).checked_next(), None);
