@@ -385,6 +385,7 @@ impl Node {
         node.log = log;
         node.commit_index = node.log.snapshot_position().index;
         node.actions.set(Action::SetElectionTimeout);
+        debug_assert!(node.commit_index >= node.log.snapshot_position().index);
 
         node
     }
@@ -1513,28 +1514,31 @@ impl Node {
     /// If the node log contains `last_included_position`, log entries up to `last_included_position` are removed.
     /// If `last_included_position` is greater than the last log position, the log is replaced with an empty log starting at `last_included_position`.
     ///
-    /// The caller must ensure that the installed snapshot represents state
-    /// that the cluster has already committed. Given that guarantee, this
-    /// method ensures on success that
-    /// `commit_index >= last_included_position.index`, so
-    /// [`Node::get_commit_status()`] treats the snapshot boundary as
-    /// committed immediately. This matches what [`Node::restart()`] derives
-    /// at the snapshot boundary from the same log; for a follower or
-    /// candidate catch-up (`commit_index < last_included_position.index`
-    /// before the call) the resulting [`Node::commit_index()`] matches
-    /// restart in full. When the running node's `commit_index` was already
-    /// above the snapshot boundary, this method keeps that in-memory
-    /// advance instead of regressing it.
-    ///
     /// Note that how to install a snapshot is outside of the scope of this crate.
     ///
     /// # Preconditions
+    ///
+    /// The caller must ensure that the installed snapshot represents state
+    /// that the cluster has already committed.
     ///
     /// This method returns [`false`] and ignores the installation if the following conditions are not met:
     /// - `last_included_position` is valid, which means:
     ///   - `self.log.entries().contains(last_included_position)` is [`true`].
     ///   - Additionally, if `self.role().is_leader()` is [`false`], it is also acceptable if `last_included_position.index` is greater than `self.commit_index()`.
     /// - `last_included_config` is the configuration at `last_included_position.index`.
+    ///
+    /// # Postconditions
+    ///
+    /// On success, `commit_index >= last_included_position.index` is
+    /// established, so [`Node::get_commit_status()`] treats the snapshot
+    /// boundary as committed immediately. This matches what
+    /// [`Node::restart()`] derives at the snapshot boundary from the same
+    /// log; for a follower or candidate catch-up
+    /// (`commit_index < last_included_position.index` before the call) the
+    /// resulting [`Node::commit_index()`] matches restart in full. When
+    /// the running node's `commit_index` was already above the snapshot
+    /// boundary, this method keeps that in-memory advance instead of
+    /// regressing it.
     pub fn handle_snapshot_installed(
         &mut self,
         last_included_position: LogPosition,
@@ -1576,6 +1580,7 @@ impl Node {
         // in-memory advance in place. See this method's rustdoc for the
         // full contract.
         self.commit_index = self.commit_index.max(last_included_position.index);
+        debug_assert!(self.commit_index >= self.log.snapshot_position().index);
 
         // Per-follower `match_index` is intentionally not updated here: what a
         // follower actually holds is only known from its `AppendEntriesReply`,
@@ -2262,6 +2267,21 @@ mod tests {
         // Re-installing the same snapshot must not regress commit_index.
         assert!(node.handle_snapshot_installed(snapshot_position, snapshot_config));
         assert_eq!(node.commit_index(), snapshot_position.index);
+    }
+
+    #[test]
+    fn snapshot_install_syncs_commit_index_on_candidate() {
+        let voters = &[NodeId::new(0), NodeId::new(1)];
+        let mut node = candidate_with(NodeId::new(0), &[NodeId::new(1)]);
+        assert!(node.role().is_candidate());
+        assert_eq!(node.commit_index(), LogIndex::ZERO);
+
+        let snapshot_position = pos(node.current_term().get(), 5);
+        let snapshot_config = config(voters);
+        assert!(node.handle_snapshot_installed(snapshot_position, snapshot_config));
+
+        assert_eq!(node.commit_index(), snapshot_position.index);
+        assert!(node.get_commit_status(snapshot_position).is_committed());
     }
 
     #[test]
