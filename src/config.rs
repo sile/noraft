@@ -103,6 +103,12 @@ impl ClusterConfig {
 
     /// Converts this configuration to a joint consensus by adding and removing voters.
     ///
+    /// Any node in the resulting `new_voters` set is also removed from
+    /// `non_voters`, so an existing non-voter can be promoted by passing
+    /// its id through `adding_voters` without violating the
+    /// [`Node::propose_config`][crate::Node::propose_config] precondition
+    /// that a node is either a voter or a non-voter.
+    ///
     /// # Examples
     ///
     /// ```
@@ -125,6 +131,9 @@ impl ClusterConfig {
         config.new_voters = config.voters.clone();
         config.new_voters.extend(adding_voters.iter().copied());
         config.new_voters.retain(|id| !removing_voters.contains(id));
+        config
+            .non_voters
+            .retain(|id| !config.new_voters.contains(id));
         config
     }
 
