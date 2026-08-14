@@ -2094,6 +2094,25 @@ mod tests {
     }
 
     #[test]
+    fn propose_config_promotes_existing_non_voter_to_voter() {
+        // Solo-voter leader so the non-voter registration commits
+        // immediately and the subsequent promotion is not blocked by a
+        // joint consensus already in progress.
+        let mut leader = leader_with(NodeId::new(0), &[]);
+        drain(&mut leader);
+
+        let mut cfg = leader.config().clone();
+        cfg.non_voters.insert(NodeId::new(1));
+        assert_ne!(leader.propose_config(cfg), LogPosition::INVALID);
+        drain(&mut leader);
+
+        // Promoting the already-registered non-voter must not be
+        // rejected as a `voters`/`non_voters` overlap.
+        let joint = leader.config().to_joint_consensus(&[NodeId::new(1)], &[]);
+        assert_ne!(leader.propose_config(joint), LogPosition::INVALID);
+    }
+
+    #[test]
     fn follower_match_index_returns_none_after_stepdown() {
         let mut leader = leader_with(NodeId::new(0), &[NodeId::new(1)]);
         let follower_id = NodeId::new(1);

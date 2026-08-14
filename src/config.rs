@@ -200,6 +200,21 @@ mod tests {
         assert_eq!(nodes, vec![1, 2, 3, 4, 5, 6]);
     }
 
+    #[test]
+    fn to_joint_consensus_promotes_existing_non_voter() {
+        let mut config = ClusterConfig::new();
+        config.voters.insert(id(1));
+        config.voters.insert(id(2));
+        config.voters.insert(id(3));
+        config.non_voters.insert(id(4));
+
+        let joint = config.to_joint_consensus(&[id(4)], &[]);
+
+        assert!(joint.new_voters.contains(&id(4)));
+        assert!(!joint.non_voters.contains(&id(4)));
+        assert!(joint.new_voters.is_disjoint(&joint.non_voters));
+    }
+
     fn id(n: u64) -> NodeId {
         NodeId::new(n)
     }
