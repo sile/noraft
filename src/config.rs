@@ -103,6 +103,11 @@ impl ClusterConfig {
 
     /// Converts this configuration to a joint consensus by adding and removing voters.
     ///
+    /// Existing non-voters can be promoted by passing their id through
+    /// `adding_voters`; the helper strips them from `non_voters` so the
+    /// result satisfies the disjointness precondition of
+    /// [`Node::propose_config()`][crate::Node::propose_config].
+    ///
     /// # Examples
     ///
     /// ```
@@ -119,12 +124,25 @@ impl ClusterConfig {
     ///
     ///     node.propose_config(new_config);
     /// }
+    ///
+    /// fn promote_non_voter(node: &mut noraft::Node, promoted: noraft::NodeId) {
+    ///     assert!(node.config().non_voters.contains(&promoted));
+    ///     let new_config = node.config().to_joint_consensus(&[promoted], &[]);
+    ///     assert!(!new_config.non_voters.contains(&promoted));
+    ///
+    ///     node.propose_config(new_config);
+    /// }
     /// ```
     pub fn to_joint_consensus(&self, adding_voters: &[NodeId], removing_voters: &[NodeId]) -> Self {
         let mut config = self.clone();
         config.new_voters = config.voters.clone();
         config.new_voters.extend(adding_voters.iter().copied());
         config.new_voters.retain(|id| !removing_voters.contains(id));
+        config
+            .non_voters
+            .retain(|id| !config.new_voters.contains(id));
+        debug_assert!(config.new_voters.is_disjoint(&config.non_voters));
+        debug_assert_eq!(config.voters, self.voters);
         config
     }
 
@@ -198,6 +216,23 @@ mod tests {
 
         let nodes: Vec<_> = config.unique_nodes().map(|n| n.get()).collect();
         assert_eq!(nodes, vec![1, 2, 3, 4, 5, 6]);
+    }
+
+    #[test]
+    fn to_joint_consensus_promotes_existing_non_voter() {
+        let mut config = ClusterConfig::new();
+        config.voters.insert(id(1));
+        config.voters.insert(id(2));
+        config.voters.insert(id(3));
+        config.non_voters.insert(id(4));
+        config.non_voters.insert(id(5));
+
+        let joint = config.to_joint_consensus(&[id(4)], &[]);
+
+        assert_eq!(joint.voters, config.voters);
+        assert!(joint.new_voters.contains(&id(4)));
+        assert_eq!(joint.non_voters, [id(5)].into_iter().collect());
+        assert!(joint.new_voters.is_disjoint(&joint.non_voters));
     }
 
     fn id(n: u64) -> NodeId {

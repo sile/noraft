@@ -894,6 +894,7 @@ impl Node {
         let mut new_config = self.log.latest_config().clone();
         new_config.voters = core::mem::take(&mut new_config.new_voters);
         debug_assert!(!new_config.voters.is_empty());
+        debug_assert!(new_config.voters.is_disjoint(&new_config.non_voters));
 
         self.propose(LogEntry::ClusterConfig(new_config));
     }
@@ -2155,5 +2156,39 @@ mod tests {
             leader.follower_match_index(follower_id),
             Some(LogIndex::new(0))
         );
+    }
+
+    #[test]
+    fn propose_config_promotes_existing_non_voter_to_voter() {
+        // Solo-voter leader so the non-voter registration commits before the
+        // promote proposal.
+        let mut leader = leader_with(NodeId::new(0), &[]);
+        drain(&mut leader);
+
+        let mut cfg = leader.config().clone();
+        cfg.non_voters.insert(NodeId::new(1));
+        assert_ne!(leader.propose_config(cfg), LogPosition::INVALID);
+        drain(&mut leader);
+
+        // Promoting the already-registered non-voter must not be rejected as
+        // a `voters`/`non_voters` overlap.
+        let joint = leader.config().to_joint_consensus(&[NodeId::new(1)], &[]);
+        let position = leader.propose_config(joint);
+        assert_ne!(position, LogPosition::INVALID);
+
+        // Ack from the promoted node so the joint entry commits and the
+        // leader finalizes the joint consensus. After finalize the promoted
+        // node must be a plain voter with no leftover non-voter entry.
+        drain(&mut leader);
+        let last = leader.log().last_position();
+        let reply = Message::append_entries_reply(leader.current_term(), NodeId::new(1), last);
+        leader
+            .handle_message(&reply)
+            .expect("append reply must be accepted");
+        drain(&mut leader);
+
+        assert!(!leader.config().is_joint_consensus());
+        assert!(leader.config().voters.contains(&NodeId::new(1)));
+        assert!(!leader.config().non_voters.contains(&NodeId::new(1)));
     }
 }

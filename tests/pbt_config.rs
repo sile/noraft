@@ -48,16 +48,22 @@ fn cluster_config_unique_nodes_matches_set_union() -> noprop::TestResult {
     })
 }
 
-/// `to_joint_consensus` keeps the old voters and computes the new
-/// voters as `(old + additions) - removals`.
+/// `to_joint_consensus` keeps the old voters, computes the new voters
+/// as `(old + additions) - removals`, and strips any promoted node
+/// from `non_voters` so the result satisfies the disjointness
+/// precondition of `Node::propose_config`.
 #[test]
 fn cluster_config_to_joint_consensus_matches_set_model() -> noprop::TestResult {
     run(1024, |ctx| {
         let base = sample_normal_config(ctx);
         let before = base.clone();
-        let additions: Vec<NodeId> = (100..104)
+        // Mix fresh ids with existing non-voters so the sampler also
+        // exercises the promote-existing-non-voter branch.
+        let mut addition_pool: Vec<NodeId> = (100..104).map(NodeId::new).collect();
+        addition_pool.extend(base.non_voters.iter().copied());
+        let additions: Vec<NodeId> = addition_pool
+            .into_iter()
             .filter(|_| noprop::sample_bool(ctx))
-            .map(NodeId::new)
             .collect();
         let removals: Vec<NodeId> = base
             .voters
@@ -65,20 +71,24 @@ fn cluster_config_to_joint_consensus_matches_set_model() -> noprop::TestResult {
             .copied()
             .filter(|_| noprop::sample_bool(ctx))
             .collect();
-        let mut expected = base.voters.clone();
-        expected.extend(additions.iter().copied());
-        expected.retain(|id| !removals.contains(id));
+        let mut expected_new_voters = base.voters.clone();
+        expected_new_voters.extend(additions.iter().copied());
+        expected_new_voters.retain(|id| !removals.contains(id));
+        let mut expected_non_voters = base.non_voters.clone();
+        expected_non_voters.retain(|id| !expected_new_voters.contains(id));
 
         let joint = base.to_joint_consensus(&additions, &removals);
         if base != before {
             return Err("to_joint_consensus mutated its source config".into());
         }
         if joint.voters != base.voters
-            || joint.non_voters != base.non_voters
-            || joint.new_voters != expected
+            || joint.non_voters != expected_non_voters
+            || joint.new_voters != expected_new_voters
         {
             return Err(format!(
-                "joint config mismatch: got {joint:?}, expected new voters {expected:?}"
+                "joint config mismatch: got {joint:?}, \
+                 expected new_voters {expected_new_voters:?}, \
+                 expected non_voters {expected_non_voters:?}"
             )
             .into());
         }
