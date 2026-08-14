@@ -1493,6 +1493,14 @@ impl Node {
     /// If the node log contains `last_included_position`, log entries up to `last_included_position` are removed.
     /// If `last_included_position` is greater than the last log position, the log is replaced with an empty log starting at `last_included_position`.
     ///
+    /// The caller must ensure that the installed snapshot represents a
+    /// committed state in the Raft sense (i.e. its entries have been
+    /// committed by the cluster). Given that guarantee, this method advances
+    /// [`Node::commit_index()`] to `max(commit_index, last_included_position.index)`
+    /// on success, so [`Node::get_commit_status()`] treats the snapshot
+    /// boundary as committed immediately (matching what [`Node::restart`]
+    /// would derive from the same log).
+    ///
     /// Note that how to install a snapshot is outside of the scope of this crate.
     ///
     /// # Preconditions
@@ -1532,6 +1540,13 @@ impl Node {
         for msg in self.actions.send_messages.values_mut() {
             msg.handle_snapshot_installed(last_included_position);
         }
+
+        // A leader passes `is_valid_snapshot` only when `commit_index >=
+        // last_included_position.index`, so this max is a no-op there.
+        // For followers and candidates it advances `commit_index` to match
+        // what `Node::restart` would derive from the same log, keeping the
+        // running node and a restart from the same log in sync.
+        self.commit_index = core::cmp::max(self.commit_index, last_included_position.index);
 
         // Per-follower `match_index` is intentionally not updated here: what a
         // follower actually holds is only known from its `AppendEntriesReply`,
@@ -2190,5 +2205,62 @@ mod tests {
         assert!(!leader.config().is_joint_consensus());
         assert!(leader.config().voters.contains(&NodeId::new(1)));
         assert!(!leader.config().non_voters.contains(&NodeId::new(1)));
+    }
+
+    #[test]
+    fn snapshot_install_syncs_commit_index_on_follower() {
+        let voters = &[NodeId::new(0), NodeId::new(1)];
+        let mut node = follower(NodeId::new(0), voters, 1, None);
+        assert_eq!(node.commit_index(), LogIndex::ZERO);
+
+        let snapshot_position = pos(2, 5);
+        let snapshot_config = config(voters);
+        assert!(node.handle_snapshot_installed(snapshot_position, snapshot_config.clone()));
+
+        // Install must advance commit_index to match what `Node::restart`
+        // would derive from the same log.
+        assert_eq!(node.commit_index(), snapshot_position.index);
+        let restarted = Node::restart(
+            NodeId::new(0),
+            node.current_term(),
+            None,
+            node.log().clone(),
+        );
+        assert_eq!(restarted.commit_index(), node.commit_index());
+
+        // The snapshot boundary is treated as committed immediately.
+        assert!(node.get_commit_status(snapshot_position).is_committed());
+
+        // Re-installing the same (or earlier) snapshot must not regress
+        // commit_index. `is_valid_snapshot` rejects positions the log no
+        // longer contains, but even when the same position is re-accepted
+        // the `max` keeps commit_index in place.
+        assert!(node.handle_snapshot_installed(snapshot_position, snapshot_config));
+        assert_eq!(node.commit_index(), snapshot_position.index);
+    }
+
+    #[test]
+    fn snapshot_install_is_noop_for_commit_index_on_leader() {
+        let mut leader = leader_with(NodeId::new(0), &[]);
+        drain(&mut leader);
+        leader.propose_command();
+        leader.propose_command();
+        drain(&mut leader);
+        let before = leader.commit_index();
+        assert!(before > LogIndex::ZERO);
+
+        // Compact to the current commit_index. On a leader `is_valid_snapshot`
+        // requires `commit_index >= last_included_position.index`, so the max
+        // is guaranteed to leave commit_index unchanged.
+        let snapshot_position = leader
+            .log()
+            .entries()
+            .iter_with_positions()
+            .find(|(p, _)| p.index == before)
+            .map(|(p, _)| p)
+            .expect("commit_index must resolve to a position in the log");
+        let snapshot_config = leader.config().clone();
+        assert!(leader.handle_snapshot_installed(snapshot_position, snapshot_config));
+        assert_eq!(leader.commit_index(), before);
     }
 }
