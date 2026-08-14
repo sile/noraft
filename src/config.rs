@@ -103,11 +103,10 @@ impl ClusterConfig {
 
     /// Converts this configuration to a joint consensus by adding and removing voters.
     ///
-    /// Any node in the resulting `new_voters` set is also removed from
-    /// `non_voters`, so an existing non-voter can be promoted by passing
-    /// its id through `adding_voters` without violating the
-    /// [`Node::propose_config`][crate::Node::propose_config] precondition
-    /// that a node is either a voter or a non-voter.
+    /// Existing non-voters can be promoted by passing their id through
+    /// `adding_voters`; the helper strips them from `non_voters` so the
+    /// result satisfies the disjointness precondition of
+    /// [`Node::propose_config()`][crate::Node::propose_config].
     ///
     /// # Examples
     ///
@@ -125,6 +124,14 @@ impl ClusterConfig {
     ///
     ///     node.propose_config(new_config);
     /// }
+    ///
+    /// fn promote_non_voter(node: &mut noraft::Node, promoted: noraft::NodeId) {
+    ///     assert!(node.config().non_voters.contains(&promoted));
+    ///     let new_config = node.config().to_joint_consensus(&[promoted], &[]);
+    ///     assert!(!new_config.non_voters.contains(&promoted));
+    ///
+    ///     node.propose_config(new_config);
+    /// }
     /// ```
     pub fn to_joint_consensus(&self, adding_voters: &[NodeId], removing_voters: &[NodeId]) -> Self {
         let mut config = self.clone();
@@ -134,6 +141,8 @@ impl ClusterConfig {
         config
             .non_voters
             .retain(|id| !config.new_voters.contains(id));
+        debug_assert!(config.new_voters.is_disjoint(&config.non_voters));
+        debug_assert_eq!(config.voters, self.voters);
         config
     }
 
@@ -216,11 +225,13 @@ mod tests {
         config.voters.insert(id(2));
         config.voters.insert(id(3));
         config.non_voters.insert(id(4));
+        config.non_voters.insert(id(5));
 
         let joint = config.to_joint_consensus(&[id(4)], &[]);
 
+        assert_eq!(joint.voters, config.voters);
         assert!(joint.new_voters.contains(&id(4)));
-        assert!(!joint.non_voters.contains(&id(4)));
+        assert_eq!(joint.non_voters, [id(5)].into_iter().collect());
         assert!(joint.new_voters.is_disjoint(&joint.non_voters));
     }
 
