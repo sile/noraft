@@ -467,6 +467,18 @@ struct InvariantState {
     // re-added during the same tenure would legitimately reset its
     // match_index to 0 and trigger a false positive here.
     follower_match_indexes: BTreeMap<(NodeId, Term), BTreeMap<NodeId, LogIndex>>,
+    // Term ever observed as a `snapshot_position.term` at a given index.
+    // `check_snapshot_boundary_consistency` uses it to catch bugs that
+    // corrupt the boundary term across time or across nodes; the per-step
+    // `check_*` methods above never look at the boundary (`iter_with_positions`
+    // skips it and the relaxed prefix comparisons intentionally stop at
+    // `common_start`).
+    snapshot_boundary_terms: BTreeMap<LogIndex, Term>,
+    // Set to `true` whenever `check_snapshot_boundary_consistency`
+    // actually compared a boundary against another node's log or the
+    // committed oracle (i.e. the cross-node / cross-time comparison
+    // fired at least once). Feeds `cases_with_boundary_cross_check`.
+    boundary_cross_check_fired: bool,
 }
 
 impl InvariantState {
@@ -477,6 +489,7 @@ impl InvariantState {
         self.check_state_machine_safety(cluster)?;
         self.check_leader_completeness(cluster)?;
         self.check_follower_match_index_monotonic(cluster)?;
+        self.check_snapshot_boundary_consistency(cluster)?;
         Ok(())
     }
 
@@ -716,6 +729,82 @@ impl InvariantState {
         }
         Ok(())
     }
+
+    // The snapshot boundary `(term, index)` is a committed marker but is
+    // not returned by `iter_with_positions`, and the relaxed prefix
+    // comparisons in `check_log_matching` / `check_leader_completeness`
+    // stop strictly above it. Cross-check it against three references:
+    // the same index observed at a previous step (cross-time), every
+    // other node's log at that index (cross-node, using
+    // `entries().get_term` which includes the peer's own boundary if
+    // any), and the `committed` oracle entry at that index.
+    fn check_snapshot_boundary_consistency(&mut self, cluster: &Cluster) -> Result<(), String> {
+        for (id, node) in &cluster.nodes {
+            let snap_pos = node.log().snapshot_position();
+            if snap_pos == LogPosition::ZERO {
+                continue;
+            }
+            if let Some(previous_term) = self
+                .snapshot_boundary_terms
+                .insert(snap_pos.index, snap_pos.term)
+            {
+                self.boundary_cross_check_fired = true;
+                if previous_term != snap_pos.term {
+                    return Err(format!(
+                        "snapshot boundary term diverged at {:?}: node {} reports \
+                         {:?}, previously observed {:?}",
+                        snap_pos.index,
+                        u64::from(*id),
+                        snap_pos.term,
+                        previous_term,
+                    ));
+                }
+            }
+            for (other_id, other_node) in &cluster.nodes {
+                if other_id == id {
+                    continue;
+                }
+                // Uncommitted entries on `other_node` may legitimately have
+                // a different `term` at the same index while a stale log is
+                // being repaired (log matching only ties `(term, index)`
+                // pairs, not `index` alone). Restrict the peer check to
+                // indices at or below `other_node`'s `commit_index`, which
+                // is the range where terms must agree.
+                if snap_pos.index > other_node.commit_index() {
+                    continue;
+                }
+                let Some(other_term) = other_node.log().entries().get_term(snap_pos.index) else {
+                    continue;
+                };
+                self.boundary_cross_check_fired = true;
+                if other_term != snap_pos.term {
+                    return Err(format!(
+                        "snapshot boundary term mismatch across nodes at {:?}: \
+                         node {} snapshot term {:?}, node {} log term {:?}",
+                        snap_pos.index,
+                        u64::from(*id),
+                        snap_pos.term,
+                        u64::from(*other_id),
+                        other_term,
+                    ));
+                }
+            }
+            if let Some((oracle_pos, _, _)) = self.committed.get(&snap_pos.index) {
+                self.boundary_cross_check_fired = true;
+                if oracle_pos.term != snap_pos.term {
+                    return Err(format!(
+                        "snapshot boundary term mismatch with committed oracle at \
+                         {:?}: node {} snapshot term {:?}, oracle term {:?}",
+                        snap_pos.index,
+                        u64::from(*id),
+                        snap_pos.term,
+                        oracle_pos.term,
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 fn sample_steps(ctx: &mut noprop::TestCaseContext) -> usize {
@@ -743,6 +832,7 @@ fn cluster_invariants_hold() -> noprop::TestResult {
     let cases_with_local_snapshot = Cell::new(0usize);
     let cases_with_remote_snapshot_installed = Cell::new(0usize);
     let cases_with_snapshot_dropped = Cell::new(0usize);
+    let cases_with_boundary_cross_check = Cell::new(0usize);
     let mut runner = noprop::Runner::new(config.seed);
 
     runner.run(config.cases, |ctx| {
@@ -810,6 +900,9 @@ fn cluster_invariants_hold() -> noprop::TestResult {
         if snapshot_dropped {
             cases_with_snapshot_dropped.set(cases_with_snapshot_dropped.get() + 1);
         }
+        if invariants.boundary_cross_check_fired {
+            cases_with_boundary_cross_check.set(cases_with_boundary_cross_check.get() + 1);
+        }
         Ok(())
     })?;
 
@@ -835,6 +928,10 @@ fn cluster_invariants_hold() -> noprop::TestResult {
             "a remote snapshot install that succeeded",
         ),
         (cases_with_snapshot_dropped.get(), "a dropped snapshot"),
+        (
+            cases_with_boundary_cross_check.get(),
+            "a snapshot boundary that was cross-checked against another observation",
+        ),
     ];
     for (count, label) in coverage {
         assert!(count > 0, "no case exercised {label}\n{runner}");
