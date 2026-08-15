@@ -398,6 +398,33 @@ mod tests {
         );
     }
 
+    #[test]
+    fn handle_snapshot_installed_keeps_request_vote_call_term() {
+        let mut message = Message::request_vote_call(Term::new(10), NodeId::new(1), pos(3, 2));
+
+        message.handle_snapshot_installed(pos(12, 5));
+
+        assert_eq!(
+            message,
+            Message::request_vote_call(Term::new(10), NodeId::new(1), pos(12, 5))
+        );
+    }
+
+    #[test]
+    fn handle_snapshot_installed_keeps_append_entries_call_term() {
+        let entries = LogEntries::new(pos(3, 2));
+        let mut message =
+            Message::append_entries_call(Term::new(10), NodeId::new(1), LogIndex::ZERO, entries);
+
+        message.handle_snapshot_installed(pos(12, 5));
+
+        let Message::AppendEntriesCall { term, entries, .. } = &message else {
+            panic!("expected AppendEntriesCall");
+        };
+        assert_eq!(*term, Term::new(10));
+        assert_eq!(entries.prev_position(), pos(12, 5));
+    }
+
     fn pos(term: u64, index: u64) -> LogPosition {
         LogPosition::new(Term::new(term), LogIndex::new(index))
     }

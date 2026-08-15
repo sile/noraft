@@ -1521,11 +1521,15 @@ impl Node {
     /// The caller must ensure that the installed snapshot represents state
     /// that the cluster has already committed.
     ///
-    /// If the snapshot originates from a higher-term leader, the caller
-    /// must also update this node's term and role first by processing the
-    /// corresponding higher-term message through [`Node::handle_message()`],
-    /// so that `self.current_term()` is at least `last_included_position.term`
-    /// before this call. Otherwise the install is rejected.
+    /// The caller must also ensure that `self.current_term()` is at least
+    /// `last_included_position.term` before this call. In the usual flow
+    /// this is automatic: the snapshot is delivered together with (or
+    /// preceded by) the leader's `AppendEntriesCall` at the same term, and
+    /// handing that message to [`Node::handle_message()`] first advances
+    /// `current_term`. If an integration transports the snapshot without
+    /// such a message, it must feed a higher-term message through
+    /// [`Node::handle_message()`] itself before calling this method;
+    /// otherwise the install is rejected.
     ///
     /// This method returns [`false`] and ignores the installation if the following conditions are not met:
     /// - `last_included_position.term <= self.current_term()`.
