@@ -712,14 +712,25 @@ impl Node {
         self.role = RoleState::Follower;
         self.actions.set(Action::SetElectionTimeout);
 
-        // Purge queued outbound Calls whose term is now strictly stale.
-        // Otherwise a leftover `RequestVoteCall` / `AppendEntriesCall`
-        // could be rebased by a subsequent `Node::handle_snapshot_installed`
-        // into a self-inconsistent state (`msg.term < last_position.term`).
-        // Reply variants are intentionally kept: `RequestVoteReply` has no
-        // position field to rebase, and `AppendEntriesReply` is dropped by
-        // the receiver's own `msg.term < current_term` check. The strict
-        // less-than also lets the same-term step-down path
+        // Purge queued outbound Calls (`RequestVoteCall` / `AppendEntriesCall`)
+        // whose term is now strictly stale. Otherwise a leftover Call could be
+        // rebased by a subsequent `Node::handle_snapshot_installed` into a
+        // self-inconsistent state where the message term is older than its own
+        // position term (`last_position.term` for `RequestVoteCall`, or
+        // `entries.prev_position.term` for `AppendEntriesCall`).
+        //
+        // Everything else in `self.actions` is intentionally kept:
+        // - `RequestVoteReply` has no position field to rebase.
+        // - `AppendEntriesReply` can still be self-inconsistent after rebase,
+        //   but the receiver is safe: it either drops the reply on
+        //   `msg.term < current_term`, or takes the divergence branch of
+        //   `handle_append_entries_reply` and returns before updating
+        //   `match_index`.
+        // - `install_snapshots` holds only `NodeId`s (nothing to rebase).
+        // - `append_log_entries` must outlive role changes so the leader's
+        //   local log stays durable across an in-flight demotion.
+        //
+        // The strict less-than also lets the same-term step-down path
         // (`transition_to_follower(self.current_term)`, e.g. when a leader
         // commits a config that removes itself) keep its in-flight Calls.
         let is_stale_call = |msg: &mut Message| -> bool {
@@ -2472,10 +2483,62 @@ mod tests {
     }
 
     #[test]
+    fn transition_to_follower_retains_stale_reply_variants() {
+        // Locks the Call/Reply asymmetry in the purge predicate: Call
+        // variants (`RequestVoteCall` / `AppendEntriesCall`) with a stale
+        // term are dropped, but Reply variants are retained regardless.
+        // Plant one Call and one of each Reply variant into `send_messages`
+        // for three distinct peers, then demote via a strictly higher term.
+        let mut leader = leader_with(
+            NodeId::new(0),
+            &[NodeId::new(1), NodeId::new(2), NodeId::new(3)],
+        );
+        drain(&mut leader);
+        let stale_term = leader.current_term();
+        let stale_call = Message::append_entries_call(
+            stale_term,
+            NodeId::new(0),
+            LogIndex::ZERO,
+            LogEntries::new(LogPosition::ZERO),
+        );
+        let stale_ae_reply =
+            Message::append_entries_reply(stale_term, NodeId::new(0), LogPosition::ZERO);
+        let stale_rv_reply = Message::request_vote_reply(stale_term, NodeId::new(0), true);
+        leader
+            .actions
+            .send_messages
+            .insert(NodeId::new(1), stale_call);
+        leader
+            .actions
+            .send_messages
+            .insert(NodeId::new(2), stale_ae_reply.clone());
+        leader
+            .actions
+            .send_messages
+            .insert(NodeId::new(3), stale_rv_reply.clone());
+
+        let higher = Term::new(stale_term.get() + 3);
+        leader.transition_to_follower(higher);
+
+        assert!(!leader.actions().send_messages.contains_key(&NodeId::new(1)));
+        assert_eq!(
+            leader.actions().send_messages.get(&NodeId::new(2)),
+            Some(&stale_ae_reply)
+        );
+        assert_eq!(
+            leader.actions().send_messages.get(&NodeId::new(3)),
+            Some(&stale_rv_reply)
+        );
+    }
+
+    #[test]
     fn transition_to_follower_keeps_same_term_outbound_calls() {
-        // The leader-step-down path (`transition_to_follower(self.current_term)`,
-        // e.g. when a leader commits a config that removes itself) must not
-        // purge same-term queued Calls.
+        // Locks the strict less-than design in the purge predicate: a future
+        // change to `<=` would silently drop in-flight Calls on the leader
+        // step-down path (`transition_to_follower(self.current_term)`, e.g.
+        // when a leader commits a config that removes itself). This is a
+        // design lock, not a regression for the fix itself; the same-term
+        // path had no purge before either.
         let mut leader = leader_with(NodeId::new(0), &[NodeId::new(1)]);
         drain(&mut leader);
         let term = leader.current_term();
