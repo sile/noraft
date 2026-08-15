@@ -2,7 +2,8 @@
 
 use noprop::TestCaseContext;
 use noraft::{
-    ClusterConfig, CommitStatus, LogEntry, LogPosition, Message, Node, NodeId, Role, Term,
+    ClusterConfig, CommitStatus, LogEntries, LogEntry, LogIndex, LogPosition, Message, Node,
+    NodeId, Role, Term,
 };
 use std::collections::BTreeMap;
 use std::io::{Error, ErrorKind};
@@ -511,6 +512,22 @@ impl TestNode {
             .snapshot_finish_time
             .take_if(|(time, _, _)| *time <= now)
         {
+            // `Node::handle_snapshot_installed` rejects snapshots whose
+            // term exceeds `current_term`. In production the snapshot
+            // transport carries the higher-term messages that pull the
+            // receiver's term up before the install; the harness has no
+            // such transport, so it delivers a synthetic higher-term
+            // `AppendEntriesCall` here to satisfy the caller
+            // precondition.
+            if position.term > self.inner.current_term() {
+                let bump = Message::AppendEntriesCall {
+                    from: NodeId::new(u64::MAX),
+                    term: position.term,
+                    commit_index: LogIndex::ZERO,
+                    entries: LogEntries::new(LogPosition::ZERO),
+                };
+                let _ = self.inner.handle_message(&bump);
+            }
             self.inner.handle_snapshot_installed(position, config);
         }
         while let Some(entry) = self.incoming_messages.first_entry() {

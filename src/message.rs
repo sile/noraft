@@ -219,24 +219,20 @@ impl Message {
     }
 
     pub(crate) fn handle_snapshot_installed(&mut self, last_included_position: LogPosition) {
-        // Outbound calls are still requests from this node, so their log state
-        // may be rebased to the installed snapshot. Replies describe a past
-        // observation by this node; raising their term would synthesize a reply
-        // for a term that the node did not actually observe.
+        // Only rebase log positions here. The message `term` is left alone:
+        // `Node::handle_snapshot_installed` rejects snapshots whose term
+        // exceeds the sender's `current_term`, so raising a queued call's
+        // term to `last_included_position.term` would produce a call that
+        // the sender never actually reached. Replies also keep their term
+        // for the same reason (they describe a past observation).
         match self {
-            Message::RequestVoteCall {
-                term,
-                last_position,
-                ..
-            } => {
-                *term = (*term).max(last_included_position.term);
+            Message::RequestVoteCall { last_position, .. } => {
                 if last_position.index < last_included_position.index {
                     *last_position = last_included_position;
                 }
             }
             Message::RequestVoteReply { .. } => {}
-            Message::AppendEntriesCall { term, entries, .. } => {
-                *term = (*term).max(last_included_position.term);
+            Message::AppendEntriesCall { entries, .. } => {
                 entries.handle_snapshot_installed(last_included_position);
             }
             Message::AppendEntriesReply { last_position, .. } => {

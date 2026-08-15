@@ -86,8 +86,16 @@ fn snapshot_preserves_pending_append_suffix_after_snapshot_position() {
 
 #[test]
 fn snapshot_discards_incompatible_pending_append_entries() {
-    let mut follower = Node::start(id(0));
-    assert_no_action!(follower);
+    // `handle_snapshot_installed` rejects snapshots whose term exceeds
+    // `current_term`, so mimic the caller precondition and restart the
+    // node at the snapshot term.
+    let mut follower = Node::restart(
+        id(0),
+        t(12),
+        None,
+        Log::new(ClusterConfig::new(), LogEntries::new(LogPosition::ZERO)),
+    );
+    while follower.actions_mut().next().is_some() {}
     follower.actions_mut().append_log_entries = Some(LogEntries::from_iter(
         log_pos(t(10), i(2)),
         [LogEntry::Command],
