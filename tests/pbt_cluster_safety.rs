@@ -184,6 +184,27 @@ impl Cluster {
         Ok(cluster)
     }
 
+    // Fold a successful `Node::handle_snapshot_installed` into the
+    // durable state so a subsequent crash preserves the boundary. The
+    // API's precondition treats the snapshot as already persisted by
+    // the user (`src/node.rs::Node::handle_snapshot_installed` /
+    // `Node::restart` doc), so mirroring the tick harness's behavior:
+    // `durable_states[id]` is updated atomically, and if a pending
+    // transaction is in flight its target is refreshed to the same
+    // post-install live state (the old target's log prefix has just
+    // been superseded by the snapshot).
+    fn fold_snapshot_install_into_durable(&mut self, id: NodeId) {
+        let node = self
+            .nodes
+            .get(&id)
+            .expect("caller runs on a live node right after the install");
+        let snapshot = DurableSnapshot::from_node(node);
+        self.durable_states.insert(id, snapshot.clone());
+        if let Some(pending) = self.pending_storage.get_mut(&id) {
+            pending.target = snapshot;
+        }
+    }
+
     // Commit `pending_storage[id]` into `durable_states[id]` and release
     // any outbound that was held for the transaction. No-op if no
     // pending exists. Used by bootstrap and by `Cmd::PersistStorage`.
@@ -589,6 +610,7 @@ impl Cluster {
                         u64::from(id),
                     ));
                 }
+                self.fold_snapshot_install_into_durable(id);
                 self.drain_actions(id)?;
                 Ok(false)
             }
@@ -607,6 +629,9 @@ impl Cluster {
                     .get_mut(&id)
                     .expect("snapshot queues only exist for running nodes")
                     .handle_snapshot_installed(position, config);
+                if ok {
+                    self.fold_snapshot_install_into_durable(id);
+                }
                 self.drain_actions(id)?;
                 Ok(ok)
             }
@@ -621,6 +646,9 @@ impl Cluster {
                     .get_mut(&id)
                     .expect("snapshot queues only exist for running nodes")
                     .handle_snapshot_installed(position, config);
+                if ok {
+                    self.fold_snapshot_install_into_durable(id);
+                }
                 self.drain_actions(id)?;
                 Ok(ok)
             }
