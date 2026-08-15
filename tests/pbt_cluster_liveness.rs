@@ -16,6 +16,10 @@ fn proposals_commit_with_stable_links() -> noprop::TestResult {
     run(64, |ctx| {
         let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
         let mut cluster = TestCluster::new(&node_ids);
+        // The harness default includes a 1% drop rate, which can delay
+        // RequestVote and bump the term during bootstrap. This property
+        // is specifically about leadership stability, so drops are off.
+        cluster.default_link_options.drop_rate = noprop::Ratio::new(0, 1);
 
         let position = cluster.random_node_mut(ctx).create_cluster(&node_ids);
         assert_ne!(position, LogPosition::INVALID);
