@@ -220,13 +220,8 @@ impl TestCluster {
                         PendingOutbound::Send(destination, message) => {
                             messages.push((source, destination, message));
                         }
-                        PendingOutbound::InstallSnapshot(destination) => {
-                            snapshots.push((
-                                source,
-                                destination,
-                                node.inner.log().snapshot_position(),
-                                node.inner.log().snapshot_config().clone(),
-                            ));
+                        PendingOutbound::InstallSnapshot(destination, position, config) => {
+                            snapshots.push((source, destination, position, config));
                         }
                     }
                 }
@@ -253,16 +248,16 @@ impl TestCluster {
                 }
             }
             for destination in actions.install_snapshots {
+                let position = node.inner.log().snapshot_position();
+                let config = node.inner.log().snapshot_config().clone();
                 if holding {
-                    node.pending_outbound
-                        .push(PendingOutbound::InstallSnapshot(destination));
-                } else {
-                    snapshots.push((
-                        source,
+                    node.pending_outbound.push(PendingOutbound::InstallSnapshot(
                         destination,
-                        node.inner.log().snapshot_position(),
-                        node.inner.log().snapshot_config().clone(),
+                        position,
+                        config,
                     ));
+                } else {
+                    snapshots.push((source, destination, position, config));
                 }
             }
         }
@@ -484,11 +479,18 @@ impl DurableSnapshot {
 /// Outbound produced by a `Node` while a storage transaction was in
 /// flight. Held per node until the transaction commits, at which point
 /// `TestCluster::run_tick` moves it onto the delivery queues.
+///
+/// `InstallSnapshot` carries the `(LogPosition, ClusterConfig)` that
+/// were live on the source node at hold time. Reading them at release
+/// time instead would deliver a snapshot boundary the source never
+/// asked the user to send: a successful `Node::handle_snapshot_installed`
+/// on the same source (folded into `durable` above) can advance
+/// `snapshot_position` while the transfer is still held.
 #[derive(Debug)]
 enum PendingOutbound {
     Broadcast(Message),
     Send(NodeId, Message),
-    InstallSnapshot(NodeId),
+    InstallSnapshot(NodeId, LogPosition, ClusterConfig),
 }
 
 #[derive(Debug)]

@@ -94,11 +94,17 @@ impl DurableSnapshot {
 /// `Cmd::PersistStorage(id)` fires. Outbound produced by the same node
 /// while `pending_storage` exists is buffered here and released at the
 /// same time.
+///
+/// `outbound_snapshots` carries the `(LogPosition, ClusterConfig)`
+/// live on the source node at hold time. Reading them at release time
+/// instead would deliver a boundary the source never asked the user
+/// to send, because `Cmd::TakeSnapshot` on the same node can advance
+/// `snapshot_position` while the transfer is still held.
 #[derive(Debug)]
 struct PendingStorage {
     target: DurableSnapshot,
     outbound_messages: Vec<(NodeId, Message)>,
-    outbound_snapshots: Vec<NodeId>,
+    outbound_snapshots: Vec<(NodeId, LogPosition, ClusterConfig)>,
 }
 
 impl PendingStorage {
@@ -218,17 +224,9 @@ impl Cluster {
                 queue.push_back(message);
             }
         }
-        if !pending.outbound_snapshots.is_empty() {
-            let source = self
-                .nodes
-                .get(&id)
-                .expect("PersistStorage runs on a live node");
-            let position = source.log().snapshot_position();
-            let config = source.log().snapshot_config().clone();
-            for destination in pending.outbound_snapshots {
-                if let Some(queue) = self.snapshot_queues.get_mut(&destination) {
-                    queue.push_back((position, config.clone()));
-                }
+        for (destination, position, config) in pending.outbound_snapshots {
+            if let Some(queue) = self.snapshot_queues.get_mut(&destination) {
+                queue.push_back((position, config));
             }
         }
     }
@@ -318,22 +316,24 @@ impl Cluster {
                     }
                 }
                 Action::InstallSnapshot(to) => {
+                    let (position, config) = {
+                        let source = self
+                            .nodes
+                            .get(&id)
+                            .expect("drain_actions is called for a running node");
+                        (
+                            source.log().snapshot_position(),
+                            source.log().snapshot_config().clone(),
+                        )
+                    };
                     if holding {
                         let pending = self
                             .pending_storage
                             .get_mut(&id)
                             .expect("holding implies pending exists");
-                        pending.outbound_snapshots.push(to);
-                    } else {
-                        let source = self
-                            .nodes
-                            .get(&id)
-                            .expect("drain_actions is called for a running node");
-                        let position = source.log().snapshot_position();
-                        let config = source.log().snapshot_config().clone();
-                        if let Some(queue) = self.snapshot_queues.get_mut(&to) {
-                            queue.push_back((position, config));
-                        }
+                        pending.outbound_snapshots.push((to, position, config));
+                    } else if let Some(queue) = self.snapshot_queues.get_mut(&to) {
+                        queue.push_back((position, config));
                     }
                 }
             }
@@ -1057,6 +1057,7 @@ fn cluster_invariants_hold() -> noprop::TestResult {
     let cases_with_boundary_cross_check = Cell::new(0usize);
     let cases_with_storage_persisted = Cell::new(0usize);
     let cases_with_crash_before_persist = Cell::new(0usize);
+    let cases_with_restart_after_snapshot_fold = Cell::new(0usize);
     let mut runner = noprop::Runner::new(config.seed);
 
     runner.run(config.cases, |ctx| {
@@ -1073,6 +1074,7 @@ fn cluster_invariants_hold() -> noprop::TestResult {
         let mut snapshot_dropped = false;
         let mut storage_persisted = false;
         let mut crash_before_persist = false;
+        let mut restart_after_snapshot_fold = false;
         invariants.check(&cluster)?;
 
         for step in 0..sample_steps(ctx) {
@@ -1089,6 +1091,20 @@ fn cluster_invariants_hold() -> noprop::TestResult {
                 && cluster.pending_storage.contains_key(&id)
             {
                 crash_before_persist = true;
+            }
+            // Restart from a durable state whose log already carries a
+            // snapshot boundary confirms the
+            // `fold_snapshot_install_into_durable` path was exercised:
+            // a prior `TakeSnapshot` / `DeliverSnapshot` /
+            // `DuplicateSnapshot` folded the install into
+            // `durable_states[id]`, that state survived a crash, and
+            // this restart is now restoring from it. Detected before
+            // `apply(Restart)` consumes the `CrashedNode` entry.
+            if let Cmd::Restart(id) = command
+                && let Some(crashed_node) = cluster.crashed.get(&id)
+                && crashed_node.durable.log.snapshot_position().index != LogIndex::ZERO
+            {
+                restart_after_snapshot_fold = true;
             }
             let remote_install_ok = cluster.apply(command).map_err(|error| {
                 format!("command failed at step {step}: {error}; history={history:?}")
@@ -1144,6 +1160,10 @@ fn cluster_invariants_hold() -> noprop::TestResult {
         if crash_before_persist {
             cases_with_crash_before_persist.set(cases_with_crash_before_persist.get() + 1);
         }
+        if restart_after_snapshot_fold {
+            cases_with_restart_after_snapshot_fold
+                .set(cases_with_restart_after_snapshot_fold.get() + 1);
+        }
         Ok(())
     })?;
 
@@ -1180,6 +1200,10 @@ fn cluster_invariants_hold() -> noprop::TestResult {
         (
             cases_with_crash_before_persist.get(),
             "a crash while a storage transaction was still pending",
+        ),
+        (
+            cases_with_restart_after_snapshot_fold.get(),
+            "a restart from a durable state that carries a snapshot boundary",
         ),
     ];
     for (count, label) in coverage {
