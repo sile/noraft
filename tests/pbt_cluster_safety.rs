@@ -78,11 +78,6 @@ struct Cluster {
     queues: BTreeMap<NodeId, VecDeque<Message>>,
     snapshot_queues: BTreeMap<NodeId, VecDeque<(LogPosition, ClusterConfig)>>,
     crashed: BTreeMap<NodeId, CrashedNode>,
-    // Set by `DeliverSnapshot` / `DuplicateSnapshot` to the return value of
-    // the last `Node::handle_snapshot_installed` call. Reset to `false` at
-    // the start of every other command. Consumed by the coverage counter
-    // `cases_with_remote_snapshot_installed`.
-    last_snapshot_install_ok: bool,
 }
 
 impl Cluster {
@@ -118,7 +113,6 @@ impl Cluster {
             queues,
             snapshot_queues,
             crashed: BTreeMap::new(),
-            last_snapshot_install_ok: false,
         };
         cluster.drain_actions(bootstrap_id)?;
         Ok(cluster)
@@ -286,17 +280,20 @@ impl Cluster {
         }
     }
 
-    fn apply(&mut self, command: Cmd) -> Result<(), String> {
-        // Reset before every command so a stale success flag cannot leak
-        // into the next `DeliverSnapshot` observation.
-        self.last_snapshot_install_ok = false;
+    // Returns `Ok(true)` iff this command called
+    // `Node::handle_snapshot_installed` on a remote-transferred snapshot
+    // (`DeliverSnapshot` / `DuplicateSnapshot`) and got `true` back.
+    // Every other command returns `Ok(false)` on success. Feeds
+    // `cases_with_remote_snapshot_installed`.
+    fn apply(&mut self, command: Cmd) -> Result<bool, String> {
         match command {
             Cmd::TickElection(id) => {
                 self.nodes
                     .get_mut(&id)
                     .expect("commands only select running nodes")
                     .handle_election_timeout();
-                self.drain_actions(id)
+                self.drain_actions(id)?;
+                Ok(false)
             }
             Cmd::DeliverNext(id) => {
                 let message = self
@@ -314,7 +311,8 @@ impl Cluster {
                             u64::from(id)
                         )
                     })?;
-                self.drain_actions(id)
+                self.drain_actions(id)?;
+                Ok(false)
             }
             Cmd::DuplicateNext(id) => {
                 let message = self
@@ -332,14 +330,15 @@ impl Cluster {
                             u64::from(id)
                         )
                     })?;
-                self.drain_actions(id)
+                self.drain_actions(id)?;
+                Ok(false)
             }
             Cmd::DropNext(id) => {
                 self.queues
                     .get_mut(&id)
                     .and_then(VecDeque::pop_front)
                     .expect("commands only select non-empty queues");
-                Ok(())
+                Ok(false)
             }
             Cmd::Crash(id) => {
                 let node = self
@@ -356,7 +355,7 @@ impl Cluster {
                         log: node.log().clone(),
                     },
                 );
-                Ok(())
+                Ok(false)
             }
             Cmd::Restart(id) => {
                 let state = self
@@ -367,7 +366,8 @@ impl Cluster {
                 self.nodes.insert(id, node);
                 self.queues.insert(id, VecDeque::new());
                 self.snapshot_queues.insert(id, VecDeque::new());
-                self.drain_actions(id)
+                self.drain_actions(id)?;
+                Ok(false)
             }
             Cmd::Propose(id) => {
                 let position = self
@@ -381,7 +381,8 @@ impl Cluster {
                         u64::from(id)
                     ));
                 }
-                self.drain_actions(id)
+                self.drain_actions(id)?;
+                Ok(false)
             }
             Cmd::TakeSnapshot(id) => {
                 let (position, config) = {
@@ -400,11 +401,15 @@ impl Cluster {
                     .get_mut(&id)
                     .expect("commands only select running nodes");
                 let ok = node.handle_snapshot_installed(position, config);
-                debug_assert!(
-                    ok,
-                    "TakeSnapshot precondition ensures handle_snapshot_installed succeeds"
-                );
-                self.drain_actions(id)
+                if !ok {
+                    return Err(format!(
+                        "TakeSnapshot: node {} rejected the local snapshot despite \
+                         the sample-time precondition",
+                        u64::from(id),
+                    ));
+                }
+                self.drain_actions(id)?;
+                Ok(false)
             }
             Cmd::DeliverSnapshot(id) => {
                 let (position, config) = self
@@ -412,18 +417,17 @@ impl Cluster {
                     .get_mut(&id)
                     .and_then(VecDeque::pop_front)
                     .expect("commands only select non-empty snapshot queues");
-                // `handle_snapshot_installed` may return `false` when the
-                // receiver has not yet caught up to the snapshot term or
-                // when its log disagrees with the snapshot boundary.
-                // Silent no-op is acceptable; `cases_with_remote_snapshot_installed`
-                // only counts successful (returned `true`) installs.
+                // `handle_snapshot_installed` returning `false` is a valid
+                // no-op contract (term not yet caught up, or log disagrees
+                // with the boundary). The return value flows through to
+                // `cases_with_remote_snapshot_installed`.
                 let ok = self
                     .nodes
                     .get_mut(&id)
                     .expect("snapshot queues only exist for running nodes")
                     .handle_snapshot_installed(position, config);
-                self.last_snapshot_install_ok = ok;
-                self.drain_actions(id)
+                self.drain_actions(id)?;
+                Ok(ok)
             }
             Cmd::DuplicateSnapshot(id) => {
                 let (position, config) = self
@@ -436,15 +440,15 @@ impl Cluster {
                     .get_mut(&id)
                     .expect("snapshot queues only exist for running nodes")
                     .handle_snapshot_installed(position, config);
-                self.last_snapshot_install_ok = ok;
-                self.drain_actions(id)
+                self.drain_actions(id)?;
+                Ok(ok)
             }
             Cmd::DropSnapshot(id) => {
                 self.snapshot_queues
                     .get_mut(&id)
                     .and_then(VecDeque::pop_front)
                     .expect("commands only select non-empty snapshot queues");
-                Ok(())
+                Ok(false)
             }
         }
     }
@@ -854,12 +858,12 @@ fn cluster_invariants_hold() -> noprop::TestResult {
             crashed |= matches!(command, Cmd::Crash(_));
             restarted |= matches!(command, Cmd::Restart(_));
             duplicated |= matches!(command, Cmd::DuplicateNext(_));
-            local_snapshot |= matches!(command, Cmd::TakeSnapshot(_));
             snapshot_dropped |= matches!(command, Cmd::DropSnapshot(_));
-            cluster.apply(command).map_err(|error| {
+            let remote_install_ok = cluster.apply(command).map_err(|error| {
                 format!("command failed at step {step}: {error}; history={history:?}")
             })?;
-            if matches!(command, Cmd::DeliverSnapshot(_)) && cluster.last_snapshot_install_ok {
+            local_snapshot |= matches!(command, Cmd::TakeSnapshot(_));
+            if remote_install_ok {
                 remote_snapshot_installed = true;
             }
             history.push(command.to_string());
