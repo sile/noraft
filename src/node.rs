@@ -2453,12 +2453,12 @@ mod tests {
         let mut leader = leader_with(NodeId::new(0), &[NodeId::new(1)]);
         drain(&mut leader);
         let leader_term = leader.current_term();
-        let stale = Message::AppendEntriesCall {
-            from: NodeId::new(0),
-            term: leader_term,
-            commit_index: LogIndex::ZERO,
-            entries: LogEntries::new(LogPosition::ZERO),
-        };
+        let stale = Message::append_entries_call(
+            leader_term,
+            NodeId::new(0),
+            LogIndex::ZERO,
+            LogEntries::new(LogPosition::ZERO),
+        );
         leader.actions.broadcast_message = Some(stale.clone());
         leader.actions.send_messages.insert(NodeId::new(1), stale);
 
@@ -2479,12 +2479,12 @@ mod tests {
         let mut leader = leader_with(NodeId::new(0), &[NodeId::new(1)]);
         drain(&mut leader);
         let term = leader.current_term();
-        let call = Message::AppendEntriesCall {
-            from: NodeId::new(0),
+        let call = Message::append_entries_call(
             term,
-            commit_index: LogIndex::ZERO,
-            entries: LogEntries::new(LogPosition::ZERO),
-        };
+            NodeId::new(0),
+            LogIndex::ZERO,
+            LogEntries::new(LogPosition::ZERO),
+        );
         leader.actions.broadcast_message = Some(call.clone());
         leader
             .actions
@@ -2522,12 +2522,12 @@ mod tests {
             Some(Message::RequestVoteCall { .. })
         ));
 
-        let bump = Message::AppendEntriesCall {
-            from: NodeId::new(1),
-            term: Term::new(3),
-            commit_index: LogIndex::ZERO,
-            entries: LogEntries::new(LogPosition::ZERO),
-        };
+        let bump = Message::append_entries_call(
+            Term::new(3),
+            NodeId::new(1),
+            LogIndex::ZERO,
+            LogEntries::new(LogPosition::ZERO),
+        );
         node.handle_message(&bump)
             .expect("higher-term bump must be accepted");
         assert!(node.role().is_follower());
