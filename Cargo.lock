@@ -10,7 +10,7 @@ checksum = "827bc70adb92a00321d7cd4fd1db0c7cae5c50ca2ab93d0c32178331cad45a05"
 
 [[package]]
 name = "noraft"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "noprop",
 ]
