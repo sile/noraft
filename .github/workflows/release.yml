@@ -44,20 +44,15 @@ jobs:
       # and the verify pass in a clean copy.
       - run: cargo publish --dry-run
 
-  github-release:
-    needs: validate
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - id: create-release
-        run: gh release create ${{ github.ref_name }} --title "${{ github.ref_name }}" --generate-notes
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
+  # publish first: crates.io publish is non-reversible (unpublish is
+  # restricted to 72 hours and only removes the version from the index,
+  # not from downstream Cargo.lock files), so make it the guarding step.
+  # If it fails, no orphan github-release with a version that does not
+  # exist on crates.io is left behind. A github-release failure after
+  # publish succeeds is recoverable by re-running `gh release create`
+  # against the existing tag.
   publish:
-    needs: github-release
+    needs: validate
     runs-on: ubuntu-latest
     # environment: release  # Optional: for enhanced security
     permissions:
@@ -69,3 +64,15 @@ jobs:
       - run: cargo publish
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+
+  github-release:
+    needs: publish
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - id: create-release
+        run: gh release create ${{ github.ref_name }} --title "${{ github.ref_name }}" --generate-notes
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
