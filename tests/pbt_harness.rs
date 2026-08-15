@@ -511,6 +511,20 @@ impl TestNode {
             .snapshot_finish_time
             .take_if(|(time, _, _)| *time <= now)
         {
+            // `Node::handle_snapshot_installed` rejects snapshots whose
+            // term exceeds `current_term`. `Action::InstallSnapshot`
+            // only fires from `handle_append_entries_reply`, which the
+            // follower cannot reach before catching up to the leader's
+            // term via a prior `AppendEntriesCall`. So by the time the
+            // snapshot arrives here, `current_term >= position.term` is
+            // an invariant of the harness. Pin it with an assertion so
+            // future scenarios that would violate it fail loudly.
+            debug_assert!(
+                position.term <= self.inner.current_term(),
+                "snapshot term {:?} exceeds receiver current_term {:?}",
+                position.term,
+                self.inner.current_term()
+            );
             self.inner.handle_snapshot_installed(position, config);
         }
         while let Some(entry) = self.incoming_messages.first_entry() {

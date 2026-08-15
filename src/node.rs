@@ -1521,7 +1521,17 @@ impl Node {
     /// The caller must ensure that the installed snapshot represents state
     /// that the cluster has already committed.
     ///
+    /// The caller must also ensure that `self.current_term()` is at least
+    /// `last_included_position.term` before this call. In the usual flow
+    /// this is automatic: the snapshot is delivered together with (or
+    /// preceded by) the leader's `AppendEntriesCall` at the same term, and
+    /// handing that message to [`Node::handle_message()`] first advances
+    /// `current_term`. If an integration transports the snapshot without
+    /// such a message, it must feed a higher-term message through
+    /// [`Node::handle_message()`] itself before calling this method.
+    ///
     /// This method returns [`false`] and ignores the installation if the following conditions are not met:
+    /// - `last_included_position.term <= self.current_term()`.
     /// - `last_included_position` is valid, which means:
     ///   - `self.log.entries().contains(last_included_position)` is [`true`].
     ///   - Additionally, if `self.role().is_leader()` is [`false`], it is also acceptable if `last_included_position.index` is greater than `self.commit_index()`.
@@ -1539,6 +1549,11 @@ impl Node {
     /// the running node's `commit_index` was already above the snapshot
     /// boundary, this method keeps that in-memory advance instead of
     /// regressing it.
+    ///
+    /// On rejection (return value [`false`]), no observable state is
+    /// modified: [`Node::current_term()`], [`Node::voted_for()`],
+    /// [`Node::role()`], [`Node::log()`], [`Node::commit_index()`], and
+    /// [`Node::actions()`] all keep their pre-call values.
     pub fn handle_snapshot_installed(
         &mut self,
         last_included_position: LogPosition,
@@ -1598,6 +1613,12 @@ impl Node {
         last_included_config: &ClusterConfig,
         last_included_position: LogPosition,
     ) -> bool {
+        // Reject snapshots whose term the receiver has not yet observed;
+        // see `Node::handle_snapshot_installed` rustdoc for the caller
+        // obligation to bump `current_term` first.
+        if last_included_position.term > self.current_term {
+            return false;
+        }
         if self.commit_index() < last_included_position.index {
             return self.role() != Role::Leader;
         }
@@ -2244,7 +2265,11 @@ mod tests {
     #[test]
     fn snapshot_install_syncs_commit_index_on_follower() {
         let voters = &[NodeId::new(0), NodeId::new(1)];
-        let mut node = follower(NodeId::new(0), voters, 1, None);
+        // `handle_snapshot_installed` rejects snapshots whose term
+        // exceeds `current_term`, so start the follower at the snapshot
+        // term. This mirrors the documented caller precondition: process
+        // the higher-term message first so `current_term >= snapshot term`.
+        let mut node = follower(NodeId::new(0), voters, 2, None);
         assert_eq!(node.commit_index(), LogIndex::ZERO);
 
         // The snapshot is ahead of the current log, so `since()` returns
@@ -2343,5 +2368,59 @@ mod tests {
         let snapshot_config = leader.config().clone();
         assert!(leader.handle_snapshot_installed(first, snapshot_config));
         assert_eq!(leader.commit_index(), before);
+    }
+
+    #[test]
+    fn snapshot_install_rejects_snapshot_with_higher_term() {
+        let voters = &[NodeId::new(0), NodeId::new(1)];
+        let mut node = follower(NodeId::new(0), voters, 1, None);
+        drain(&mut node);
+        let before_log = node.log().clone();
+
+        // Snapshot term (2) > current_term (1) must be rejected.
+        let snapshot_position = pos(2, 5);
+        let snapshot_config = config(voters);
+        assert!(!node.handle_snapshot_installed(snapshot_position, snapshot_config));
+
+        // No observable state changes on rejection.
+        assert_eq!(node.current_term(), Term::new(1));
+        assert_eq!(node.voted_for(), None);
+        assert!(node.role().is_follower());
+        assert_eq!(node.commit_index(), LogIndex::ZERO);
+        assert_eq!(node.log(), &before_log);
+        assert!(node.actions().is_empty());
+    }
+
+    #[test]
+    fn snapshot_install_does_not_raise_queued_call_term_above_current_term() {
+        let voters = &[NodeId::new(0), NodeId::new(1)];
+        let mut node = follower(NodeId::new(0), voters, 0, None);
+        // Drop restart's queued `SetElectionTimeout`, then trigger the
+        // election so a `RequestVoteCall` sits in `broadcast_message`.
+        drain(&mut node);
+        node.handle_election_timeout();
+        assert!(node.role().is_candidate());
+        let candidate_term = node.current_term();
+
+        let queued_term = match node.actions().broadcast_message.as_ref() {
+            Some(Message::RequestVoteCall { term, .. }) => *term,
+            other => panic!("candidate should have a queued RequestVoteCall, got {other:?}"),
+        };
+        assert_eq!(queued_term, candidate_term);
+
+        // Install a snapshot at the same term. Before the fix,
+        // `Message::handle_snapshot_installed` would have raised the
+        // queued call's term to `last_included_position.term`; now the
+        // rebase leaves the term alone.
+        let snapshot_position = pos(candidate_term.get(), 5);
+        let snapshot_config = config(voters);
+        assert!(node.handle_snapshot_installed(snapshot_position, snapshot_config));
+
+        let queued_after = match node.actions().broadcast_message.as_ref() {
+            Some(Message::RequestVoteCall { term, .. }) => *term,
+            other => panic!("RequestVoteCall must remain queued, got {other:?}"),
+        };
+        assert!(queued_after <= node.current_term());
+        assert_eq!(queued_after, candidate_term);
     }
 }
