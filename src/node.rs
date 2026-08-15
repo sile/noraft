@@ -2618,13 +2618,9 @@ mod tests {
 
     #[test]
     fn transition_to_follower_keeps_election_timer_on_same_role_term_bump() {
-        // A `RequestVoteCall` that bumps a follower's `current_term` but is
-        // rejected by the up-to-date log check must not reset the follower's
-        // election timer. Otherwise a lagging candidate broadcasting
-        // higher-term `RequestVoteCall`s would starve the up-to-date follower
-        // from ever campaigning. Raft (extended paper, Figure 2, Followers §)
-        // only extends the follower timer on AppendEntries from the current
-        // leader or on granting a vote.
+        // Regression: an up-to-date follower's election timer must survive a
+        // log-rejected higher-term `RequestVoteCall` (see
+        // `transition_to_follower` for the Figure 2 rationale).
         let voters = &[NodeId::new(0), NodeId::new(1)];
         let mut node = follower(NodeId::new(0), voters, 5, None);
         drain(&mut node);
