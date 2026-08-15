@@ -711,6 +711,27 @@ impl Node {
         self.set_voted_for(None);
         self.role = RoleState::Follower;
         self.actions.set(Action::SetElectionTimeout);
+
+        // Purge queued outbound Calls whose term is now strictly stale.
+        // Otherwise a leftover `RequestVoteCall` / `AppendEntriesCall`
+        // could be rebased by a subsequent `Node::handle_snapshot_installed`
+        // into a self-inconsistent state (`msg.term < last_position.term`).
+        // Reply variants are intentionally kept: `RequestVoteReply` has no
+        // position field to rebase, and `AppendEntriesReply` is dropped by
+        // the receiver's own `msg.term < current_term` check. The strict
+        // less-than also lets the same-term step-down path
+        // (`transition_to_follower(self.current_term)`, e.g. when a leader
+        // commits a config that removes itself) keep its in-flight Calls.
+        let is_stale_call = |msg: &mut Message| -> bool {
+            matches!(
+                msg,
+                Message::RequestVoteCall { .. } | Message::AppendEntriesCall { .. }
+            ) && msg.term() < term
+        };
+        self.actions.broadcast_message.take_if(is_stale_call);
+        self.actions
+            .send_messages
+            .retain(|_, msg| !is_stale_call(msg));
     }
 
     /// Proposes a user-defined command ([`LogEntry::Command`]).
@@ -2422,5 +2443,100 @@ mod tests {
         };
         assert!(queued_after <= node.current_term());
         assert_eq!(queued_after, candidate_term);
+    }
+
+    #[test]
+    fn transition_to_follower_purges_stale_outbound_calls() {
+        // Set up a leader with both a queued broadcast heartbeat and a
+        // per-follower `AppendEntriesCall`, then demote via a strictly
+        // higher term. Both stale Calls must be purged.
+        let mut leader = leader_with(NodeId::new(0), &[NodeId::new(1)]);
+        drain(&mut leader);
+        let leader_term = leader.current_term();
+        let stale = Message::AppendEntriesCall {
+            from: NodeId::new(0),
+            term: leader_term,
+            commit_index: LogIndex::ZERO,
+            entries: LogEntries::new(LogPosition::ZERO),
+        };
+        leader.actions.broadcast_message = Some(stale.clone());
+        leader.actions.send_messages.insert(NodeId::new(1), stale);
+
+        let higher = Term::new(leader_term.get() + 3);
+        leader.transition_to_follower(higher);
+
+        assert!(leader.role().is_follower());
+        assert_eq!(leader.current_term(), higher);
+        assert!(leader.actions().broadcast_message.is_none());
+        assert!(leader.actions().send_messages.is_empty());
+    }
+
+    #[test]
+    fn transition_to_follower_keeps_same_term_outbound_calls() {
+        // The leader-step-down path (`transition_to_follower(self.current_term)`,
+        // e.g. when a leader commits a config that removes itself) must not
+        // purge same-term queued Calls.
+        let mut leader = leader_with(NodeId::new(0), &[NodeId::new(1)]);
+        drain(&mut leader);
+        let term = leader.current_term();
+        let call = Message::AppendEntriesCall {
+            from: NodeId::new(0),
+            term,
+            commit_index: LogIndex::ZERO,
+            entries: LogEntries::new(LogPosition::ZERO),
+        };
+        leader.actions.broadcast_message = Some(call.clone());
+        leader
+            .actions
+            .send_messages
+            .insert(NodeId::new(1), call.clone());
+
+        leader.transition_to_follower(term);
+
+        assert!(leader.role().is_follower());
+        assert_eq!(leader.current_term(), term);
+        assert_eq!(leader.actions().broadcast_message, Some(call.clone()));
+        assert_eq!(
+            leader.actions().send_messages.get(&NodeId::new(1)),
+            Some(&call)
+        );
+    }
+
+    #[test]
+    fn snapshot_install_after_transition_does_not_produce_self_inconsistent_call() {
+        // End-to-end scenario: a candidate at term=1 is demoted to
+        // follower by a higher-term `AppendEntriesCall`, and a
+        // subsequent snapshot install used to leave
+        // `RequestVoteCall { term: 1, last_position: pos(2, 5) }` in
+        // `broadcast_message`, a self-inconsistent Call whose position
+        // term is newer than its own term. The purge in
+        // `transition_to_follower` clears the stale Call before the
+        // install so no such message can be sent.
+        let voters = &[NodeId::new(0), NodeId::new(1)];
+        let mut node = follower(NodeId::new(0), voters, 0, None);
+        drain(&mut node);
+        node.handle_election_timeout();
+        assert!(node.role().is_candidate());
+        assert!(matches!(
+            node.actions().broadcast_message,
+            Some(Message::RequestVoteCall { .. })
+        ));
+
+        let bump = Message::AppendEntriesCall {
+            from: NodeId::new(1),
+            term: Term::new(3),
+            commit_index: LogIndex::ZERO,
+            entries: LogEntries::new(LogPosition::ZERO),
+        };
+        node.handle_message(&bump)
+            .expect("higher-term bump must be accepted");
+        assert!(node.role().is_follower());
+        assert_eq!(node.current_term(), Term::new(3));
+        assert!(node.actions().broadcast_message.is_none());
+
+        let snapshot_position = pos(2, 5);
+        let snapshot_config = config(voters);
+        assert!(node.handle_snapshot_installed(snapshot_position, snapshot_config));
+        assert!(node.actions().broadcast_message.is_none());
     }
 }
