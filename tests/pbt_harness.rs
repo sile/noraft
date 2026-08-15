@@ -2,7 +2,7 @@
 
 use noprop::TestCaseContext;
 use noraft::{
-    ClusterConfig, CommitStatus, LogEntry, LogPosition, Message, Node, NodeId, Role, Term,
+    ClusterConfig, CommitStatus, Log, LogEntry, LogPosition, Message, Node, NodeId, Role, Term,
 };
 use std::collections::BTreeMap;
 use std::io::{Error, ErrorKind};
@@ -204,22 +204,66 @@ impl TestCluster {
             node.run_tick(ctx, self.clock);
 
             let source = node.inner.id();
+
+            // Release any outbound that was held for a transaction which
+            // has now committed. `run_tick` clears `pending_durable`
+            // when storage completes, so a `None` here with a non-empty
+            // `pending_outbound` means the batch just became durable.
+            if node.pending_durable.is_none() && !node.pending_outbound.is_empty() {
+                for held in node.pending_outbound.drain(..) {
+                    match held {
+                        PendingOutbound::Broadcast(message) => {
+                            for destination in node.inner.peers() {
+                                messages.push((source, destination, message.clone()));
+                            }
+                        }
+                        PendingOutbound::Send(destination, message) => {
+                            messages.push((source, destination, message));
+                        }
+                        PendingOutbound::InstallSnapshot(destination) => {
+                            snapshots.push((
+                                source,
+                                destination,
+                                node.inner.log().snapshot_position(),
+                                node.inner.log().snapshot_config().clone(),
+                            ));
+                        }
+                    }
+                }
+            }
+
             let mut actions = std::mem::take(node.inner.actions_mut());
+            let holding = node.pending_durable.is_some();
             if let Some(message) = actions.broadcast_message.take() {
-                for destination in node.inner.peers() {
-                    messages.push((source, destination, message.clone()));
+                if holding {
+                    node.pending_outbound
+                        .push(PendingOutbound::Broadcast(message));
+                } else {
+                    for destination in node.inner.peers() {
+                        messages.push((source, destination, message.clone()));
+                    }
                 }
             }
             for (destination, message) in actions.send_messages {
-                messages.push((source, destination, message));
+                if holding {
+                    node.pending_outbound
+                        .push(PendingOutbound::Send(destination, message));
+                } else {
+                    messages.push((source, destination, message));
+                }
             }
             for destination in actions.install_snapshots {
-                snapshots.push((
-                    source,
-                    destination,
-                    node.inner.log().snapshot_position(),
-                    node.inner.log().snapshot_config().clone(),
-                ));
+                if holding {
+                    node.pending_outbound
+                        .push(PendingOutbound::InstallSnapshot(destination));
+                } else {
+                    snapshots.push((
+                        source,
+                        destination,
+                        node.inner.log().snapshot_position(),
+                        node.inner.log().snapshot_config().clone(),
+                    ));
+                }
             }
         }
 
@@ -417,6 +461,36 @@ impl MinMax {
     }
 }
 
+/// Test-only durable state snapshot: what `Node::restart` needs when a
+/// crashed node comes back. Mirrors the persistent-state contract in
+/// `src/node.rs::Node::restart`.
+#[derive(Debug, Clone)]
+struct DurableSnapshot {
+    current_term: Term,
+    voted_for: Option<NodeId>,
+    log: Log,
+}
+
+impl DurableSnapshot {
+    fn from_node(node: &Node) -> Self {
+        Self {
+            current_term: node.current_term(),
+            voted_for: node.voted_for(),
+            log: node.log().clone(),
+        }
+    }
+}
+
+/// Outbound produced by a `Node` while a storage transaction was in
+/// flight. Held per node until the transaction commits, at which point
+/// `TestCluster::run_tick` moves it onto the delivery queues.
+#[derive(Debug)]
+enum PendingOutbound {
+    Broadcast(Message),
+    Send(NodeId, Message),
+    InstallSnapshot(NodeId),
+}
+
 #[derive(Debug)]
 pub struct TestNode {
     pub inner: Node,
@@ -430,12 +504,26 @@ pub struct TestNode {
     stop_time: Option<Clock>,
     start_time: Option<Clock>,
     restarts: u64,
+    // Last state that has been fully persisted. Restart restores the
+    // node from this snapshot, not from live `Node` state.
+    durable: DurableSnapshot,
+    // In-flight storage transaction target. Set when a storage action
+    // (`SaveCurrentTerm` / `SaveVotedFor` / `AppendLogEntries`) is added
+    // and cleared into `durable` when `storage_finish_time` expires.
+    // Discarded on crash so an unfinished write is not restored.
+    pending_durable: Option<DurableSnapshot>,
+    // Outbound produced while `pending_durable` was `Some`. Held here
+    // until the transaction commits, then handed to `TestCluster` for
+    // delivery. Cleared on crash.
+    pending_outbound: Vec<PendingOutbound>,
 }
 
 impl TestNode {
     pub fn new(id: NodeId) -> Self {
+        let inner = Node::start(id);
+        let durable = DurableSnapshot::from_node(&inner);
         Self {
-            inner: Node::start(id),
+            inner,
             options: TestNodeOptions::default(),
             voter: true,
             running: true,
@@ -446,6 +534,9 @@ impl TestNode {
             stop_time: None,
             start_time: None,
             restarts: 0,
+            durable,
+            pending_durable: None,
+            pending_outbound: Vec::new(),
         }
     }
 
@@ -471,11 +562,16 @@ impl TestNode {
                         break;
                     }
                 }
+                // Restore from the last committed durable snapshot, not
+                // from live `Node` state. This makes the harness respect
+                // the persistence contract: an unfinished write that was
+                // still in `pending_durable` at crash time is not
+                // resurrected.
                 self.inner = Node::restart(
                     self.inner.id(),
-                    self.inner.current_term(),
-                    self.inner.voted_for(),
-                    self.inner.log().clone(),
+                    self.durable.current_term,
+                    self.durable.voted_for,
+                    self.durable.log.clone(),
                 );
                 self.restarts = self.restarts.saturating_add(1);
             } else {
@@ -491,11 +587,23 @@ impl TestNode {
             self.timeout_expire_time = None;
             self.storage_finish_time = None;
             self.snapshot_finish_time = None;
+            // In-flight storage transaction is lost on crash. The held
+            // outbound is dropped for the same reason: those messages
+            // depended on the transaction that never became durable.
+            self.pending_durable = None;
+            self.pending_outbound.clear();
             self.start_time = Some(now.after(self.options.stopping_ticks.sample(ctx)));
             return;
         }
 
-        self.storage_finish_time.take_if(|time| *time <= now);
+        if self
+            .storage_finish_time
+            .take_if(|time| *time <= now)
+            .is_some()
+            && let Some(committed) = self.pending_durable.take()
+        {
+            self.durable = committed;
+        }
         if self.storage_finish_time.is_some() {
             return;
         }
@@ -525,7 +633,14 @@ impl TestNode {
                 position.term,
                 self.inner.current_term()
             );
-            self.inner.handle_snapshot_installed(position, config);
+            if self.inner.handle_snapshot_installed(position, config) {
+                // A successful snapshot install atomically persists the
+                // new log / term boundary from the user's perspective
+                // (it acknowledges an already-persisted snapshot). Fold
+                // it into `durable` so a subsequent crash keeps the
+                // installed state.
+                self.durable = DurableSnapshot::from_node(&self.inner);
+            }
         }
         while let Some(entry) = self.incoming_messages.first_entry() {
             if entry.key().0 <= now {
@@ -541,14 +656,26 @@ impl TestNode {
         if std::mem::take(&mut self.inner.actions_mut().set_election_timeout) {
             self.reset_election_timeout(ctx, now);
         }
+        let mut generated_storage = false;
         if std::mem::take(&mut self.inner.actions_mut().save_current_term) {
             self.extend_storage_finish_time(ctx, now, 1);
+            generated_storage = true;
         }
         if std::mem::take(&mut self.inner.actions_mut().save_voted_for) {
             self.extend_storage_finish_time(ctx, now, 1);
+            generated_storage = true;
         }
         if let Some(entries) = self.inner.actions_mut().append_log_entries.take() {
             self.extend_storage_finish_time(ctx, now, entries.len());
+            generated_storage = true;
+        }
+        if generated_storage {
+            // Capture the current live `Node` state as the target of the
+            // in-flight transaction. If more storage actions are added
+            // in later ticks before `storage_finish_time` expires, the
+            // target is refreshed each time so it always reflects the
+            // latest queued write.
+            self.pending_durable = Some(DurableSnapshot::from_node(&self.inner));
         }
     }
 
