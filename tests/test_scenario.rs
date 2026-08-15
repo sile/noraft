@@ -73,6 +73,9 @@ fn snapshot_preserves_pending_append_suffix_after_snapshot_position() {
     let snapshot_config = leader.config().clone();
     assert!(leader.handle_snapshot_installed(first_position, snapshot_config));
 
+    // The leader was already committed past `first_position`, so
+    // `handle_snapshot_installed` must not regress `commit_index`.
+    assert_eq!(leader.commit_index(), second_position.index);
     assert_eq!(leader.log().entries().prev_position(), first_position);
     assert_eq!(leader.log().entries().last_position(), second_position);
     assert_eq!(
@@ -93,6 +96,9 @@ fn snapshot_discards_incompatible_pending_append_entries() {
     let snapshot_position = log_pos(t(12), i(2));
     assert!(follower.handle_snapshot_installed(snapshot_position, ClusterConfig::new()));
 
+    // A fresh follower starts at `commit_index == 0`; the install must
+    // advance it to the snapshot boundary.
+    assert_eq!(follower.commit_index(), snapshot_position.index);
     assert_eq!(follower.log().entries().prev_position(), snapshot_position);
     assert!(follower.actions().append_log_entries.is_none());
 }
@@ -806,6 +812,9 @@ fn snapshot() {
         let snapshot_position = node.log().entries().last_position();
         assert!(node.handle_snapshot_installed(snapshot_position, snapshot_config));
         assert_ne!(node.log().entries().prev_position().index, LogIndex::new(0));
+        // Every node had already committed the last position, so the
+        // install keeps `commit_index` at the snapshot boundary.
+        assert_eq!(node.commit_index(), snapshot_position.index);
     }
 
     // Add a new node and remove two nodes.
@@ -828,6 +837,9 @@ fn snapshot() {
         .node0
         .asserted_handle_append_entries_reply_failure_need_snapshot(&reply);
     assert!(node3.handle_snapshot_installed(snapshot_position, snapshot_config));
+    // A fresh member joining via snapshot install lands with
+    // `commit_index` at the snapshot boundary.
+    assert_eq!(node3.commit_index(), snapshot_position.index);
 
     // Append after snapshot.
     let call = cluster.node0.asserted_heartbeat();
