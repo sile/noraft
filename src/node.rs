@@ -707,10 +707,23 @@ impl Node {
     fn transition_to_follower(&mut self, term: Term) {
         debug_assert!(self.current_term <= term);
 
+        // Only reset the election timer when the role actually converts to
+        // Follower. Raft (extended paper, Figure 2, Followers §) lists just two
+        // events that extend a follower's election timer: receiving an
+        // `AppendEntries` from the current leader, and granting a vote to a
+        // candidate. A same-role term bump (already Follower, only
+        // `current_term` moves up) is not one of them; resetting here would let
+        // a lagging Candidate that keeps broadcasting `RequestVoteCall` starve
+        // an up-to-date Follower from ever campaigning. The vote-granting reset
+        // still fires in `handle_request_vote_call`, and the leader-heartbeat
+        // reset still fires in `handle_append_entries_call`.
+        let was_follower = matches!(self.role, RoleState::Follower);
         self.set_current_term(term);
         self.set_voted_for(None);
         self.role = RoleState::Follower;
-        self.actions.set(Action::SetElectionTimeout);
+        if !was_follower {
+            self.actions.set(Action::SetElectionTimeout);
+        }
 
         // Purge queued outbound Calls (`RequestVoteCall` / `AppendEntriesCall`)
         // whose term is now strictly stale. Otherwise a leftover Call could be
@@ -2601,5 +2614,89 @@ mod tests {
         let snapshot_config = config(voters);
         assert!(node.handle_snapshot_installed(snapshot_position, snapshot_config));
         assert!(node.actions().broadcast_message.is_none());
+    }
+
+    #[test]
+    fn transition_to_follower_keeps_election_timer_on_same_role_term_bump() {
+        // A `RequestVoteCall` that bumps a follower's `current_term` but is
+        // rejected by the up-to-date log check must not reset the follower's
+        // election timer. Otherwise a lagging candidate broadcasting
+        // higher-term `RequestVoteCall`s would starve the up-to-date follower
+        // from ever campaigning. Raft (extended paper, Figure 2, Followers §)
+        // only extends the follower timer on AppendEntries from the current
+        // leader or on granting a vote.
+        let voters = &[NodeId::new(0), NodeId::new(1)];
+        let mut node = follower(NodeId::new(0), voters, 5, None);
+        drain(&mut node);
+        assert!(!node.actions().set_election_timeout);
+
+        let stale = LogPosition::ZERO;
+        assert!(node.log().last_position() > stale);
+
+        let bump = Message::request_vote_call(Term::new(10), NodeId::new(1), stale);
+        node.handle_message(&bump)
+            .expect("higher-term RequestVote must be accepted");
+
+        assert!(node.role().is_follower());
+        assert_eq!(node.current_term(), Term::new(10));
+        assert_eq!(node.voted_for(), None);
+        assert!(
+            !node.actions().set_election_timeout,
+            "existing follower timer must not be reset on a log-rejected term bump"
+        );
+    }
+
+    #[test]
+    fn transition_to_follower_resets_election_timer_when_granting_vote() {
+        // The "grants a vote" path from Figure 2 remains a valid reset
+        // trigger even when the role does not change: an up-to-date
+        // higher-term candidate that is granted a vote must reset the
+        // follower's election timer.
+        let voters = &[NodeId::new(0), NodeId::new(1)];
+        let mut node = follower(NodeId::new(0), voters, 5, None);
+        drain(&mut node);
+        assert!(!node.actions().set_election_timeout);
+
+        let up_to_date = node.log().last_position();
+        let bump = Message::request_vote_call(Term::new(10), NodeId::new(1), up_to_date);
+        node.handle_message(&bump)
+            .expect("higher-term RequestVote must be accepted");
+
+        assert!(node.role().is_follower());
+        assert_eq!(node.current_term(), Term::new(10));
+        assert_eq!(node.voted_for(), Some(NodeId::new(1)));
+        assert!(
+            node.actions().set_election_timeout,
+            "granting a vote must reset the election timer"
+        );
+    }
+
+    #[test]
+    fn transition_to_follower_resets_election_timer_from_candidate() {
+        // A real role change (Candidate -> Follower) must reset the timer:
+        // the newly-demoted node has no active leader contact to lean on.
+        let mut node = candidate_with(NodeId::new(0), &[NodeId::new(1)]);
+        drain(&mut node);
+        assert!(!node.actions().set_election_timeout);
+
+        let higher = Term::new(node.current_term().get() + 1);
+        node.transition_to_follower(higher);
+
+        assert!(node.role().is_follower());
+        assert!(node.actions().set_election_timeout);
+    }
+
+    #[test]
+    fn transition_to_follower_resets_election_timer_from_leader() {
+        // A real role change (Leader -> Follower) must reset the timer.
+        let mut leader = leader_with(NodeId::new(0), &[NodeId::new(1)]);
+        drain(&mut leader);
+        assert!(!leader.actions().set_election_timeout);
+
+        let higher = Term::new(leader.current_term().get() + 1);
+        leader.transition_to_follower(higher);
+
+        assert!(leader.role().is_follower());
+        assert!(leader.actions().set_election_timeout);
     }
 }
