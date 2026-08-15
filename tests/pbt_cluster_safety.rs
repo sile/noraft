@@ -7,7 +7,9 @@
 
 pub mod pbt_harness;
 
-use noraft::{Action, Log, LogEntry, LogIndex, LogPosition, Message, Node, NodeId, Role, Term};
+use noraft::{
+    Action, ClusterConfig, Log, LogEntry, LogIndex, LogPosition, Message, Node, NodeId, Role, Term,
+};
 use pbt_harness::run_config;
 use std::cell::Cell;
 use std::collections::{BTreeMap, VecDeque};
@@ -25,6 +27,10 @@ enum Cmd {
     Crash(NodeId),
     Restart(NodeId),
     Propose(NodeId),
+    TakeSnapshot(NodeId),
+    DeliverSnapshot(NodeId),
+    DuplicateSnapshot(NodeId),
+    DropSnapshot(NodeId),
 }
 
 impl fmt::Display for Cmd {
@@ -37,6 +43,10 @@ impl fmt::Display for Cmd {
             Self::Crash(id) => ("Crash", id),
             Self::Restart(id) => ("Restart", id),
             Self::Propose(id) => ("Propose", id),
+            Self::TakeSnapshot(id) => ("TakeSnapshot", id),
+            Self::DeliverSnapshot(id) => ("DeliverSnapshot", id),
+            Self::DuplicateSnapshot(id) => ("DuplicateSnapshot", id),
+            Self::DropSnapshot(id) => ("DropSnapshot", id),
         };
         write!(f, "{name}({})", u64::from(*id))
     }
@@ -51,6 +61,10 @@ enum CmdKind {
     Crash,
     Restart,
     Propose,
+    TakeSnapshot,
+    DeliverSnapshot,
+    DuplicateSnapshot,
+    DropSnapshot,
 }
 
 struct CrashedNode {
@@ -62,7 +76,13 @@ struct CrashedNode {
 struct Cluster {
     nodes: BTreeMap<NodeId, Node>,
     queues: BTreeMap<NodeId, VecDeque<Message>>,
+    snapshot_queues: BTreeMap<NodeId, VecDeque<(LogPosition, ClusterConfig)>>,
     crashed: BTreeMap<NodeId, CrashedNode>,
+    // Set by `DeliverSnapshot` / `DuplicateSnapshot` to the return value of
+    // the last `Node::handle_snapshot_installed` call. Reset to `false` at
+    // the start of every other command. Consumed by the coverage counter
+    // `cases_with_remote_snapshot_installed`.
+    last_snapshot_install_ok: bool,
 }
 
 impl Cluster {
@@ -73,6 +93,11 @@ impl Cluster {
             .map(|id| (id, Node::start(id)))
             .collect();
         let queues = node_ids
+            .iter()
+            .copied()
+            .map(|id| (id, VecDeque::new()))
+            .collect();
+        let snapshot_queues = node_ids
             .iter()
             .copied()
             .map(|id| (id, VecDeque::new()))
@@ -91,7 +116,9 @@ impl Cluster {
         let mut cluster = Self {
             nodes,
             queues,
+            snapshot_queues,
             crashed: BTreeMap::new(),
+            last_snapshot_install_ok: false,
         };
         cluster.drain_actions(bootstrap_id)?;
         Ok(cluster)
@@ -133,10 +160,15 @@ impl Cluster {
                     }
                 }
                 Action::InstallSnapshot(to) => {
-                    return Err(format!(
-                        "snapshot installation for node {} is outside this harness",
-                        u64::from(to)
-                    ));
+                    let source = self
+                        .nodes
+                        .get(&id)
+                        .expect("drain_actions is called for a running node");
+                    let position = source.log().snapshot_position();
+                    let config = source.log().snapshot_config().clone();
+                    if let Some(queue) = self.snapshot_queues.get_mut(&to) {
+                        queue.push_back((position, config));
+                    }
                 }
             }
         }
@@ -158,6 +190,13 @@ impl Cluster {
             .collect()
     }
 
+    fn snapshot_queued_ids(&self) -> Vec<NodeId> {
+        self.snapshot_queues
+            .iter()
+            .filter_map(|(id, queue)| (!queue.is_empty()).then_some(*id))
+            .collect()
+    }
+
     fn leader_ids(&self) -> Vec<NodeId> {
         self.nodes
             .iter()
@@ -165,11 +204,26 @@ impl Cluster {
             .collect()
     }
 
+    // Nodes whose `commit_index` has advanced past their current snapshot
+    // boundary. `TakeSnapshot` is only offered for these so the install
+    // strictly advances `snapshot_position`, and the bootstrap-time
+    // `commit_index == snapshot_position == LogIndex::ZERO` case is excluded.
+    fn snapshot_takers(&self) -> Vec<NodeId> {
+        self.nodes
+            .iter()
+            .filter_map(|(id, node)| {
+                (node.commit_index() > node.log().snapshot_position().index).then_some(*id)
+            })
+            .collect()
+    }
+
     fn sample_command(&self, ctx: &mut noprop::TestCaseContext) -> Cmd {
         let running = self.running_ids();
         let crashed = self.crashed_ids();
         let queued = self.queued_ids();
+        let snapshot_queued = self.snapshot_queued_ids();
         let leaders = self.leader_ids();
+        let snapshot_takers = self.snapshot_takers();
         let mut kinds = Vec::new();
         let mut weights = Vec::new();
 
@@ -195,6 +249,18 @@ impl Cluster {
             kinds.push(CmdKind::Propose);
             weights.push(5);
         }
+        if !snapshot_takers.is_empty() {
+            kinds.push(CmdKind::TakeSnapshot);
+            weights.push(2);
+        }
+        if !snapshot_queued.is_empty() {
+            kinds.push(CmdKind::DeliverSnapshot);
+            weights.push(6);
+            kinds.push(CmdKind::DuplicateSnapshot);
+            weights.push(1);
+            kinds.push(CmdKind::DropSnapshot);
+            weights.push(1);
+        }
 
         let kind = kinds[noprop::sample_weighted_index(ctx, &weights)];
         match kind {
@@ -205,10 +271,25 @@ impl Cluster {
             CmdKind::Crash => Cmd::Crash(noprop::sample_choice(ctx, &running)),
             CmdKind::Restart => Cmd::Restart(noprop::sample_choice(ctx, &crashed)),
             CmdKind::Propose => Cmd::Propose(noprop::sample_choice(ctx, &leaders)),
+            CmdKind::TakeSnapshot => {
+                Cmd::TakeSnapshot(noprop::sample_choice(ctx, &snapshot_takers))
+            }
+            CmdKind::DeliverSnapshot => {
+                Cmd::DeliverSnapshot(noprop::sample_choice(ctx, &snapshot_queued))
+            }
+            CmdKind::DuplicateSnapshot => {
+                Cmd::DuplicateSnapshot(noprop::sample_choice(ctx, &snapshot_queued))
+            }
+            CmdKind::DropSnapshot => {
+                Cmd::DropSnapshot(noprop::sample_choice(ctx, &snapshot_queued))
+            }
         }
     }
 
     fn apply(&mut self, command: Cmd) -> Result<(), String> {
+        // Reset before every command so a stale success flag cannot leak
+        // into the next `DeliverSnapshot` observation.
+        self.last_snapshot_install_ok = false;
         match command {
             Cmd::TickElection(id) => {
                 self.nodes
@@ -266,6 +347,7 @@ impl Cluster {
                     .remove(&id)
                     .expect("commands only select running nodes");
                 self.queues.remove(&id);
+                self.snapshot_queues.remove(&id);
                 self.crashed.insert(
                     id,
                     CrashedNode {
@@ -284,6 +366,7 @@ impl Cluster {
                 let node = Node::restart(id, state.term, state.voted_for, state.log);
                 self.nodes.insert(id, node);
                 self.queues.insert(id, VecDeque::new());
+                self.snapshot_queues.insert(id, VecDeque::new());
                 self.drain_actions(id)
             }
             Cmd::Propose(id) => {
@@ -299,6 +382,69 @@ impl Cluster {
                     ));
                 }
                 self.drain_actions(id)
+            }
+            Cmd::TakeSnapshot(id) => {
+                let (position, config) = {
+                    let node = self
+                        .nodes
+                        .get(&id)
+                        .expect("commands only select running nodes");
+                    let commit_index = node.commit_index();
+                    node.log()
+                        .get_position_and_config(commit_index)
+                        .map(|(pos, cfg)| (pos, cfg.clone()))
+                        .expect("TakeSnapshot precondition guarantees commit_index is in log range")
+                };
+                let node = self
+                    .nodes
+                    .get_mut(&id)
+                    .expect("commands only select running nodes");
+                let ok = node.handle_snapshot_installed(position, config);
+                debug_assert!(
+                    ok,
+                    "TakeSnapshot precondition ensures handle_snapshot_installed succeeds"
+                );
+                self.drain_actions(id)
+            }
+            Cmd::DeliverSnapshot(id) => {
+                let (position, config) = self
+                    .snapshot_queues
+                    .get_mut(&id)
+                    .and_then(VecDeque::pop_front)
+                    .expect("commands only select non-empty snapshot queues");
+                // `handle_snapshot_installed` may return `false` when the
+                // receiver has not yet caught up to the snapshot term or
+                // when its log disagrees with the snapshot boundary.
+                // Silent no-op is acceptable; `cases_with_remote_snapshot_installed`
+                // only counts successful (returned `true`) installs.
+                let ok = self
+                    .nodes
+                    .get_mut(&id)
+                    .expect("snapshot queues only exist for running nodes")
+                    .handle_snapshot_installed(position, config);
+                self.last_snapshot_install_ok = ok;
+                self.drain_actions(id)
+            }
+            Cmd::DuplicateSnapshot(id) => {
+                let (position, config) = self
+                    .snapshot_queues
+                    .get(&id)
+                    .and_then(|queue| queue.front().cloned())
+                    .expect("commands only select non-empty snapshot queues");
+                let ok = self
+                    .nodes
+                    .get_mut(&id)
+                    .expect("snapshot queues only exist for running nodes")
+                    .handle_snapshot_installed(position, config);
+                self.last_snapshot_install_ok = ok;
+                self.drain_actions(id)
+            }
+            Cmd::DropSnapshot(id) => {
+                self.snapshot_queues
+                    .get_mut(&id)
+                    .and_then(VecDeque::pop_front)
+                    .expect("commands only select non-empty snapshot queues");
+                Ok(())
             }
         }
     }
@@ -373,7 +519,21 @@ impl InvariantState {
                     .map(|(position, entry)| (position, entry.clone()))
                     .collect();
 
+                // The lower bound below which entries have been absorbed by
+                // one side's snapshot. Log matching is only meaningful
+                // strictly above this boundary: indices at or below can be
+                // present on the un-snapshotted side but gone on the other,
+                // which is not a violation.
+                let common_start = left
+                    .log()
+                    .snapshot_position()
+                    .index
+                    .max(right.log().snapshot_position().index);
+
                 for (shared_position, _) in &left_entries {
+                    if shared_position.index <= common_start {
+                        continue;
+                    }
                     let same_position = right_entries
                         .iter()
                         .any(|(position, _)| position == shared_position);
@@ -382,10 +542,12 @@ impl InvariantState {
                     }
                     let left_prefix: Vec<_> = left_entries
                         .iter()
+                        .filter(|(position, _)| position.index > common_start)
                         .take_while(|(position, _)| position.index <= shared_position.index)
                         .collect();
                     let right_prefix: Vec<_> = right_entries
                         .iter()
+                        .filter(|(position, _)| position.index > common_start)
                         .take_while(|(position, _)| position.index <= shared_position.index)
                         .collect();
                     if left_prefix != right_prefix {
@@ -414,15 +576,24 @@ impl InvariantState {
                 .iter_with_positions()
                 .map(|(position, entry)| (position, entry.clone()))
                 .collect();
-            if let Some(previous) = self.leader_logs.get(&key)
-                && !current.starts_with(previous)
-            {
-                return Err(format!(
-                    "leader {} changed its term {:?} log prefix: previous={previous:?}, \
-                     current={current:?}",
-                    u64::from(*id),
-                    node.current_term()
-                ));
+            // A local snapshot taken within the same tenure legitimately
+            // deletes a prefix of the previously observed log. Compare only
+            // the portion strictly above the current snapshot boundary.
+            let current_snapshot = node.log().snapshot_position().index;
+            if let Some(previous) = self.leader_logs.get(&key) {
+                let previous_suffix: Vec<(LogPosition, LogEntry)> = previous
+                    .iter()
+                    .filter(|(position, _)| position.index > current_snapshot)
+                    .cloned()
+                    .collect();
+                if !current.starts_with(&previous_suffix) {
+                    return Err(format!(
+                        "leader {} changed its term {:?} log prefix: previous={previous:?}, \
+                         current={current:?}",
+                        u64::from(*id),
+                        node.current_term()
+                    ));
+                }
             }
             self.leader_logs.insert(key, current);
         }
@@ -476,6 +647,13 @@ impl InvariantState {
                 // contain entries committed later. Leader completeness
                 // applies from the term in which the commit occurred.
                 if node.current_term() < expected.2 {
+                    continue;
+                }
+                // Committed entries at or below this leader's snapshot
+                // boundary are absorbed by the snapshot itself, so the
+                // per-entry log lookup is not required (and would
+                // legitimately return `None`).
+                if *index <= node.log().snapshot_position().index {
                     continue;
                 }
                 let actual = node.log().entries().get_entry(*index).map(|entry| {
@@ -562,6 +740,9 @@ fn cluster_invariants_hold() -> noprop::TestResult {
     let cases_with_restart = Cell::new(0usize);
     let cases_with_duplicate = Cell::new(0usize);
     let cases_with_multiple_leader_terms = Cell::new(0usize);
+    let cases_with_local_snapshot = Cell::new(0usize);
+    let cases_with_remote_snapshot_installed = Cell::new(0usize);
+    let cases_with_snapshot_dropped = Cell::new(0usize);
     let mut runner = noprop::Runner::new(config.seed);
 
     runner.run(config.cases, |ctx| {
@@ -573,6 +754,9 @@ fn cluster_invariants_hold() -> noprop::TestResult {
         let mut crashed = false;
         let mut restarted = false;
         let mut duplicated = false;
+        let mut local_snapshot = false;
+        let mut remote_snapshot_installed = false;
+        let mut snapshot_dropped = false;
         invariants.check(&cluster)?;
 
         for step in 0..sample_steps(ctx) {
@@ -580,9 +764,14 @@ fn cluster_invariants_hold() -> noprop::TestResult {
             crashed |= matches!(command, Cmd::Crash(_));
             restarted |= matches!(command, Cmd::Restart(_));
             duplicated |= matches!(command, Cmd::DuplicateNext(_));
+            local_snapshot |= matches!(command, Cmd::TakeSnapshot(_));
+            snapshot_dropped |= matches!(command, Cmd::DropSnapshot(_));
             cluster.apply(command).map_err(|error| {
                 format!("command failed at step {step}: {error}; history={history:?}")
             })?;
+            if matches!(command, Cmd::DeliverSnapshot(_)) && cluster.last_snapshot_install_ok {
+                remote_snapshot_installed = true;
+            }
             history.push(command.to_string());
             invariants.check(&cluster).map_err(|error| {
                 format!("invariant failed at step {step}: {error}; history={history:?}")
@@ -611,6 +800,16 @@ fn cluster_invariants_hold() -> noprop::TestResult {
         if invariants.leaders_by_term.len() > 1 {
             cases_with_multiple_leader_terms.set(cases_with_multiple_leader_terms.get() + 1);
         }
+        if local_snapshot {
+            cases_with_local_snapshot.set(cases_with_local_snapshot.get() + 1);
+        }
+        if remote_snapshot_installed {
+            cases_with_remote_snapshot_installed
+                .set(cases_with_remote_snapshot_installed.get() + 1);
+        }
+        if snapshot_dropped {
+            cases_with_snapshot_dropped.set(cases_with_snapshot_dropped.get() + 1);
+        }
         Ok(())
     })?;
 
@@ -630,6 +829,12 @@ fn cluster_invariants_hold() -> noprop::TestResult {
             cases_with_multiple_leader_terms.get(),
             "leaders in multiple terms",
         ),
+        (cases_with_local_snapshot.get(), "a local snapshot"),
+        (
+            cases_with_remote_snapshot_installed.get(),
+            "a remote snapshot install that succeeded",
+        ),
+        (cases_with_snapshot_dropped.get(), "a dropped snapshot"),
     ];
     for (count, label) in coverage {
         assert!(count > 0, "no case exercised {label}\n{runner}");
