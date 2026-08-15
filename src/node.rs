@@ -1528,8 +1528,7 @@ impl Node {
     /// handing that message to [`Node::handle_message()`] first advances
     /// `current_term`. If an integration transports the snapshot without
     /// such a message, it must feed a higher-term message through
-    /// [`Node::handle_message()`] itself before calling this method;
-    /// otherwise the install is rejected.
+    /// [`Node::handle_message()`] itself before calling this method.
     ///
     /// This method returns [`false`] and ignores the installation if the following conditions are not met:
     /// - `last_included_position.term <= self.current_term()`.
@@ -1550,6 +1549,11 @@ impl Node {
     /// the running node's `commit_index` was already above the snapshot
     /// boundary, this method keeps that in-memory advance instead of
     /// regressing it.
+    ///
+    /// On rejection (return value [`false`]), no observable state is
+    /// modified: [`Node::current_term()`], [`Node::voted_for()`],
+    /// [`Node::role()`], [`Node::log()`], [`Node::commit_index()`], and
+    /// [`Node::actions()`] all keep their pre-call values.
     pub fn handle_snapshot_installed(
         &mut self,
         last_included_position: LogPosition,
@@ -1609,6 +1613,9 @@ impl Node {
         last_included_config: &ClusterConfig,
         last_included_position: LogPosition,
     ) -> bool {
+        // Reject snapshots whose term the receiver has not yet observed;
+        // see `Node::handle_snapshot_installed` rustdoc for the caller
+        // obligation to bump `current_term` first.
         if last_included_position.term > self.current_term {
             return false;
         }
@@ -2367,8 +2374,7 @@ mod tests {
     fn snapshot_install_rejects_snapshot_with_higher_term() {
         let voters = &[NodeId::new(0), NodeId::new(1)];
         let mut node = follower(NodeId::new(0), voters, 1, None);
-        let before_current_term = node.current_term();
-        let before_commit_index = node.commit_index();
+        drain(&mut node);
         let before_log = node.log().clone();
 
         // Snapshot term (2) > current_term (1) must be rejected.
@@ -2376,9 +2382,13 @@ mod tests {
         let snapshot_config = config(voters);
         assert!(!node.handle_snapshot_installed(snapshot_position, snapshot_config));
 
-        assert_eq!(node.current_term(), before_current_term);
-        assert_eq!(node.commit_index(), before_commit_index);
+        // No observable state changes on rejection.
+        assert_eq!(node.current_term(), Term::new(1));
+        assert_eq!(node.voted_for(), None);
+        assert!(node.role().is_follower());
+        assert_eq!(node.commit_index(), LogIndex::ZERO);
         assert_eq!(node.log(), &before_log);
+        assert!(node.actions().is_empty());
     }
 
     #[test]

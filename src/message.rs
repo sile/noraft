@@ -223,19 +223,40 @@ impl Message {
         // `Node::handle_snapshot_installed` rejects snapshots whose term
         // exceeds the sender's `current_term`, so raising a queued call's
         // term to `last_included_position.term` would produce a call that
-        // the sender never actually reached. Replies also keep their term
-        // for the same reason (they describe a past observation).
+        // the sender never actually issued at that term. Replies describe
+        // a past observation and keep their term as well.
+        //
+        // Every variant field is bound explicitly (matching the style of
+        // `Self::merge`) so that a future field addition trips a
+        // compiler error rather than silently escaping this rebase.
         match self {
-            Message::RequestVoteCall { last_position, .. } => {
+            Message::RequestVoteCall {
+                from: _,
+                term: _,
+                last_position,
+            } => {
                 if last_position.index < last_included_position.index {
                     *last_position = last_included_position;
                 }
             }
-            Message::RequestVoteReply { .. } => {}
-            Message::AppendEntriesCall { entries, .. } => {
+            Message::RequestVoteReply {
+                from: _,
+                term: _,
+                vote_granted: _,
+            } => {}
+            Message::AppendEntriesCall {
+                from: _,
+                term: _,
+                commit_index: _,
+                entries,
+            } => {
                 entries.handle_snapshot_installed(last_included_position);
             }
-            Message::AppendEntriesReply { last_position, .. } => {
+            Message::AppendEntriesReply {
+                from: _,
+                term: _,
+                last_position,
+            } => {
                 if last_position.index < last_included_position.index {
                     *last_position = last_included_position;
                 }
