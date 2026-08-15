@@ -31,6 +31,7 @@ enum Cmd {
     DeliverSnapshot(NodeId),
     DuplicateSnapshot(NodeId),
     DropSnapshot(NodeId),
+    PersistStorage(NodeId),
 }
 
 impl fmt::Display for Cmd {
@@ -47,6 +48,7 @@ impl fmt::Display for Cmd {
             Self::DeliverSnapshot(id) => ("DeliverSnapshot", id),
             Self::DuplicateSnapshot(id) => ("DuplicateSnapshot", id),
             Self::DropSnapshot(id) => ("DropSnapshot", id),
+            Self::PersistStorage(id) => ("PersistStorage", id),
         };
         write!(f, "{name}({})", u64::from(*id))
     }
@@ -65,12 +67,58 @@ enum CmdKind {
     DeliverSnapshot,
     DuplicateSnapshot,
     DropSnapshot,
+    PersistStorage,
 }
 
-struct CrashedNode {
+/// Test-only durable snapshot mirroring the three inputs `Node::restart`
+/// requires (`current_term`, `voted_for`, `log`).
+#[derive(Debug, Clone)]
+struct DurableSnapshot {
     term: Term,
     voted_for: Option<NodeId>,
     log: Log,
+}
+
+impl DurableSnapshot {
+    fn from_node(node: &Node) -> Self {
+        Self {
+            term: node.current_term(),
+            voted_for: node.voted_for(),
+            log: node.log().clone(),
+        }
+    }
+}
+
+/// In-flight storage transaction on the step-driven cluster harness.
+/// `target` is the state that will replace `durable_states[id]` when
+/// `Cmd::PersistStorage(id)` fires. Outbound produced by the same node
+/// while `pending_storage` exists is buffered here and released at the
+/// same time.
+///
+/// `outbound_snapshots` carries the `(LogPosition, ClusterConfig)`
+/// live on the source node at hold time. Reading them at release time
+/// instead would deliver a boundary the source never asked the user
+/// to send, because `Cmd::TakeSnapshot` on the same node can advance
+/// `snapshot_position` while the transfer is still held.
+#[derive(Debug)]
+struct PendingStorage {
+    target: DurableSnapshot,
+    outbound_messages: Vec<(NodeId, Message)>,
+    outbound_snapshots: Vec<(NodeId, LogPosition, ClusterConfig)>,
+}
+
+impl PendingStorage {
+    fn new(target: DurableSnapshot) -> Self {
+        Self {
+            target,
+            outbound_messages: Vec::new(),
+            outbound_snapshots: Vec::new(),
+        }
+    }
+}
+
+struct CrashedNode {
+    durable: DurableSnapshot,
 }
 
 struct Cluster {
@@ -78,6 +126,15 @@ struct Cluster {
     queues: BTreeMap<NodeId, VecDeque<Message>>,
     snapshot_queues: BTreeMap<NodeId, VecDeque<(LogPosition, ClusterConfig)>>,
     crashed: BTreeMap<NodeId, CrashedNode>,
+    // Last state that has been fully persisted for each node. Restart
+    // restores the node from here, and `Cmd::PersistStorage` refreshes
+    // it from `pending_storage[id].target`.
+    durable_states: BTreeMap<NodeId, DurableSnapshot>,
+    // In-flight storage transaction plus the outbound produced by the
+    // same node while it is pending. Cleared on crash (with its held
+    // outbound) or on `Cmd::PersistStorage` (with its held outbound
+    // released into `queues` / `snapshot_queues`).
+    pending_storage: BTreeMap<NodeId, PendingStorage>,
 }
 
 impl Cluster {
@@ -97,6 +154,14 @@ impl Cluster {
             .copied()
             .map(|id| (id, VecDeque::new()))
             .collect();
+        // Seed each node's initial durable state from `Node::start`. The
+        // bootstrap node's `create_cluster` below extends its live log
+        // and the follow-up `drain_actions` + explicit persist stashes
+        // that extension into `durable_states[bootstrap_id]`.
+        let durable_states: BTreeMap<NodeId, DurableSnapshot> = nodes
+            .iter()
+            .map(|(id, node)| (*id, DurableSnapshot::from_node(node)))
+            .collect();
         let bootstrap_id = *node_ids
             .first()
             .ok_or("a cluster needs at least one node")?;
@@ -113,9 +178,57 @@ impl Cluster {
             queues,
             snapshot_queues,
             crashed: BTreeMap::new(),
+            durable_states,
+            pending_storage: BTreeMap::new(),
         };
         cluster.drain_actions(bootstrap_id)?;
+        // Force-persist the bootstrap transaction so the cluster starts
+        // with the initial cluster-config entry committed to durable
+        // state. Without this, the very first `Cmd::Crash(bootstrap_id)`
+        // would resurrect an empty log and stall the cluster.
+        cluster.persist_pending(bootstrap_id);
         Ok(cluster)
+    }
+
+    // Fold a successful `Node::handle_snapshot_installed` into the
+    // durable state so a subsequent crash preserves the boundary. The
+    // API's precondition treats the snapshot as already persisted by
+    // the user (`src/node.rs::Node::handle_snapshot_installed` /
+    // `Node::restart` doc), so mirroring the tick harness's behavior:
+    // `durable_states[id]` is updated atomically, and if a pending
+    // transaction is in flight its target is refreshed to the same
+    // post-install live state (the old target's log prefix has just
+    // been superseded by the snapshot).
+    fn fold_snapshot_install_into_durable(&mut self, id: NodeId) {
+        let node = self
+            .nodes
+            .get(&id)
+            .expect("caller runs on a live node right after the install");
+        let snapshot = DurableSnapshot::from_node(node);
+        self.durable_states.insert(id, snapshot.clone());
+        if let Some(pending) = self.pending_storage.get_mut(&id) {
+            pending.target = snapshot;
+        }
+    }
+
+    // Commit `pending_storage[id]` into `durable_states[id]` and release
+    // any outbound that was held for the transaction. No-op if no
+    // pending exists. Used by bootstrap and by `Cmd::PersistStorage`.
+    fn persist_pending(&mut self, id: NodeId) {
+        let Some(pending) = self.pending_storage.remove(&id) else {
+            return;
+        };
+        self.durable_states.insert(id, pending.target);
+        for (destination, message) in pending.outbound_messages {
+            if let Some(queue) = self.queues.get_mut(&destination) {
+                queue.push_back(message);
+            }
+        }
+        for (destination, position, config) in pending.outbound_snapshots {
+            if let Some(queue) = self.snapshot_queues.get_mut(&destination) {
+                queue.push_back((position, config));
+            }
+        }
     }
 
     fn drain_actions(&mut self, id: NodeId) -> Result<(), String> {
@@ -131,36 +244,95 @@ impl Cluster {
             .expect("the node was checked above")
             .actions_mut()
             .collect();
+
+        // Update or open a pending storage transaction if any storage
+        // action is present in this batch. The transaction target always
+        // reflects the latest live Node state, so subsequent commands
+        // that add more storage without a `Cmd::PersistStorage` in
+        // between naturally accumulate into the same transaction.
+        let has_storage_action = actions.iter().any(|a| {
+            matches!(
+                a,
+                Action::SaveCurrentTerm | Action::SaveVotedFor | Action::AppendLogEntries(_)
+            )
+        });
+        if has_storage_action {
+            let target = {
+                let source = self
+                    .nodes
+                    .get(&id)
+                    .expect("drain_actions is called for a running node");
+                DurableSnapshot::from_node(source)
+            };
+            self.pending_storage
+                .entry(id)
+                .and_modify(|p| p.target = target.clone())
+                .or_insert_with(|| PendingStorage::new(target));
+        }
+
+        // Outbound is held for the entire time a pending storage
+        // transaction exists for this node, not only for the same batch
+        // that opened it: a later outbound whose payload reflects
+        // uncommitted state must not be exposed to peers until that
+        // state is durable.
+        let holding = self.pending_storage.contains_key(&id);
+
         for action in actions {
             match action {
                 Action::SetElectionTimeout
                 | Action::SaveCurrentTerm
                 | Action::SaveVotedFor
                 | Action::AppendLogEntries(_) => {
-                    // This harness models persistence as synchronous.
-                    // Node already contains the state represented by
-                    // these actions when it is crashed.
+                    // Storage side is captured in `pending_storage`
+                    // above; `SetElectionTimeout` has no bearing on
+                    // durable state.
                 }
                 Action::BroadcastMessage(message) => {
-                    for peer in &peers {
-                        if let Some(queue) = self.queues.get_mut(peer) {
-                            queue.push_back(message.clone());
+                    if holding {
+                        let pending = self
+                            .pending_storage
+                            .get_mut(&id)
+                            .expect("holding implies pending exists");
+                        for peer in &peers {
+                            pending.outbound_messages.push((*peer, message.clone()));
+                        }
+                    } else {
+                        for peer in &peers {
+                            if let Some(queue) = self.queues.get_mut(peer) {
+                                queue.push_back(message.clone());
+                            }
                         }
                     }
                 }
                 Action::SendMessage(to, message) => {
-                    if let Some(queue) = self.queues.get_mut(&to) {
+                    if holding {
+                        let pending = self
+                            .pending_storage
+                            .get_mut(&id)
+                            .expect("holding implies pending exists");
+                        pending.outbound_messages.push((to, message));
+                    } else if let Some(queue) = self.queues.get_mut(&to) {
                         queue.push_back(message);
                     }
                 }
                 Action::InstallSnapshot(to) => {
-                    let source = self
-                        .nodes
-                        .get(&id)
-                        .expect("drain_actions is called for a running node");
-                    let position = source.log().snapshot_position();
-                    let config = source.log().snapshot_config().clone();
-                    if let Some(queue) = self.snapshot_queues.get_mut(&to) {
+                    let (position, config) = {
+                        let source = self
+                            .nodes
+                            .get(&id)
+                            .expect("drain_actions is called for a running node");
+                        (
+                            source.log().snapshot_position(),
+                            source.log().snapshot_config().clone(),
+                        )
+                    };
+                    if holding {
+                        let pending = self
+                            .pending_storage
+                            .get_mut(&id)
+                            .expect("holding implies pending exists");
+                        pending.outbound_snapshots.push((to, position, config));
+                    } else if let Some(queue) = self.snapshot_queues.get_mut(&to) {
                         queue.push_back((position, config));
                     }
                 }
@@ -211,6 +383,10 @@ impl Cluster {
             .collect()
     }
 
+    fn persist_pending_ids(&self) -> Vec<NodeId> {
+        self.pending_storage.keys().copied().collect()
+    }
+
     fn sample_command(&self, ctx: &mut noprop::TestCaseContext) -> Cmd {
         let running = self.running_ids();
         let crashed = self.crashed_ids();
@@ -218,6 +394,7 @@ impl Cluster {
         let snapshot_queued = self.snapshot_queued_ids();
         let leaders = self.leader_ids();
         let snapshot_takers = self.snapshot_takers();
+        let persistable = self.persist_pending_ids();
         let mut kinds = Vec::new();
         let mut weights = Vec::new();
 
@@ -252,8 +429,23 @@ impl Cluster {
             weights.push(6);
             kinds.push(CmdKind::DuplicateSnapshot);
             weights.push(1);
+            // Bumped from 1 to 3 to keep `cases_with_snapshot_dropped`
+            // reliable after `Cmd::PersistStorage` diluted the
+            // per-selection probability of the low-weight snapshot
+            // commands. DropSnapshot only fires when
+            // `snapshot_queued` is non-empty, which is a rare event
+            // that does not scale linearly with the case budget.
             kinds.push(CmdKind::DropSnapshot);
-            weights.push(1);
+            weights.push(3);
+        }
+        if !persistable.is_empty() {
+            // Kept modest so the harness's overall weight distribution
+            // (and the coverage assertions calibrated on it in
+            // `snapshot_dropped` etc.) is not disturbed too much, while
+            // still commonly persisting pending storage before the run
+            // stalls under held outbound.
+            kinds.push(CmdKind::PersistStorage);
+            weights.push(5);
         }
 
         let kind = kinds[noprop::sample_weighted_index(ctx, &weights)];
@@ -276,6 +468,9 @@ impl Cluster {
             }
             CmdKind::DropSnapshot => {
                 Cmd::DropSnapshot(noprop::sample_choice(ctx, &snapshot_queued))
+            }
+            CmdKind::PersistStorage => {
+                Cmd::PersistStorage(noprop::sample_choice(ctx, &persistable))
             }
         }
     }
@@ -341,20 +536,22 @@ impl Cluster {
                 Ok(false)
             }
             Cmd::Crash(id) => {
-                let node = self
-                    .nodes
+                self.nodes
                     .remove(&id)
                     .expect("commands only select running nodes");
                 self.queues.remove(&id);
                 self.snapshot_queues.remove(&id);
-                self.crashed.insert(
-                    id,
-                    CrashedNode {
-                        term: node.current_term(),
-                        voted_for: node.voted_for(),
-                        log: node.log().clone(),
-                    },
-                );
+                // Drop any in-flight storage transaction (and its held
+                // outbound) so the restart cannot resurrect an
+                // unpersisted change. `durable_states[id]` is what the
+                // node will be resurrected from.
+                self.pending_storage.remove(&id);
+                let durable = self
+                    .durable_states
+                    .get(&id)
+                    .cloned()
+                    .expect("durable state is seeded for every node at bootstrap");
+                self.crashed.insert(id, CrashedNode { durable });
                 Ok(false)
             }
             Cmd::Restart(id) => {
@@ -362,7 +559,12 @@ impl Cluster {
                     .crashed
                     .remove(&id)
                     .expect("commands only select crashed nodes");
-                let node = Node::restart(id, state.term, state.voted_for, state.log);
+                let node = Node::restart(
+                    id,
+                    state.durable.term,
+                    state.durable.voted_for,
+                    state.durable.log,
+                );
                 self.nodes.insert(id, node);
                 self.queues.insert(id, VecDeque::new());
                 self.snapshot_queues.insert(id, VecDeque::new());
@@ -408,6 +610,7 @@ impl Cluster {
                         u64::from(id),
                     ));
                 }
+                self.fold_snapshot_install_into_durable(id);
                 self.drain_actions(id)?;
                 Ok(false)
             }
@@ -426,6 +629,9 @@ impl Cluster {
                     .get_mut(&id)
                     .expect("snapshot queues only exist for running nodes")
                     .handle_snapshot_installed(position, config);
+                if ok {
+                    self.fold_snapshot_install_into_durable(id);
+                }
                 self.drain_actions(id)?;
                 Ok(ok)
             }
@@ -440,6 +646,9 @@ impl Cluster {
                     .get_mut(&id)
                     .expect("snapshot queues only exist for running nodes")
                     .handle_snapshot_installed(position, config);
+                if ok {
+                    self.fold_snapshot_install_into_durable(id);
+                }
                 self.drain_actions(id)?;
                 Ok(ok)
             }
@@ -448,6 +657,10 @@ impl Cluster {
                     .get_mut(&id)
                     .and_then(VecDeque::pop_front)
                     .expect("commands only select non-empty snapshot queues");
+                Ok(false)
+            }
+            Cmd::PersistStorage(id) => {
+                self.persist_pending(id);
                 Ok(false)
             }
         }
@@ -826,7 +1039,12 @@ fn sample_steps(ctx: &mut noprop::TestCaseContext) -> usize {
 /// after every state-dependent cluster command.
 #[test]
 fn cluster_invariants_hold() -> noprop::TestResult {
-    let config = run_config(128)?;
+    // Bumped from 128 to 256: `Cmd::PersistStorage` added a new
+    // storage-scoped path that must appear per case, so more cases are
+    // needed to reliably exercise every coverage counter (in particular
+    // `cases_with_snapshot_dropped` / `cases_with_remote_snapshot_installed`,
+    // both of which depend on `snapshot_queued` being non-empty first).
+    let config = run_config(256)?;
     let cases_with_command_commit = Cell::new(0usize);
     let cases_with_leader_history = Cell::new(0usize);
     let cases_with_crash = Cell::new(0usize);
@@ -837,6 +1055,9 @@ fn cluster_invariants_hold() -> noprop::TestResult {
     let cases_with_remote_snapshot_installed = Cell::new(0usize);
     let cases_with_snapshot_dropped = Cell::new(0usize);
     let cases_with_boundary_cross_check = Cell::new(0usize);
+    let cases_with_storage_persisted = Cell::new(0usize);
+    let cases_with_crash_before_persist = Cell::new(0usize);
+    let cases_with_restart_after_snapshot_fold = Cell::new(0usize);
     let mut runner = noprop::Runner::new(config.seed);
 
     runner.run(config.cases, |ctx| {
@@ -851,6 +1072,9 @@ fn cluster_invariants_hold() -> noprop::TestResult {
         let mut local_snapshot = false;
         let mut remote_snapshot_installed = false;
         let mut snapshot_dropped = false;
+        let mut storage_persisted = false;
+        let mut crash_before_persist = false;
+        let mut restart_after_snapshot_fold = false;
         invariants.check(&cluster)?;
 
         for step in 0..sample_steps(ctx) {
@@ -859,6 +1083,29 @@ fn cluster_invariants_hold() -> noprop::TestResult {
             restarted |= matches!(command, Cmd::Restart(_));
             duplicated |= matches!(command, Cmd::DuplicateNext(_));
             snapshot_dropped |= matches!(command, Cmd::DropSnapshot(_));
+            storage_persisted |= matches!(command, Cmd::PersistStorage(_));
+            // Crash with pending storage on the same node = crash window
+            // exercise. Detected before `apply` because `apply(Crash)`
+            // clears the pending entry.
+            if let Cmd::Crash(id) = command
+                && cluster.pending_storage.contains_key(&id)
+            {
+                crash_before_persist = true;
+            }
+            // Restart from a durable state whose log already carries a
+            // snapshot boundary confirms the
+            // `fold_snapshot_install_into_durable` path was exercised:
+            // a prior `TakeSnapshot` / `DeliverSnapshot` /
+            // `DuplicateSnapshot` folded the install into
+            // `durable_states[id]`, that state survived a crash, and
+            // this restart is now restoring from it. Detected before
+            // `apply(Restart)` consumes the `CrashedNode` entry.
+            if let Cmd::Restart(id) = command
+                && let Some(crashed_node) = cluster.crashed.get(&id)
+                && crashed_node.durable.log.snapshot_position().index != LogIndex::ZERO
+            {
+                restart_after_snapshot_fold = true;
+            }
             let remote_install_ok = cluster.apply(command).map_err(|error| {
                 format!("command failed at step {step}: {error}; history={history:?}")
             })?;
@@ -907,6 +1154,16 @@ fn cluster_invariants_hold() -> noprop::TestResult {
         if invariants.boundary_cross_check_fired {
             cases_with_boundary_cross_check.set(cases_with_boundary_cross_check.get() + 1);
         }
+        if storage_persisted {
+            cases_with_storage_persisted.set(cases_with_storage_persisted.get() + 1);
+        }
+        if crash_before_persist {
+            cases_with_crash_before_persist.set(cases_with_crash_before_persist.get() + 1);
+        }
+        if restart_after_snapshot_fold {
+            cases_with_restart_after_snapshot_fold
+                .set(cases_with_restart_after_snapshot_fold.get() + 1);
+        }
         Ok(())
     })?;
 
@@ -935,6 +1192,18 @@ fn cluster_invariants_hold() -> noprop::TestResult {
         (
             cases_with_boundary_cross_check.get(),
             "a snapshot boundary that was cross-checked against another observation",
+        ),
+        (
+            cases_with_storage_persisted.get(),
+            "a storage transaction persisted via PersistStorage",
+        ),
+        (
+            cases_with_crash_before_persist.get(),
+            "a crash while a storage transaction was still pending",
+        ),
+        (
+            cases_with_restart_after_snapshot_fold.get(),
+            "a restart from a durable state that carries a snapshot boundary",
         ),
     ];
     for (count, label) in coverage {
