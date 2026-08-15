@@ -225,38 +225,17 @@ impl Message {
         // term to `last_included_position.term` would produce a call that
         // the sender never actually issued at that term. Replies describe
         // a past observation and keep their term as well.
-        //
-        // Every variant field is bound explicitly (matching the style of
-        // `Self::merge`) so that a future field addition trips a
-        // compiler error rather than silently escaping this rebase.
         match self {
-            Message::RequestVoteCall {
-                from: _,
-                term: _,
-                last_position,
-            } => {
+            Message::RequestVoteCall { last_position, .. } => {
                 if last_position.index < last_included_position.index {
                     *last_position = last_included_position;
                 }
             }
-            Message::RequestVoteReply {
-                from: _,
-                term: _,
-                vote_granted: _,
-            } => {}
-            Message::AppendEntriesCall {
-                from: _,
-                term: _,
-                commit_index: _,
-                entries,
-            } => {
+            Message::RequestVoteReply { .. } => {}
+            Message::AppendEntriesCall { entries, .. } => {
                 entries.handle_snapshot_installed(last_included_position);
             }
-            Message::AppendEntriesReply {
-                from: _,
-                term: _,
-                last_position,
-            } => {
+            Message::AppendEntriesReply { last_position, .. } => {
                 if last_position.index < last_included_position.index {
                     *last_position = last_included_position;
                 }
