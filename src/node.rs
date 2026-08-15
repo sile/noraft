@@ -718,12 +718,13 @@ impl Node {
         // still fires in `handle_request_vote_call`, and the leader-heartbeat
         // reset still fires in `handle_append_entries_call`.
         let was_follower = matches!(self.role, RoleState::Follower);
-        self.set_current_term(term);
-        self.set_voted_for(None);
-        self.role = RoleState::Follower;
         if !was_follower {
             self.actions.set(Action::SetElectionTimeout);
         }
+
+        self.set_current_term(term);
+        self.set_voted_for(None);
+        self.role = RoleState::Follower;
 
         // Purge queued outbound Calls (`RequestVoteCall` / `AppendEntriesCall`)
         // whose term is now strictly stale. Otherwise a leftover Call could be
