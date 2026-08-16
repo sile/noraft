@@ -13,4 +13,4 @@ categories = ["algorithms", "no-std"]
 [dependencies]
 
 [dev-dependencies]
-noprop = "0.1.0"
+noprop = "0.2.0"
