@@ -1,3 +1,6 @@
+[workspace]
+members = [".", "pbt"]
+
 [package]
 name = "noraft"
 version = "0.7.1"
@@ -14,3 +17,4 @@ categories = ["algorithms", "no-std"]
 
 [dev-dependencies]
 noprop = "0.2.0"
+

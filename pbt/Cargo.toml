@@ -1,0 +1,10 @@
+[package]
+name = "pbt"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+noraft = { path = ".." }
+noprop = "0.2.0"
+

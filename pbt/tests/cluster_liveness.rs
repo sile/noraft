@@ -4,10 +4,8 @@
 //! via the shared runner. CI therefore uses a fresh time-derived seed
 //! unless `NORAFT_PBT_SEED` is explicitly set for reproduction.
 
-pub mod pbt_harness;
-
 use noraft::{LogPosition, NodeId};
-use pbt_harness::{MinMax, TestCluster, assert_all_terminal, run};
+use pbt::{MinMax, TestCluster, assert_all_terminal, run};
 
 /// Command proposals commit under stable links, the commit indices
 /// converge, and the leader does not change (term stays 1).

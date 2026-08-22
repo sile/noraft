@@ -1,9 +1,7 @@
 //! Model-based PBTs for noraft cluster configurations.
 
-pub mod pbt_harness;
-
 use noraft::{ClusterConfig, NodeId};
-use pbt_harness::{run, sample_config, sample_normal_config};
+use pbt::{run, sample_config, sample_normal_config};
 use std::collections::BTreeSet;
 
 /// `unique_nodes` is the sorted set union, including configurations

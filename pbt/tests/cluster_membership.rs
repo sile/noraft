@@ -4,10 +4,8 @@
 //! via the shared runner. CI therefore uses a fresh time-derived seed
 //! unless `NORAFT_PBT_SEED` is explicitly set for reproduction.
 
-pub mod pbt_harness;
-
 use noraft::{ClusterConfig, LogEntry, LogPosition, NodeId};
-use pbt_harness::{MinMax, TestCluster, TestNode, run_config, wait_until_terminal};
+use pbt::{MinMax, TestCluster, TestNode, run_config, wait_until_terminal};
 use std::cell::Cell;
 
 fn config_is_committed(cluster: &TestCluster, expected: &ClusterConfig) -> bool {

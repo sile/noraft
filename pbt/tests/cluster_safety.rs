@@ -5,12 +5,10 @@
 //! The oracle retains leaders and committed entries across the complete
 //! case so sequential violations cannot disappear with current state.
 
-pub mod pbt_harness;
-
 use noraft::{
     Action, ClusterConfig, Log, LogEntry, LogIndex, LogPosition, Message, Node, NodeId, Role, Term,
 };
-use pbt_harness::run_config;
+use pbt::run_config;
 use std::cell::Cell;
 use std::collections::{BTreeMap, VecDeque};
 use std::fmt;

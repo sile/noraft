@@ -1,9 +1,7 @@
 //! Model-based PBTs for noraft log APIs.
 
-pub mod pbt_harness;
-
 use noraft::{Log, LogEntries, LogEntry, LogIndex, LogPosition, Term};
-use pbt_harness::{run, sample_config, sample_len, sample_log_entry, sample_u64_before_max};
+use pbt::{run, sample_config, sample_len, sample_log_entry, sample_u64_before_max};
 
 fn sample_entries(ctx: &mut noprop::TestCaseContext, max_len: usize) -> LogEntries {
     let count = sample_len(ctx, max_len);
