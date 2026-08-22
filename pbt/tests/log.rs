@@ -1,33 +1,36 @@
 //! Model-based PBTs for noraft log APIs.
 
-use noraft::{Log, LogEntries, LogEntry, LogIndex, LogPosition, Term};
-use pbt::{run, sample_config, sample_len, sample_log_entry, sample_u64_before_max};
-
-fn sample_entries(ctx: &mut noprop::TestCaseContext, max_len: usize) -> LogEntries {
-    let count = sample_len(ctx, max_len);
-    LogEntries::from_iter(LogPosition::ZERO, (0..count).map(|_| sample_log_entry(ctx)))
+fn sample_entries(ctx: &mut noprop::TestCaseContext, max_len: usize) -> noraft::LogEntries {
+    let count = pbt::sample_len(ctx, max_len);
+    noraft::LogEntries::from_iter(
+        noraft::LogPosition::ZERO,
+        (0..count).map(|_| pbt::sample_log_entry(ctx)),
+    )
 }
 
 fn sample_entries_from(
     ctx: &mut noprop::TestCaseContext,
-    prev_position: LogPosition,
+    prev_position: noraft::LogPosition,
     max_len: usize,
-) -> LogEntries {
-    let count = sample_len(ctx, max_len);
-    LogEntries::from_iter(prev_position, (0..count).map(|_| sample_log_entry(ctx)))
+) -> noraft::LogEntries {
+    let count = pbt::sample_len(ctx, max_len);
+    noraft::LogEntries::from_iter(
+        prev_position,
+        (0..count).map(|_| pbt::sample_log_entry(ctx)),
+    )
 }
 
 fn sample_contained_position(
     ctx: &mut noprop::TestCaseContext,
-    entries: &LogEntries,
-) -> LogPosition {
+    entries: &noraft::LogEntries,
+) -> noraft::LogPosition {
     let prev = entries.prev_position();
     let last = entries.last_position();
-    let index = LogIndex::new(noprop::sample_usize_in(
+    let index = noraft::LogIndex::new(noprop::sample_usize_in(
         ctx,
         prev.index.get() as usize..=last.index.get() as usize,
     ) as u64);
-    LogPosition::new(
+    noraft::LogPosition::new(
         entries
             .get_term(index)
             .expect("a sampled contained index must have a term"),
@@ -35,19 +38,19 @@ fn sample_contained_position(
     )
 }
 
-fn different_term(term: Term) -> Term {
+fn different_term(term: noraft::Term) -> noraft::Term {
     if term.get() == u64::MAX {
-        Term::ZERO
+        noraft::Term::ZERO
     } else {
-        Term::new(term.get() + 1)
+        noraft::Term::new(term.get() + 1)
     }
 }
 
-/// Sampler for [`LogIndex`] that stresses both the ZERO and `u64::MAX`
+/// Sampler for [`noraft::LogIndex`] that stresses both the ZERO and `u64::MAX`
 /// boundaries, so property tests exercise the `None` branches of the
 /// checked operators.
-fn sample_log_index_full_range(ctx: &mut noprop::TestCaseContext) -> LogIndex {
-    LogIndex::new(noprop::sample_with_boundaries(
+fn sample_log_index_full_range(ctx: &mut noprop::TestCaseContext) -> noraft::LogIndex {
+    noraft::LogIndex::new(noprop::sample_with_boundaries(
         ctx,
         &[0, 1, u64::MAX - 1, u64::MAX],
         noprop::Ratio::one_nth(5),
@@ -59,9 +62,9 @@ fn sample_log_index_full_range(ctx: &mut noprop::TestCaseContext) -> LogIndex {
 /// describe the same entry sequence.
 #[test]
 fn log_entries_iteration_matches_indexed_lookup() -> noprop::TestResult {
-    run(1024, |ctx| {
+    pbt::run(1024, |ctx| {
         let entries = sample_entries(ctx, 64);
-        let iterated: Vec<(LogPosition, LogEntry)> = entries
+        let iterated: Vec<(noraft::LogPosition, noraft::LogEntry)> = entries
             .iter_with_positions()
             .map(|(position, entry)| (position, entry.clone()))
             .collect();
@@ -84,7 +87,7 @@ fn log_entries_iteration_matches_indexed_lookup() -> noprop::TestResult {
                 .into());
             }
             let expected_term = match entry {
-                LogEntry::Term(term) => *term,
+                noraft::LogEntry::Term(term) => *term,
                 _ => previous.term,
             };
             if position.term != expected_term {
@@ -116,9 +119,9 @@ fn log_entries_iteration_matches_indexed_lookup() -> noprop::TestResult {
 /// its entry values and final position.
 #[test]
 fn log_entries_truncate_matches_prefix_model() -> noprop::TestResult {
-    run(1024, |ctx| {
+    pbt::run(1024, |ctx| {
         let mut entries = sample_entries(ctx, 32);
-        let before: Vec<(LogPosition, LogEntry)> = entries
+        let before: Vec<(noraft::LogPosition, noraft::LogEntry)> = entries
             .iter_with_positions()
             .map(|(position, entry)| (position, entry.clone()))
             .collect();
@@ -135,7 +138,7 @@ fn log_entries_truncate_matches_prefix_model() -> noprop::TestResult {
             .map_or(entries.prev_position(), |(position, _)| *position);
 
         entries.truncate(len);
-        let actual: Vec<(LogPosition, LogEntry)> = entries
+        let actual: Vec<(noraft::LogPosition, noraft::LogEntry)> = entries
             .iter_with_positions()
             .map(|(position, entry)| (position, entry.clone()))
             .collect();
@@ -159,18 +162,18 @@ fn log_entries_truncate_matches_prefix_model() -> noprop::TestResult {
 /// reject the same index paired with a different term.
 #[test]
 fn log_entries_since_matches_suffix_model() -> noprop::TestResult {
-    run(1024, |ctx| {
+    pbt::run(1024, |ctx| {
         let entries = sample_entries(ctx, 32);
         let position = sample_contained_position(ctx, &entries);
         let suffix = entries
             .since(position)
             .ok_or_else(|| format!("since({position:?}) rejected a contained position"))?;
-        let expected: Vec<(LogPosition, LogEntry)> = entries
+        let expected: Vec<(noraft::LogPosition, noraft::LogEntry)> = entries
             .iter_with_positions()
             .filter(|(candidate, _)| candidate.index > position.index)
             .map(|(candidate, entry)| (candidate, entry.clone()))
             .collect();
-        let actual: Vec<(LogPosition, LogEntry)> = suffix
+        let actual: Vec<(noraft::LogPosition, noraft::LogEntry)> = suffix
             .iter_with_positions()
             .map(|(candidate, entry)| (candidate, entry.clone()))
             .collect();
@@ -191,7 +194,7 @@ fn log_entries_since_matches_suffix_model() -> noprop::TestResult {
             .into());
         }
 
-        let mismatched = LogPosition::new(different_term(position.term), position.index);
+        let mismatched = noraft::LogPosition::new(different_term(position.term), position.index);
         if entries.since(mismatched).is_some() {
             return Err(format!("since({mismatched:?}) accepted a mismatched term").into());
         }
@@ -203,9 +206,9 @@ fn log_entries_since_matches_suffix_model() -> noprop::TestResult {
 /// anchor leaves the complete log unchanged.
 #[test]
 fn log_append_suffix_matches_replacement_model() -> noprop::TestResult {
-    run(1024, |ctx| {
-        let snapshot_config = sample_config(ctx);
-        let original = Log::new(snapshot_config.clone(), sample_entries(ctx, 32));
+    pbt::run(1024, |ctx| {
+        let snapshot_config = pbt::sample_config(ctx);
+        let original = noraft::Log::new(snapshot_config.clone(), sample_entries(ctx, 32));
         let anchor = sample_contained_position(ctx, original.entries());
         let suffix = sample_entries_from(ctx, anchor, 16);
 
@@ -215,9 +218,9 @@ fn log_append_suffix_matches_replacement_model() -> noprop::TestResult {
             .take_while(|(position, _)| position.index <= anchor.index)
             .map(|(_, entry)| entry.clone())
             .chain(suffix.iter());
-        let expected = Log::new(
+        let expected = noraft::Log::new(
             snapshot_config,
-            LogEntries::from_iter(original.snapshot_position(), expected_entries),
+            noraft::LogEntries::from_iter(original.snapshot_position(), expected_entries),
         );
         let mut actual = original.clone();
         if !actual.append_suffix(&suffix) {
@@ -230,7 +233,8 @@ fn log_append_suffix_matches_replacement_model() -> noprop::TestResult {
             .into());
         }
 
-        let invalid_anchor = LogPosition::new(Term::ZERO, original.last_position().index.next());
+        let invalid_anchor =
+            noraft::LogPosition::new(noraft::Term::ZERO, original.last_position().index.next());
         let invalid_suffix = sample_entries_from(ctx, invalid_anchor, 16);
         let mut unchanged = original.clone();
         if unchanged.append_suffix(&invalid_suffix) || unchanged != original {
@@ -244,13 +248,13 @@ fn log_append_suffix_matches_replacement_model() -> noprop::TestResult {
 /// straightforward scan of the log.
 #[test]
 fn log_config_queries_match_scan_model() -> noprop::TestResult {
-    run(1024, |ctx| {
-        let snapshot_config = sample_config(ctx);
+    pbt::run(1024, |ctx| {
+        let snapshot_config = pbt::sample_config(ctx);
         let entries = sample_entries(ctx, 32);
-        let log = Log::new(snapshot_config.clone(), entries);
+        let log = noraft::Log::new(snapshot_config.clone(), entries);
         let mut latest = snapshot_config.clone();
         for (_, entry) in log.entries().iter_with_positions() {
-            if let LogEntry::ClusterConfig(config) = entry {
+            if let noraft::LogEntry::ClusterConfig(config) = entry {
                 latest = config.clone();
             }
         }
@@ -271,7 +275,7 @@ fn log_config_queries_match_scan_model() -> noprop::TestResult {
             if position.index > target.index {
                 break;
             }
-            if let LogEntry::ClusterConfig(config) = entry {
+            if let noraft::LogEntry::ClusterConfig(config) = entry {
                 expected_config = config.clone();
             }
         }
@@ -294,10 +298,10 @@ fn log_config_queries_match_scan_model() -> noprop::TestResult {
 
 #[test]
 fn log_position_next_advances_index_only() -> noprop::TestResult {
-    run(1024, |ctx| {
-        let term = Term::new(noprop::sample_u64(ctx));
-        let index = LogIndex::new(sample_u64_before_max(ctx));
-        let position = LogPosition::new(term, index);
+    pbt::run(1024, |ctx| {
+        let term = noraft::Term::new(noprop::sample_u64(ctx));
+        let index = noraft::LogIndex::new(pbt::sample_u64_before_max(ctx));
+        let position = noraft::LogPosition::new(term, index);
         let next = position.next();
         if next.index.get() != index.get() + 1 || next.term != term {
             return Err(format!("next({position:?}) returned {next:?}").into());
@@ -308,8 +312,8 @@ fn log_position_next_advances_index_only() -> noprop::TestResult {
 
 #[test]
 fn log_index_next_advances_by_one() -> noprop::TestResult {
-    run(1024, |ctx| {
-        let index = LogIndex::new(sample_u64_before_max(ctx));
+    pbt::run(1024, |ctx| {
+        let index = noraft::LogIndex::new(pbt::sample_u64_before_max(ctx));
         let next = index.next();
         if next.get() != index.get() + 1 {
             return Err(format!("next({index:?}) returned {next:?}").into());
@@ -318,14 +322,14 @@ fn log_index_next_advances_by_one() -> noprop::TestResult {
     })
 }
 
-/// `checked_next` must agree with `checked_add(LogIndex::new(1))` for every
+/// `checked_next` must agree with `checked_add(noraft::LogIndex::new(1))` for every
 /// input, including the `u64::MAX` boundary where both return `None`.
 #[test]
 fn log_index_checked_next_matches_checked_add_one() -> noprop::TestResult {
-    run(1024, |ctx| {
+    pbt::run(1024, |ctx| {
         let x = sample_log_index_full_range(ctx);
         let actual = x.checked_next();
-        let expected = x.checked_add(LogIndex::new(1));
+        let expected = x.checked_add(noraft::LogIndex::new(1));
         if actual != expected {
             return Err(format!(
                 "checked_next({x:?}) = {actual:?}, but checked_add(x, 1) = {expected:?}"
@@ -340,10 +344,10 @@ fn log_index_checked_next_matches_checked_add_one() -> noprop::TestResult {
 /// bit-for-bit, including the `None` branch.
 #[test]
 fn log_index_checked_add_matches_u64_and_is_commutative() -> noprop::TestResult {
-    run(1024, |ctx| {
+    pbt::run(1024, |ctx| {
         let a = sample_log_index_full_range(ctx);
         let b = sample_log_index_full_range(ctx);
-        let expected = a.get().checked_add(b.get()).map(LogIndex::new);
+        let expected = a.get().checked_add(b.get()).map(noraft::LogIndex::new);
         let ab = a.checked_add(b);
         if ab != expected {
             return Err(
@@ -366,10 +370,10 @@ fn log_index_checked_add_matches_u64_and_is_commutative() -> noprop::TestResult 
 /// `checked_add` whenever the subtraction succeeds.
 #[test]
 fn log_index_checked_sub_matches_u64_and_inverts_checked_add() -> noprop::TestResult {
-    run(1024, |ctx| {
+    pbt::run(1024, |ctx| {
         let a = sample_log_index_full_range(ctx);
         let b = sample_log_index_full_range(ctx);
-        let expected = a.get().checked_sub(b.get()).map(LogIndex::new);
+        let expected = a.get().checked_sub(b.get()).map(noraft::LogIndex::new);
         let actual = a.checked_sub(b);
         if actual != expected {
             return Err(
@@ -389,16 +393,18 @@ fn log_index_checked_sub_matches_u64_and_inverts_checked_add() -> noprop::TestRe
     })
 }
 
-/// `LogPosition::checked_next` must advance only the index (leaving the
+/// `noraft::LogPosition::checked_next` must advance only the index (leaving the
 /// term untouched) and return `None` exactly when the index would overflow.
 #[test]
 fn log_position_checked_next_advances_index_only_or_returns_none() -> noprop::TestResult {
-    run(1024, |ctx| {
-        let term = Term::new(noprop::sample_u64(ctx));
+    pbt::run(1024, |ctx| {
+        let term = noraft::Term::new(noprop::sample_u64(ctx));
         let index = sample_log_index_full_range(ctx);
-        let position = LogPosition::new(term, index);
+        let position = noraft::LogPosition::new(term, index);
         let actual = position.checked_next();
-        let expected = index.checked_next().map(|i| LogPosition::new(term, i));
+        let expected = index
+            .checked_next()
+            .map(|i| noraft::LogPosition::new(term, i));
         if actual != expected {
             return Err(
                 format!("checked_next({position:?}) = {actual:?}, expected {expected:?}").into(),

@@ -1,36 +1,34 @@
 //! Model-based PBTs for noraft cluster configurations.
 
-use noraft::{ClusterConfig, NodeId};
-use pbt::{run, sample_config, sample_normal_config};
 use std::collections::BTreeSet;
 
 /// `unique_nodes` is the sorted set union, including configurations
 /// where voter sets overlap during joint consensus.
 #[test]
 fn cluster_config_unique_nodes_matches_set_union() -> noprop::TestResult {
-    run(1024, |ctx| {
-        let empty = ClusterConfig::new();
+    pbt::run(1024, |ctx| {
+        let empty = noraft::ClusterConfig::new();
         if empty.unique_nodes().next().is_some() {
             return Err("an empty config yielded a node".into());
         }
 
-        let mut config = sample_config(ctx);
-        let joint_overlap = NodeId::new(100);
+        let mut config = pbt::sample_config(ctx);
+        let joint_overlap = noraft::NodeId::new(100);
         config.voters.insert(joint_overlap);
         config.new_voters.insert(joint_overlap);
-        let three_way_overlap = NodeId::new(101);
+        let three_way_overlap = noraft::NodeId::new(101);
         config.voters.insert(three_way_overlap);
         config.new_voters.insert(three_way_overlap);
         config.non_voters.insert(three_way_overlap);
 
-        let expected: BTreeSet<NodeId> = config
+        let expected: BTreeSet<noraft::NodeId> = config
             .voters
             .iter()
             .chain(&config.new_voters)
             .chain(&config.non_voters)
             .copied()
             .collect();
-        let actual: Vec<NodeId> = config.unique_nodes().collect();
+        let actual: Vec<noraft::NodeId> = config.unique_nodes().collect();
         if actual != expected.iter().copied().collect::<Vec<_>>() {
             return Err(format!("unique_nodes returned {actual:?}, expected {expected:?}").into());
         }
@@ -49,21 +47,21 @@ fn cluster_config_unique_nodes_matches_set_union() -> noprop::TestResult {
 /// `to_joint_consensus` keeps the old voters, computes the new voters
 /// as `(old + additions) - removals`, and strips any promoted node
 /// from `non_voters` so the result satisfies the disjointness
-/// precondition of `Node::propose_config`.
+/// precondition of `noraft::Node::propose_config`.
 #[test]
 fn cluster_config_to_joint_consensus_matches_set_model() -> noprop::TestResult {
-    run(1024, |ctx| {
-        let base = sample_normal_config(ctx);
+    pbt::run(1024, |ctx| {
+        let base = pbt::sample_normal_config(ctx);
         let before = base.clone();
         // Mix fresh ids with existing non-voters so the sampler also
         // exercises the promote-existing-non-voter branch.
-        let mut addition_pool: Vec<NodeId> = (100..104).map(NodeId::new).collect();
+        let mut addition_pool: Vec<noraft::NodeId> = (100..104).map(noraft::NodeId::new).collect();
         addition_pool.extend(base.non_voters.iter().copied());
-        let additions: Vec<NodeId> = addition_pool
+        let additions: Vec<noraft::NodeId> = addition_pool
             .into_iter()
             .filter(|_| noprop::sample_bool(ctx))
             .collect();
-        let removals: Vec<NodeId> = base
+        let removals: Vec<noraft::NodeId> = base
             .voters
             .iter()
             .copied()

@@ -4,26 +4,27 @@
 //! via the shared runner. CI therefore uses a fresh time-derived seed
 //! unless `NORAFT_PBT_SEED` is explicitly set for reproduction.
 
-use noraft::{LogPosition, NodeId};
-use pbt::{MinMax, TestCluster, assert_all_terminal, run};
-
 /// Command proposals commit while a node periodically restarts, and
 /// the run must exercise at least one restart.
 #[test]
 fn proposals_commit_across_node_restarts() -> noprop::TestResult {
-    run(32, |ctx| {
-        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
-        let mut cluster = TestCluster::new(&node_ids);
+    pbt::run(32, |ctx| {
+        let node_ids = [
+            noraft::NodeId::new(0),
+            noraft::NodeId::new(1),
+            noraft::NodeId::new(2),
+        ];
+        let mut cluster = pbt::TestCluster::new(&node_ids);
 
-        // Node 0 stops and restarts periodically with the same slow
+        // noraft::Node 0 stops and restarts periodically with the same slow
         // cadence as the original scenario test: while it is down,
         // the remaining two voters can still elect a leader and
         // commit, so the cluster keeps making progress.
-        cluster.nodes[0].options.running_ticks = MinMax::new(800, 5000);
-        cluster.nodes[0].options.stopping_ticks = MinMax::new(800, 5000);
+        cluster.nodes[0].options.running_ticks = pbt::MinMax::new(800, 5000);
+        cluster.nodes[0].options.stopping_ticks = pbt::MinMax::new(800, 5000);
 
         let position = cluster.random_node_mut(ctx).create_cluster(&node_ids);
-        assert_ne!(position, LogPosition::INVALID);
+        assert_ne!(position, noraft::LogPosition::INVALID);
         let satisfied = cluster.run_until(ctx, cluster.clock.after(10_000), |cluster| {
             cluster.leader_node().is_some()
         });
@@ -39,7 +40,7 @@ fn proposals_commit_across_node_restarts() -> noprop::TestResult {
                 unreachable!();
             };
             before_restart_positions.push(leader.propose_command());
-            let ticks = MinMax::new(1, 10).sample(ctx);
+            let ticks = pbt::MinMax::new(1, 10).sample(ctx);
             cluster.run(ctx, cluster.clock.after(ticks));
         }
 
@@ -67,7 +68,7 @@ fn proposals_commit_across_node_restarts() -> noprop::TestResult {
                 unreachable!();
             };
             after_restart_positions.push(leader.propose_command());
-            let ticks = MinMax::new(1, 10).sample(ctx);
+            let ticks = pbt::MinMax::new(1, 10).sample(ctx);
             cluster.run(ctx, cluster.clock.after(ticks));
         }
 
@@ -76,9 +77,9 @@ fn proposals_commit_across_node_restarts() -> noprop::TestResult {
         // `Rejected` status is legitimate here. The liveness claim is
         // that every proposal settles and the cluster keeps
         // committing while node 0 restarts.
-        assert_all_terminal(&mut cluster, ctx, &before_restart_positions, true, false)?;
+        pbt::assert_all_terminal(&mut cluster, ctx, &before_restart_positions, true, false)?;
         let committed_after_restart =
-            assert_all_terminal(&mut cluster, ctx, &after_restart_positions, true, false)?;
+            pbt::assert_all_terminal(&mut cluster, ctx, &after_restart_positions, true, false)?;
         if committed_after_restart == 0 {
             return Err("no post-restart proposal committed".into());
         }
@@ -100,12 +101,16 @@ fn proposals_commit_across_node_restarts() -> noprop::TestResult {
 /// new-leader position commits, and the commit indices converge.
 #[test]
 fn divergent_logs_reconcile() -> noprop::TestResult {
-    run(16, |ctx| {
-        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
-        let mut cluster = TestCluster::new(&node_ids);
+    pbt::run(16, |ctx| {
+        let node_ids = [
+            noraft::NodeId::new(0),
+            noraft::NodeId::new(1),
+            noraft::NodeId::new(2),
+        ];
+        let mut cluster = pbt::TestCluster::new(&node_ids);
 
         let position = cluster.random_node_mut(ctx).create_cluster(&node_ids);
-        assert_ne!(position, LogPosition::INVALID);
+        assert_ne!(position, noraft::LogPosition::INVALID);
         let satisfied = cluster.run_until(ctx, cluster.clock.after(10_000), |cluster| {
             cluster.leader_node().is_some()
         });
@@ -125,7 +130,7 @@ fn divergent_logs_reconcile() -> noprop::TestResult {
                 unreachable!();
             };
             before_isolation_positions.push(leader.propose_command());
-            let ticks = MinMax::new(1, 10).sample(ctx);
+            let ticks = pbt::MinMax::new(1, 10).sample(ctx);
             cluster.run(ctx, cluster.clock.after(ticks));
         }
 
@@ -164,7 +169,7 @@ fn divergent_logs_reconcile() -> noprop::TestResult {
                 unreachable!();
             };
             new_leader_positions.push(leader.propose_command());
-            let ticks = MinMax::new(1, 10).sample(ctx);
+            let ticks = pbt::MinMax::new(1, 10).sample(ctx);
             cluster.run(ctx, cluster.clock.after(ticks));
         }
 
@@ -175,10 +180,10 @@ fn divergent_logs_reconcile() -> noprop::TestResult {
         // after the rejoin, so a terminal `Rejected` status is
         // legitimate here; the liveness claim is that the cluster
         // recovers and keeps committing.
-        assert_all_terminal(&mut cluster, ctx, &before_isolation_positions, true, false)?;
-        assert_all_terminal(&mut cluster, ctx, &isolated_leader_positions, true, false)?;
+        pbt::assert_all_terminal(&mut cluster, ctx, &before_isolation_positions, true, false)?;
+        pbt::assert_all_terminal(&mut cluster, ctx, &isolated_leader_positions, true, false)?;
         let committed_by_new_leader =
-            assert_all_terminal(&mut cluster, ctx, &new_leader_positions, true, false)?;
+            pbt::assert_all_terminal(&mut cluster, ctx, &new_leader_positions, true, false)?;
         if committed_by_new_leader == 0 {
             return Err("the newly elected leader committed no proposal".into());
         }

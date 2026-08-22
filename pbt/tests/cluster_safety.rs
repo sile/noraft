@@ -5,10 +5,6 @@
 //! The oracle retains leaders and committed entries across the complete
 //! case so sequential violations cannot disappear with current state.
 
-use noraft::{
-    Action, ClusterConfig, Log, LogEntry, LogIndex, LogPosition, Message, Node, NodeId, Role, Term,
-};
-use pbt::run_config;
 use std::cell::Cell;
 use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
@@ -18,18 +14,18 @@ const MAX_STEPS: usize = 200;
 
 #[derive(Debug, Clone, Copy)]
 enum Cmd {
-    TickElection(NodeId),
-    DeliverNext(NodeId),
-    DuplicateNext(NodeId),
-    DropNext(NodeId),
-    Crash(NodeId),
-    Restart(NodeId),
-    Propose(NodeId),
-    TakeSnapshot(NodeId),
-    DeliverSnapshot(NodeId),
-    DuplicateSnapshot(NodeId),
-    DropSnapshot(NodeId),
-    PersistStorage(NodeId),
+    TickElection(noraft::NodeId),
+    DeliverNext(noraft::NodeId),
+    DuplicateNext(noraft::NodeId),
+    DropNext(noraft::NodeId),
+    Crash(noraft::NodeId),
+    Restart(noraft::NodeId),
+    Propose(noraft::NodeId),
+    TakeSnapshot(noraft::NodeId),
+    DeliverSnapshot(noraft::NodeId),
+    DuplicateSnapshot(noraft::NodeId),
+    DropSnapshot(noraft::NodeId),
+    PersistStorage(noraft::NodeId),
 }
 
 impl fmt::Display for Cmd {
@@ -68,17 +64,17 @@ enum CmdKind {
     PersistStorage,
 }
 
-/// Test-only durable snapshot mirroring the three inputs `Node::restart`
+/// Test-only durable snapshot mirroring the three inputs `noraft::Node::restart`
 /// requires (`current_term`, `voted_for`, `log`).
 #[derive(Debug, Clone)]
 struct DurableSnapshot {
-    term: Term,
-    voted_for: Option<NodeId>,
-    log: Log,
+    term: noraft::Term,
+    voted_for: Option<noraft::NodeId>,
+    log: noraft::Log,
 }
 
 impl DurableSnapshot {
-    fn from_node(node: &Node) -> Self {
+    fn from_node(node: &noraft::Node) -> Self {
         Self {
             term: node.current_term(),
             voted_for: node.voted_for(),
@@ -93,7 +89,7 @@ impl DurableSnapshot {
 /// while `pending_storage` exists is buffered here and released at the
 /// same time.
 ///
-/// `outbound_snapshots` carries the `(LogPosition, ClusterConfig)`
+/// `outbound_snapshots` carries the `(noraft::LogPosition, noraft::ClusterConfig)`
 /// live on the source node at hold time. Reading them at release time
 /// instead would deliver a boundary the source never asked the user
 /// to send, because `Cmd::TakeSnapshot` on the same node can advance
@@ -101,8 +97,8 @@ impl DurableSnapshot {
 #[derive(Debug)]
 struct PendingStorage {
     target: DurableSnapshot,
-    outbound_messages: Vec<(NodeId, Message)>,
-    outbound_snapshots: Vec<(NodeId, LogPosition, ClusterConfig)>,
+    outbound_messages: Vec<(noraft::NodeId, noraft::Message)>,
+    outbound_snapshots: Vec<(noraft::NodeId, noraft::LogPosition, noraft::ClusterConfig)>,
 }
 
 impl PendingStorage {
@@ -120,27 +116,28 @@ struct CrashedNode {
 }
 
 struct Cluster {
-    nodes: BTreeMap<NodeId, Node>,
-    queues: BTreeMap<NodeId, VecDeque<Message>>,
-    snapshot_queues: BTreeMap<NodeId, VecDeque<(LogPosition, ClusterConfig)>>,
-    crashed: BTreeMap<NodeId, CrashedNode>,
+    nodes: BTreeMap<noraft::NodeId, noraft::Node>,
+    queues: BTreeMap<noraft::NodeId, VecDeque<noraft::Message>>,
+    snapshot_queues:
+        BTreeMap<noraft::NodeId, VecDeque<(noraft::LogPosition, noraft::ClusterConfig)>>,
+    crashed: BTreeMap<noraft::NodeId, CrashedNode>,
     // Last state that has been fully persisted for each node. Restart
     // restores the node from here, and `Cmd::PersistStorage` refreshes
     // it from `pending_storage[id].target`.
-    durable_states: BTreeMap<NodeId, DurableSnapshot>,
+    durable_states: BTreeMap<noraft::NodeId, DurableSnapshot>,
     // In-flight storage transaction plus the outbound produced by the
     // same node while it is pending. Cleared on crash (with its held
     // outbound) or on `Cmd::PersistStorage` (with its held outbound
     // released into `queues` / `snapshot_queues`).
-    pending_storage: BTreeMap<NodeId, PendingStorage>,
+    pending_storage: BTreeMap<noraft::NodeId, PendingStorage>,
 }
 
 impl Cluster {
-    fn bootstrap(node_ids: &[NodeId]) -> Result<Self, String> {
-        let mut nodes: BTreeMap<NodeId, Node> = node_ids
+    fn bootstrap(node_ids: &[noraft::NodeId]) -> Result<Self, String> {
+        let mut nodes: BTreeMap<noraft::NodeId, noraft::Node> = node_ids
             .iter()
             .copied()
-            .map(|id| (id, Node::start(id)))
+            .map(|id| (id, noraft::Node::start(id)))
             .collect();
         let queues = node_ids
             .iter()
@@ -152,11 +149,11 @@ impl Cluster {
             .copied()
             .map(|id| (id, VecDeque::new()))
             .collect();
-        // Seed each node's initial durable state from `Node::start`. The
+        // Seed each node's initial durable state from `noraft::Node::start`. The
         // bootstrap node's `create_cluster` below extends its live log
         // and the follow-up `drain_actions` + explicit persist stashes
         // that extension into `durable_states[bootstrap_id]`.
-        let durable_states: BTreeMap<NodeId, DurableSnapshot> = nodes
+        let durable_states: BTreeMap<noraft::NodeId, DurableSnapshot> = nodes
             .iter()
             .map(|(id, node)| (*id, DurableSnapshot::from_node(node)))
             .collect();
@@ -167,7 +164,7 @@ impl Cluster {
             .get_mut(&bootstrap_id)
             .expect("the bootstrap node was inserted")
             .create_cluster(node_ids);
-        if position == LogPosition::INVALID {
+        if position == noraft::LogPosition::INVALID {
             return Err("cluster bootstrap returned an invalid position".into());
         }
 
@@ -188,16 +185,16 @@ impl Cluster {
         Ok(cluster)
     }
 
-    // Fold a successful `Node::handle_snapshot_installed` into the
+    // Fold a successful `noraft::Node::handle_snapshot_installed` into the
     // durable state so a subsequent crash preserves the boundary. The
     // API's precondition treats the snapshot as already persisted by
     // the user (`src/node.rs::Node::handle_snapshot_installed` /
-    // `Node::restart` doc), so mirroring the tick harness's behavior:
+    // `noraft::Node::restart` doc), so mirroring the tick harness's behavior:
     // `durable_states[id]` is updated atomically, and if a pending
     // transaction is in flight its target is refreshed to the same
     // post-install live state (the old target's log prefix has just
     // been superseded by the snapshot).
-    fn fold_snapshot_install_into_durable(&mut self, id: NodeId) {
+    fn fold_snapshot_install_into_durable(&mut self, id: noraft::NodeId) {
         let node = self
             .nodes
             .get(&id)
@@ -212,7 +209,7 @@ impl Cluster {
     // Commit `pending_storage[id]` into `durable_states[id]` and release
     // any outbound that was held for the transaction. No-op if no
     // pending exists. Used by bootstrap and by `Cmd::PersistStorage`.
-    fn persist_pending(&mut self, id: NodeId) {
+    fn persist_pending(&mut self, id: noraft::NodeId) {
         let Some(pending) = self.pending_storage.remove(&id) else {
             return;
         };
@@ -229,14 +226,14 @@ impl Cluster {
         }
     }
 
-    fn drain_actions(&mut self, id: NodeId) -> Result<(), String> {
-        let peers: Vec<NodeId> = self
+    fn drain_actions(&mut self, id: noraft::NodeId) -> Result<(), String> {
+        let peers: Vec<noraft::NodeId> = self
             .nodes
             .get(&id)
             .ok_or_else(|| format!("node {} is not running", u64::from(id)))?
             .peers()
             .collect();
-        let actions: Vec<Action> = self
+        let actions: Vec<noraft::Action> = self
             .nodes
             .get_mut(&id)
             .expect("the node was checked above")
@@ -245,13 +242,15 @@ impl Cluster {
 
         // Update or open a pending storage transaction if any storage
         // action is present in this batch. The transaction target always
-        // reflects the latest live Node state, so subsequent commands
+        // reflects the latest live noraft::Node state, so subsequent commands
         // that add more storage without a `Cmd::PersistStorage` in
         // between naturally accumulate into the same transaction.
         let has_storage_action = actions.iter().any(|a| {
             matches!(
                 a,
-                Action::SaveCurrentTerm | Action::SaveVotedFor | Action::AppendLogEntries(_)
+                noraft::Action::SaveCurrentTerm
+                    | noraft::Action::SaveVotedFor
+                    | noraft::Action::AppendLogEntries(_)
             )
         });
         if has_storage_action {
@@ -277,15 +276,15 @@ impl Cluster {
 
         for action in actions {
             match action {
-                Action::SetElectionTimeout
-                | Action::SaveCurrentTerm
-                | Action::SaveVotedFor
-                | Action::AppendLogEntries(_) => {
+                noraft::Action::SetElectionTimeout
+                | noraft::Action::SaveCurrentTerm
+                | noraft::Action::SaveVotedFor
+                | noraft::Action::AppendLogEntries(_) => {
                     // Storage side is captured in `pending_storage`
                     // above; `SetElectionTimeout` has no bearing on
                     // durable state.
                 }
-                Action::BroadcastMessage(message) => {
+                noraft::Action::BroadcastMessage(message) => {
                     if holding {
                         let pending = self
                             .pending_storage
@@ -302,7 +301,7 @@ impl Cluster {
                         }
                     }
                 }
-                Action::SendMessage(to, message) => {
+                noraft::Action::SendMessage(to, message) => {
                     if holding {
                         let pending = self
                             .pending_storage
@@ -313,7 +312,7 @@ impl Cluster {
                         queue.push_back(message);
                     }
                 }
-                Action::InstallSnapshot(to) => {
+                noraft::Action::InstallSnapshot(to) => {
                     let (position, config) = {
                         let source = self
                             .nodes
@@ -339,40 +338,40 @@ impl Cluster {
         Ok(())
     }
 
-    fn running_ids(&self) -> Vec<NodeId> {
+    fn running_ids(&self) -> Vec<noraft::NodeId> {
         self.nodes.keys().copied().collect()
     }
 
-    fn crashed_ids(&self) -> Vec<NodeId> {
+    fn crashed_ids(&self) -> Vec<noraft::NodeId> {
         self.crashed.keys().copied().collect()
     }
 
-    fn queued_ids(&self) -> Vec<NodeId> {
+    fn queued_ids(&self) -> Vec<noraft::NodeId> {
         self.queues
             .iter()
             .filter_map(|(id, queue)| (!queue.is_empty()).then_some(*id))
             .collect()
     }
 
-    fn snapshot_queued_ids(&self) -> Vec<NodeId> {
+    fn snapshot_queued_ids(&self) -> Vec<noraft::NodeId> {
         self.snapshot_queues
             .iter()
             .filter_map(|(id, queue)| (!queue.is_empty()).then_some(*id))
             .collect()
     }
 
-    fn leader_ids(&self) -> Vec<NodeId> {
+    fn leader_ids(&self) -> Vec<noraft::NodeId> {
         self.nodes
             .iter()
-            .filter_map(|(id, node)| (node.role() == Role::Leader).then_some(*id))
+            .filter_map(|(id, node)| (node.role() == noraft::Role::Leader).then_some(*id))
             .collect()
     }
 
     // Nodes whose `commit_index` has advanced past their current snapshot
     // boundary. `TakeSnapshot` is only offered for these so the install
     // strictly advances `snapshot_position`, and the bootstrap-time
-    // `commit_index == snapshot_position == LogIndex::ZERO` case is excluded.
-    fn snapshot_takers(&self) -> Vec<NodeId> {
+    // `commit_index == snapshot_position == noraft::LogIndex::ZERO` case is excluded.
+    fn snapshot_takers(&self) -> Vec<noraft::NodeId> {
         self.nodes
             .iter()
             .filter_map(|(id, node)| {
@@ -381,7 +380,7 @@ impl Cluster {
             .collect()
     }
 
-    fn persist_pending_ids(&self) -> Vec<NodeId> {
+    fn persist_pending_ids(&self) -> Vec<noraft::NodeId> {
         self.pending_storage.keys().copied().collect()
     }
 
@@ -474,7 +473,7 @@ impl Cluster {
     }
 
     // Returns `Ok(true)` iff this command called
-    // `Node::handle_snapshot_installed` on a remote-transferred snapshot
+    // `noraft::Node::handle_snapshot_installed` on a remote-transferred snapshot
     // (`DeliverSnapshot` / `DuplicateSnapshot`) and got `true` back.
     // Every other command returns `Ok(false)` on success. Feeds
     // `cases_with_remote_snapshot_installed`.
@@ -557,7 +556,7 @@ impl Cluster {
                     .crashed
                     .remove(&id)
                     .expect("commands only select crashed nodes");
-                let node = Node::restart(
+                let node = noraft::Node::restart(
                     id,
                     state.durable.term,
                     state.durable.voted_for,
@@ -575,7 +574,7 @@ impl Cluster {
                     .get_mut(&id)
                     .expect("commands only select running leaders")
                     .propose_command();
-                if position == LogPosition::INVALID {
+                if position == noraft::LogPosition::INVALID {
                     return Err(format!(
                         "leader {} rejected a command proposal",
                         u64::from(id)
@@ -667,13 +666,14 @@ impl Cluster {
 
 #[derive(Default)]
 struct InvariantState {
-    leaders_by_term: BTreeMap<Term, NodeId>,
-    leader_logs: BTreeMap<(NodeId, Term), Vec<(LogPosition, LogEntry)>>,
+    leaders_by_term: BTreeMap<noraft::Term, noraft::NodeId>,
+    leader_logs:
+        BTreeMap<(noraft::NodeId, noraft::Term), Vec<(noraft::LogPosition, noraft::LogEntry)>>,
     // Position, entry value, and the term in which the commit was
     // first observed. The observation term matters for leader
     // completeness when an older-term entry is committed by a newer
     // leader.
-    committed: BTreeMap<LogIndex, (LogPosition, LogEntry, Term)>,
+    committed: BTreeMap<noraft::LogIndex, (noraft::LogPosition, noraft::LogEntry, noraft::Term)>,
     leader_with_committed_history_seen: bool,
     // Highest match_index observed per (leader, term) tenure, used by
     // `check_follower_match_index_monotonic` to detect within-tenure
@@ -681,14 +681,15 @@ struct InvariantState {
     // changes: a follower dropped from the configuration and later
     // re-added during the same tenure would legitimately reset its
     // match_index to 0 and trigger a false positive here.
-    follower_match_indexes: BTreeMap<(NodeId, Term), BTreeMap<NodeId, LogIndex>>,
-    // Term ever observed as a `snapshot_position.term` at a given index.
+    follower_match_indexes:
+        BTreeMap<(noraft::NodeId, noraft::Term), BTreeMap<noraft::NodeId, noraft::LogIndex>>,
+    // noraft::Term ever observed as a `snapshot_position.term` at a given index.
     // `check_snapshot_boundary_consistency` uses it to catch bugs that
     // corrupt the boundary term across time or across nodes; the per-step
     // `check_*` methods above never look at the boundary (`iter_with_positions`
     // skips it and the relaxed prefix comparisons intentionally stop at
     // `common_start`).
-    snapshot_boundary_terms: BTreeMap<LogIndex, Term>,
+    snapshot_boundary_terms: BTreeMap<noraft::LogIndex, noraft::Term>,
     // Set to `true` whenever `check_snapshot_boundary_consistency`
     // actually compared a boundary against another node's log or the
     // committed oracle (i.e. the cross-node / cross-time comparison
@@ -710,7 +711,7 @@ impl InvariantState {
 
     fn check_election_safety(&mut self, cluster: &Cluster) -> Result<(), String> {
         for (id, node) in &cluster.nodes {
-            if node.role() != Role::Leader {
+            if node.role() != noraft::Role::Leader {
                 continue;
             }
             let term = node.current_term();
@@ -729,18 +730,18 @@ impl InvariantState {
     }
 
     fn check_log_matching(&self, cluster: &Cluster) -> Result<(), String> {
-        let nodes: Vec<(&NodeId, &Node)> = cluster.nodes.iter().collect();
+        let nodes: Vec<(&noraft::NodeId, &noraft::Node)> = cluster.nodes.iter().collect();
         for left_index in 0..nodes.len() {
             for right_index in left_index + 1..nodes.len() {
                 let (left_id, left) = nodes[left_index];
                 let (right_id, right) = nodes[right_index];
-                let left_entries: Vec<(LogPosition, LogEntry)> = left
+                let left_entries: Vec<(noraft::LogPosition, noraft::LogEntry)> = left
                     .log()
                     .entries()
                     .iter_with_positions()
                     .map(|(position, entry)| (position, entry.clone()))
                     .collect();
-                let right_entries: Vec<(LogPosition, LogEntry)> = right
+                let right_entries: Vec<(noraft::LogPosition, noraft::LogEntry)> = right
                     .log()
                     .entries()
                     .iter_with_positions()
@@ -748,7 +749,7 @@ impl InvariantState {
                     .collect();
 
                 // The lower bound below which entries have been absorbed by
-                // one side's snapshot. Log matching is only meaningful
+                // one side's snapshot. noraft::Log matching is only meaningful
                 // strictly above this boundary: indices at or below can be
                 // present on the un-snapshotted side but gone on the other,
                 // which is not a violation.
@@ -794,11 +795,11 @@ impl InvariantState {
 
     fn check_leader_append_only(&mut self, cluster: &Cluster) -> Result<(), String> {
         for (id, node) in &cluster.nodes {
-            if node.role() != Role::Leader {
+            if node.role() != noraft::Role::Leader {
                 continue;
             }
             let key = (*id, node.current_term());
-            let current: Vec<(LogPosition, LogEntry)> = node
+            let current: Vec<(noraft::LogPosition, noraft::LogEntry)> = node
                 .log()
                 .entries()
                 .iter_with_positions()
@@ -809,7 +810,7 @@ impl InvariantState {
             // the portion strictly above the current snapshot boundary.
             let current_snapshot = node.log().snapshot_position().index;
             if let Some(previous) = self.leader_logs.get(&key) {
-                let previous_suffix: Vec<(LogPosition, LogEntry)> = previous
+                let previous_suffix: Vec<(noraft::LogPosition, noraft::LogEntry)> = previous
                     .iter()
                     .filter(|(position, _)| position.index > current_snapshot)
                     .cloned()
@@ -860,7 +861,7 @@ impl InvariantState {
 
     fn check_leader_completeness(&mut self, cluster: &Cluster) -> Result<(), String> {
         for (id, node) in &cluster.nodes {
-            if node.role() != Role::Leader {
+            if node.role() != noraft::Role::Leader {
                 continue;
             }
             if self
@@ -886,7 +887,7 @@ impl InvariantState {
                 }
                 let actual = node.log().entries().get_entry(*index).map(|entry| {
                     (
-                        LogPosition::new(
+                        noraft::LogPosition::new(
                             node.log()
                                 .entries()
                                 .get_term(*index)
@@ -917,7 +918,7 @@ impl InvariantState {
     // which bumps `current_term`.
     fn check_follower_match_index_monotonic(&mut self, cluster: &Cluster) -> Result<(), String> {
         for (leader_id, node) in &cluster.nodes {
-            if node.role() != Role::Leader {
+            if node.role() != noraft::Role::Leader {
                 continue;
             }
             let term = node.current_term();
@@ -956,7 +957,7 @@ impl InvariantState {
     fn check_snapshot_boundary_consistency(&mut self, cluster: &Cluster) -> Result<(), String> {
         for (id, node) in &cluster.nodes {
             let snap_pos = node.log().snapshot_position();
-            if snap_pos == LogPosition::ZERO {
+            if snap_pos == noraft::LogPosition::ZERO {
                 continue;
             }
             if let Some(previous_term) = self
@@ -1033,7 +1034,7 @@ fn sample_steps(ctx: &mut noprop::TestCaseContext) -> usize {
 
 /// The Raft election-safety, log-matching, leader-append-only,
 /// state-machine-safety, and leader-completeness properties, plus the
-/// within-tenure monotonicity of `Node::follower_match_index`, hold
+/// within-tenure monotonicity of `noraft::Node::follower_match_index`, hold
 /// after every state-dependent cluster command.
 #[test]
 fn cluster_invariants_hold() -> noprop::TestResult {
@@ -1042,7 +1043,7 @@ fn cluster_invariants_hold() -> noprop::TestResult {
     // needed to reliably exercise every coverage counter (in particular
     // `cases_with_snapshot_dropped` / `cases_with_remote_snapshot_installed`,
     // both of which depend on `snapshot_queued` being non-empty first).
-    let config = run_config(256)?;
+    let config = pbt::run_config(256)?;
     let cases_with_command_commit = Cell::new(0usize);
     let cases_with_leader_history = Cell::new(0usize);
     let cases_with_crash = Cell::new(0usize);
@@ -1060,7 +1061,7 @@ fn cluster_invariants_hold() -> noprop::TestResult {
 
     runner.run(config.cases, |ctx| {
         let node_count = noprop::sample_usize_in(ctx, 3..=5) as u64;
-        let node_ids: Vec<NodeId> = (0..node_count).map(NodeId::new).collect();
+        let node_ids: Vec<noraft::NodeId> = (0..node_count).map(noraft::NodeId::new).collect();
         let mut cluster = Cluster::bootstrap(&node_ids)?;
         let mut invariants = InvariantState::default();
         let mut history = Vec::new();
@@ -1100,7 +1101,7 @@ fn cluster_invariants_hold() -> noprop::TestResult {
             // `apply(Restart)` consumes the `CrashedNode` entry.
             if let Cmd::Restart(id) = command
                 && let Some(crashed_node) = cluster.crashed.get(&id)
-                && crashed_node.durable.log.snapshot_position().index != LogIndex::ZERO
+                && crashed_node.durable.log.snapshot_position().index != noraft::LogIndex::ZERO
             {
                 restart_after_snapshot_fold = true;
             }
@@ -1120,7 +1121,7 @@ fn cluster_invariants_hold() -> noprop::TestResult {
         if invariants
             .committed
             .values()
-            .any(|(_, entry, _)| matches!(entry, LogEntry::Command))
+            .any(|(_, entry, _)| matches!(entry, noraft::LogEntry::Command))
         {
             cases_with_command_commit.set(cases_with_command_commit.get() + 1);
         }

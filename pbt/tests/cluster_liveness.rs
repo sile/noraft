@@ -4,23 +4,24 @@
 //! via the shared runner. CI therefore uses a fresh time-derived seed
 //! unless `NORAFT_PBT_SEED` is explicitly set for reproduction.
 
-use noraft::{LogPosition, NodeId};
-use pbt::{MinMax, TestCluster, assert_all_terminal, run};
-
 /// Command proposals commit under stable links, the commit indices
 /// converge, and the leader does not change (term stays 1).
 #[test]
 fn proposals_commit_with_stable_links() -> noprop::TestResult {
-    run(64, |ctx| {
-        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
-        let mut cluster = TestCluster::new(&node_ids);
+    pbt::run(64, |ctx| {
+        let node_ids = [
+            noraft::NodeId::new(0),
+            noraft::NodeId::new(1),
+            noraft::NodeId::new(2),
+        ];
+        let mut cluster = pbt::TestCluster::new(&node_ids);
         // The harness default includes a 1% drop rate, which can delay
         // RequestVote and bump the term during bootstrap. This property
         // is specifically about leadership stability, so drops are off.
         cluster.default_link_options.drop_rate = noprop::Ratio::new(0, 1);
 
         let position = cluster.random_node_mut(ctx).create_cluster(&node_ids);
-        assert_ne!(position, LogPosition::INVALID);
+        assert_ne!(position, noraft::LogPosition::INVALID);
         let satisfied = cluster.run_until(ctx, cluster.clock.after(10_000), |cluster| {
             cluster.leader_node().is_some()
         });
@@ -35,11 +36,11 @@ fn proposals_commit_with_stable_links() -> noprop::TestResult {
                 return Err("leader disappeared".into());
             };
             positions.push(leader.propose_command());
-            let ticks = MinMax::new(1, 10).sample(ctx);
+            let ticks = pbt::MinMax::new(1, 10).sample(ctx);
             cluster.run(ctx, cluster.clock.after(ticks));
         }
 
-        let committed = assert_all_terminal(&mut cluster, ctx, &positions, false, false)?;
+        let committed = pbt::assert_all_terminal(&mut cluster, ctx, &positions, false, false)?;
         if committed != positions.len() {
             return Err("all proposals must commit".into());
         }
@@ -64,14 +65,18 @@ fn proposals_commit_with_stable_links() -> noprop::TestResult {
 /// (30% drop rate, 1-1000 tick latency).
 #[test]
 fn proposals_commit_with_unstable_links() -> noprop::TestResult {
-    run(32, |ctx| {
-        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
-        let mut cluster = TestCluster::new(&node_ids);
+    pbt::run(32, |ctx| {
+        let node_ids = [
+            noraft::NodeId::new(0),
+            noraft::NodeId::new(1),
+            noraft::NodeId::new(2),
+        ];
+        let mut cluster = pbt::TestCluster::new(&node_ids);
         cluster.default_link_options.drop_rate = noprop::Ratio::new(3, 10);
-        cluster.default_link_options.latency_ticks = MinMax::new(1, 1000);
+        cluster.default_link_options.latency_ticks = pbt::MinMax::new(1, 1000);
 
         let position = cluster.random_node_mut(ctx).create_cluster(&node_ids);
-        assert_ne!(position, LogPosition::INVALID);
+        assert_ne!(position, noraft::LogPosition::INVALID);
         let satisfied = cluster.run_until(ctx, cluster.clock.after(100_000), |cluster| {
             cluster.leader_node().is_some()
         });
@@ -90,11 +95,11 @@ fn proposals_commit_with_unstable_links() -> noprop::TestResult {
                 unreachable!();
             };
             positions.push(leader.propose_command());
-            let ticks = MinMax::new(1, 10).sample(ctx);
+            let ticks = pbt::MinMax::new(1, 10).sample(ctx);
             cluster.run(ctx, cluster.clock.after(ticks));
         }
 
-        let committed = assert_all_terminal(&mut cluster, ctx, &positions, false, false)?;
+        let committed = pbt::assert_all_terminal(&mut cluster, ctx, &positions, false, false)?;
         if committed != positions.len() {
             return Err("all proposals must commit".into());
         }
@@ -114,12 +119,16 @@ fn proposals_commit_with_unstable_links() -> noprop::TestResult {
 /// for the previous commit) and interleaved with heartbeats.
 #[test]
 fn proposals_commit_with_pipelining() -> noprop::TestResult {
-    run(32, |ctx| {
-        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
-        let mut cluster = TestCluster::new(&node_ids);
+    pbt::run(32, |ctx| {
+        let node_ids = [
+            noraft::NodeId::new(0),
+            noraft::NodeId::new(1),
+            noraft::NodeId::new(2),
+        ];
+        let mut cluster = pbt::TestCluster::new(&node_ids);
 
         let position = cluster.random_node_mut(ctx).create_cluster(&node_ids);
-        assert_ne!(position, LogPosition::INVALID);
+        assert_ne!(position, noraft::LogPosition::INVALID);
         let satisfied = cluster.run_until(ctx, cluster.clock.after(10_000), |cluster| {
             cluster.leader_node().is_some()
         });
@@ -155,12 +164,12 @@ fn proposals_commit_with_pipelining() -> noprop::TestResult {
             }
 
             if !pipeline {
-                let ticks = MinMax::new(0, 5).sample(ctx);
+                let ticks = pbt::MinMax::new(0, 5).sample(ctx);
                 cluster.run(ctx, cluster.clock.after(ticks));
             }
         }
 
-        let committed = assert_all_terminal(&mut cluster, ctx, &positions, false, false)?;
+        let committed = pbt::assert_all_terminal(&mut cluster, ctx, &positions, false, false)?;
         if committed != positions.len() {
             return Err("all proposals must commit".into());
         }

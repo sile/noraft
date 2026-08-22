@@ -4,11 +4,9 @@
 //! via the shared runner. CI therefore uses a fresh time-derived seed
 //! unless `NORAFT_PBT_SEED` is explicitly set for reproduction.
 
-use noraft::{ClusterConfig, LogEntry, LogPosition, NodeId};
-use pbt::{MinMax, TestCluster, TestNode, run_config, wait_until_terminal};
 use std::cell::Cell;
 
-fn config_is_committed(cluster: &TestCluster, expected: &ClusterConfig) -> bool {
+fn config_is_committed(cluster: &pbt::TestCluster, expected: &noraft::ClusterConfig) -> bool {
     if expected.is_joint_consensus() {
         return false;
     }
@@ -24,7 +22,7 @@ fn config_is_committed(cluster: &TestCluster, expected: &ClusterConfig) -> bool 
         let mut position = (node.inner.log().snapshot_config() == expected)
             .then_some(node.inner.log().snapshot_position());
         for (candidate, entry) in node.inner.log().entries().iter_with_positions() {
-            if matches!(entry, LogEntry::ClusterConfig(config) if config == *expected) {
+            if matches!(entry, noraft::LogEntry::ClusterConfig(config) if config == *expected) {
                 position = Some(candidate);
             }
         }
@@ -33,9 +31,9 @@ fn config_is_committed(cluster: &TestCluster, expected: &ClusterConfig) -> bool 
 }
 
 fn observed_config_status(
-    cluster: &TestCluster,
-    position: LogPosition,
-    expected: &ClusterConfig,
+    cluster: &pbt::TestCluster,
+    position: noraft::LogPosition,
+    expected: &noraft::ClusterConfig,
 ) -> Option<noraft::CommitStatus> {
     cluster
         .nodes
@@ -51,19 +49,23 @@ fn observed_config_status(
 /// least one config change.
 #[test]
 fn membership_changes_settle() -> noprop::TestResult {
-    let config = run_config(16)?;
+    let config = pbt::run_config(16)?;
     let seed = config.seed;
     let cases_with_change: Cell<usize> = Cell::new(0);
     let cases_with_commit: Cell<usize> = Cell::new(0);
 
     noprop::Runner::new(seed).run(config.cases, |ctx| {
-        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
-        let mut cluster = TestCluster::new(&node_ids);
+        let node_ids = [
+            noraft::NodeId::new(0),
+            noraft::NodeId::new(1),
+            noraft::NodeId::new(2),
+        ];
+        let mut cluster = pbt::TestCluster::new(&node_ids);
         cluster.default_link_options.drop_rate = noprop::Ratio::new(3, 10);
-        cluster.default_link_options.latency_ticks = MinMax::new(1, 1000);
+        cluster.default_link_options.latency_ticks = pbt::MinMax::new(1, 1000);
 
         let position = cluster.random_node_mut(ctx).create_cluster(&node_ids);
-        assert_ne!(position, LogPosition::INVALID);
+        assert_ne!(position, noraft::LogPosition::INVALID);
         let satisfied = cluster.run_until(ctx, cluster.clock.after(100_000), |cluster| {
             cluster.leader_node().is_some()
         });
@@ -76,7 +78,7 @@ fn membership_changes_settle() -> noprop::TestResult {
         for i in 0..rounds {
             // Wait for the previous configuration change to settle:
             // proposing the next change while the cluster is still in
-            // joint consensus returns `LogPosition::INVALID`.
+            // joint consensus returns `noraft::LogPosition::INVALID`.
             let settled = cluster.run_until(ctx, cluster.clock.after(1_000_000), |cluster| {
                 cluster
                     .leader_node()
@@ -88,9 +90,9 @@ fn membership_changes_settle() -> noprop::TestResult {
             let mut proposed_config = None;
             if noprop::sample_ratio(ctx, noprop::Ratio::new(7, 10)) {
                 // Add.
-                let node_id = NodeId::new(3 + i as u64);
+                let node_id = noraft::NodeId::new(3 + i as u64);
                 let voter = noprop::sample_ratio(ctx, noprop::Ratio::one_nth(2));
-                let mut node = TestNode::new(node_id);
+                let mut node = pbt::TestNode::new(node_id);
                 node.voter = voter;
                 cluster.nodes.push(node);
 
@@ -109,7 +111,7 @@ fn membership_changes_settle() -> noprop::TestResult {
                     expected.voters = std::mem::take(&mut expected.new_voters);
                 }
                 let position = leader.propose_config(new_config);
-                assert_ne!(position, LogPosition::INVALID);
+                assert_ne!(position, noraft::LogPosition::INVALID);
                 proposed_config = Some((position, expected, Some(node_id)));
             } else {
                 // Remove an actual member of the leader's current
@@ -119,7 +121,7 @@ fn membership_changes_settle() -> noprop::TestResult {
                 let Some(leader) = cluster.leader_node() else {
                     unreachable!();
                 };
-                let mut candidates: Vec<(NodeId, bool)> = leader
+                let mut candidates: Vec<(noraft::NodeId, bool)> = leader
                     .config()
                     .non_voters
                     .iter()
@@ -147,7 +149,7 @@ fn membership_changes_settle() -> noprop::TestResult {
                         expected.voters = std::mem::take(&mut expected.new_voters);
                     }
                     let position = leader.propose_config(new_config);
-                    assert_ne!(position, LogPosition::INVALID);
+                    assert_ne!(position, noraft::LogPosition::INVALID);
                     proposed_config = Some((position, expected, None));
                 }
             }
@@ -161,7 +163,7 @@ fn membership_changes_settle() -> noprop::TestResult {
                 cluster.run(ctx, cluster.clock.after(unstable_ticks));
                 let unstable_links = cluster.default_link_options.clone();
                 cluster.default_link_options.drop_rate = noprop::Ratio::new(0, 1);
-                cluster.default_link_options.latency_ticks = MinMax::new(1, 10);
+                cluster.default_link_options.latency_ticks = pbt::MinMax::new(1, 10);
 
                 let terminal = cluster.run_until(ctx, cluster.clock.after(1_000_000), |cluster| {
                     observed_config_status(cluster, position, &expected).is_some()
@@ -251,7 +253,7 @@ fn membership_changes_settle() -> noprop::TestResult {
                     unreachable!();
                 };
                 positions.push(leader.propose_command());
-                let ticks = MinMax::new(1, 10).sample(ctx);
+                let ticks = pbt::MinMax::new(1, 10).sample(ctx);
                 cluster.run(ctx, cluster.clock.after(ticks));
             }
 
@@ -261,7 +263,7 @@ fn membership_changes_settle() -> noprop::TestResult {
                 // network (e.g. a newly added voter that has not yet
                 // caught up); the liveness claim is that *some*
                 // command commits, not that every one does.
-                if let Some(status) = wait_until_terminal(&mut cluster, ctx, *position, 20_000)
+                if let Some(status) = pbt::wait_until_terminal(&mut cluster, ctx, *position, 20_000)
                     && status.is_committed()
                 {
                     total_committed += 1;

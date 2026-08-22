@@ -1,9 +1,5 @@
 //! Shared runner, generators, and tick-driven cluster harness for PBTs.
 
-use noprop::TestCaseContext;
-use noraft::{
-    ClusterConfig, CommitStatus, Log, LogEntry, LogPosition, Message, Node, NodeId, Role, Term,
-};
 use std::collections::BTreeMap;
 use std::io::{Error, ErrorKind};
 
@@ -56,7 +52,7 @@ pub fn run_config(default_cases: usize) -> noprop::TestResult<RunConfig> {
 /// Runs a property with a time-derived seed unless reproduction is requested.
 pub fn run<F>(default_cases: usize, property: F) -> noprop::TestResult
 where
-    F: Fn(&mut TestCaseContext) -> noprop::TestResult,
+    F: Fn(&mut noprop::TestCaseContext) -> noprop::TestResult,
 {
     let config = run_config(default_cases)?;
     noprop::Runner::new(config.seed).run(config.cases, property)?;
@@ -65,7 +61,7 @@ where
 
 /// Samples a bounded length while giving empty, singleton, and maximum
 /// lengths explicit probability.
-pub fn sample_len(ctx: &mut TestCaseContext, max: usize) -> usize {
+pub fn sample_len(ctx: &mut noprop::TestCaseContext, max: usize) -> usize {
     assert!(max >= 3, "sample_len requires max >= 3");
     noprop::sample_with_boundaries(ctx, &[0, 1, max], noprop::Ratio::one_nth(5), |ctx| {
         noprop::sample_usize_in(ctx, 2..max)
@@ -74,7 +70,7 @@ pub fn sample_len(ctx: &mut TestCaseContext, max: usize) -> usize {
 
 /// Samples every representable `u64` except `u64::MAX`, with extra
 /// weight on values relevant to `next()` boundary behavior.
-pub fn sample_u64_before_max(ctx: &mut TestCaseContext) -> u64 {
+pub fn sample_u64_before_max(ctx: &mut noprop::TestCaseContext) -> u64 {
     noprop::sample_with_boundaries(
         ctx,
         &[0, 1, u64::MAX - 1],
@@ -88,12 +84,12 @@ pub fn sample_u64_before_max(ctx: &mut TestCaseContext) -> u64 {
     )
 }
 
-/// Samples an arbitrary public `ClusterConfig`, including overlaps
+/// Samples an arbitrary public `noraft::ClusterConfig`, including overlaps
 /// between any of the three node sets.
-pub fn sample_config(ctx: &mut TestCaseContext) -> ClusterConfig {
-    let mut config = ClusterConfig::new();
+pub fn sample_config(ctx: &mut noprop::TestCaseContext) -> noraft::ClusterConfig {
+    let mut config = noraft::ClusterConfig::new();
     for value in 0..6 {
-        let id = NodeId::new(value);
+        let id = noraft::NodeId::new(value);
         let membership = noprop::sample_usize_in(ctx, 0..8);
         if membership & 1 != 0 {
             config.voters.insert(id);
@@ -110,10 +106,10 @@ pub fn sample_config(ctx: &mut TestCaseContext) -> ClusterConfig {
 
 /// Samples a non-joint configuration whose voters and non-voters are
 /// disjoint by construction.
-pub fn sample_normal_config(ctx: &mut TestCaseContext) -> ClusterConfig {
-    let mut config = ClusterConfig::new();
+pub fn sample_normal_config(ctx: &mut noprop::TestCaseContext) -> noraft::ClusterConfig {
+    let mut config = noraft::ClusterConfig::new();
     for value in 0..6 {
-        let id = NodeId::new(value);
+        let id = noraft::NodeId::new(value);
         match noprop::sample_usize_in(ctx, 0..3) {
             0 => {
                 config.voters.insert(id);
@@ -127,11 +123,11 @@ pub fn sample_normal_config(ctx: &mut TestCaseContext) -> ClusterConfig {
     config
 }
 
-pub fn sample_log_entry(ctx: &mut TestCaseContext) -> LogEntry {
+pub fn sample_log_entry(ctx: &mut noprop::TestCaseContext) -> noraft::LogEntry {
     match noprop::sample_weighted_index(ctx, &[3, 1, 1]) {
-        0 => LogEntry::Command,
-        1 => LogEntry::Term(Term::new(noprop::sample_u64(ctx))),
-        _ => LogEntry::ClusterConfig(sample_config(ctx)),
+        0 => noraft::LogEntry::Command,
+        1 => noraft::LogEntry::Term(noraft::Term::new(noprop::sample_u64(ctx))),
+        _ => noraft::LogEntry::ClusterConfig(sample_config(ctx)),
     }
 }
 
@@ -141,11 +137,11 @@ pub struct TestCluster {
     pub clock: Clock,
     pub default_link_options: TestLinkOptions,
     seqno: u64,
-    leaders_by_term: BTreeMap<Term, NodeId>,
+    leaders_by_term: BTreeMap<noraft::Term, noraft::NodeId>,
 }
 
 impl TestCluster {
-    pub fn new(node_ids: &[NodeId]) -> Self {
+    pub fn new(node_ids: &[noraft::NodeId]) -> Self {
         Self {
             nodes: node_ids.iter().map(|&id| TestNode::new(id)).collect(),
             clock: Clock::new(),
@@ -155,34 +151,43 @@ impl TestCluster {
         }
     }
 
-    pub fn leader_node(&self) -> Option<&Node> {
+    pub fn leader_node(&self) -> Option<&noraft::Node> {
         self.nodes
             .iter()
             .find(|node| node.running && node.inner.role().is_leader())
             .map(|node| &node.inner)
     }
 
-    pub fn leader_node_mut(&mut self) -> Option<&mut Node> {
+    pub fn leader_node_mut(&mut self) -> Option<&mut noraft::Node> {
         self.nodes
             .iter_mut()
             .find(|node| node.running && node.inner.role().is_leader())
             .map(|node| &mut node.inner)
     }
 
-    pub fn random_node_mut(&mut self, ctx: &mut TestCaseContext) -> &mut Node {
+    pub fn random_node_mut(&mut self, ctx: &mut noprop::TestCaseContext) -> &mut noraft::Node {
         let index = noprop::sample_usize_in(ctx, 0..self.nodes.len());
         &mut self.nodes[index].inner
     }
 
-    pub fn run_while_leader_absent(&mut self, ctx: &mut TestCaseContext, deadline: Clock) -> bool {
+    pub fn run_while_leader_absent(
+        &mut self,
+        ctx: &mut noprop::TestCaseContext,
+        deadline: Clock,
+    ) -> bool {
         self.run_until(ctx, deadline, |cluster| cluster.leader_node().is_some())
     }
 
-    pub fn run(&mut self, ctx: &mut TestCaseContext, deadline: Clock) {
+    pub fn run(&mut self, ctx: &mut noprop::TestCaseContext, deadline: Clock) {
         self.run_until(ctx, deadline, |_| false);
     }
 
-    pub fn run_until<F>(&mut self, ctx: &mut TestCaseContext, deadline: Clock, condition: F) -> bool
+    pub fn run_until<F>(
+        &mut self,
+        ctx: &mut noprop::TestCaseContext,
+        deadline: Clock,
+        condition: F,
+    ) -> bool
     where
         F: Fn(&TestCluster) -> bool,
     {
@@ -195,7 +200,7 @@ impl TestCluster {
         condition(self)
     }
 
-    pub fn run_tick(&mut self, ctx: &mut TestCaseContext) {
+    pub fn run_tick(&mut self, ctx: &mut noprop::TestCaseContext) {
         self.clock.tick();
         let mut messages = Vec::new();
         let mut snapshots = Vec::new();
@@ -273,10 +278,10 @@ impl TestCluster {
 
     fn send_message(
         &mut self,
-        ctx: &mut TestCaseContext,
-        _source: NodeId,
-        destination: NodeId,
-        message: Message,
+        ctx: &mut noprop::TestCaseContext,
+        _source: noraft::NodeId,
+        destination: noraft::NodeId,
+        message: noraft::Message,
     ) {
         let options = &self.default_link_options;
         if noprop::sample_ratio(ctx, options.drop_rate) {
@@ -296,11 +301,11 @@ impl TestCluster {
 
     fn send_snapshot(
         &mut self,
-        ctx: &mut TestCaseContext,
-        _source: NodeId,
-        destination: NodeId,
-        position: LogPosition,
-        config: ClusterConfig,
+        ctx: &mut noprop::TestCaseContext,
+        _source: noraft::NodeId,
+        destination: noraft::NodeId,
+        position: noraft::LogPosition,
+        config: noraft::ClusterConfig,
     ) {
         if noprop::sample_ratio(ctx, self.default_link_options.drop_rate) {
             return;
@@ -343,10 +348,10 @@ impl TestCluster {
 /// (committed / rejected / unknown), or the round budget is exhausted.
 pub fn wait_until_terminal(
     cluster: &mut TestCluster,
-    ctx: &mut TestCaseContext,
-    position: LogPosition,
+    ctx: &mut noprop::TestCaseContext,
+    position: noraft::LogPosition,
     max_rounds: usize,
-) -> Option<CommitStatus> {
+) -> Option<noraft::CommitStatus> {
     for _ in 0..max_rounds {
         let found = cluster.run_while_leader_absent(ctx, cluster.clock.after(100_000));
         if !found {
@@ -368,8 +373,8 @@ pub fn wait_until_terminal(
 /// returns the number that committed.
 pub fn assert_all_terminal(
     cluster: &mut TestCluster,
-    ctx: &mut TestCaseContext,
-    positions: &[LogPosition],
+    ctx: &mut noprop::TestCaseContext,
+    positions: &[noraft::LogPosition],
     allow_rejected: bool,
     allow_unknown: bool,
 ) -> Result<usize, String> {
@@ -390,12 +395,12 @@ pub fn assert_all_terminal(
     Ok(committed)
 }
 
-fn message_size(message: &Message) -> usize {
+fn message_size(message: &noraft::Message) -> usize {
     match message {
-        Message::AppendEntriesCall { entries, .. } => entries.len(),
-        Message::AppendEntriesReply { .. }
-        | Message::RequestVoteCall { .. }
-        | Message::RequestVoteReply { .. } => 1,
+        noraft::Message::AppendEntriesCall { entries, .. } => entries.len(),
+        noraft::Message::AppendEntriesReply { .. }
+        | noraft::Message::RequestVoteCall { .. }
+        | noraft::Message::RequestVoteReply { .. } => 1,
     }
 }
 
@@ -451,23 +456,23 @@ impl MinMax {
         Self::new(value, value)
     }
 
-    pub fn sample(self, ctx: &mut TestCaseContext) -> usize {
+    pub fn sample(self, ctx: &mut noprop::TestCaseContext) -> usize {
         noprop::sample_usize_in(ctx, self.min..=self.max)
     }
 }
 
-/// Test-only durable state snapshot: what `Node::restart` needs when a
+/// Test-only durable state snapshot: what `noraft::Node::restart` needs when a
 /// crashed node comes back. Mirrors the persistent-state contract in
 /// `src/node.rs::Node::restart`.
 #[derive(Debug, Clone)]
 struct DurableSnapshot {
-    current_term: Term,
-    voted_for: Option<NodeId>,
-    log: Log,
+    current_term: noraft::Term,
+    voted_for: Option<noraft::NodeId>,
+    log: noraft::Log,
 }
 
 impl DurableSnapshot {
-    fn from_node(node: &Node) -> Self {
+    fn from_node(node: &noraft::Node) -> Self {
         Self {
             current_term: node.current_term(),
             voted_for: node.voted_for(),
@@ -476,38 +481,38 @@ impl DurableSnapshot {
     }
 }
 
-/// Outbound produced by a `Node` while a storage transaction was in
+/// Outbound produced by a `noraft::Node` while a storage transaction was in
 /// flight. Held per node until the transaction commits, at which point
 /// `TestCluster::run_tick` moves it onto the delivery queues.
 ///
-/// `InstallSnapshot` carries the `(LogPosition, ClusterConfig)` that
+/// `InstallSnapshot` carries the `(noraft::LogPosition, noraft::ClusterConfig)` that
 /// were live on the source node at hold time. Reading them at release
 /// time instead would deliver a snapshot boundary the source never
-/// asked the user to send: a successful `Node::handle_snapshot_installed`
+/// asked the user to send: a successful `noraft::Node::handle_snapshot_installed`
 /// on the same source (folded into `durable` above) can advance
 /// `snapshot_position` while the transfer is still held.
 #[derive(Debug)]
 enum PendingOutbound {
-    Broadcast(Message),
-    Send(NodeId, Message),
-    InstallSnapshot(NodeId, LogPosition, ClusterConfig),
+    Broadcast(noraft::Message),
+    Send(noraft::NodeId, noraft::Message),
+    InstallSnapshot(noraft::NodeId, noraft::LogPosition, noraft::ClusterConfig),
 }
 
 #[derive(Debug)]
 pub struct TestNode {
-    pub inner: Node,
+    pub inner: noraft::Node,
     pub options: TestNodeOptions,
     pub voter: bool,
     running: bool,
     timeout_expire_time: Option<Clock>,
     storage_finish_time: Option<Clock>,
-    snapshot_finish_time: Option<(Clock, LogPosition, ClusterConfig)>,
-    incoming_messages: BTreeMap<(Clock, u64), Message>,
+    snapshot_finish_time: Option<(Clock, noraft::LogPosition, noraft::ClusterConfig)>,
+    incoming_messages: BTreeMap<(Clock, u64), noraft::Message>,
     stop_time: Option<Clock>,
     start_time: Option<Clock>,
     restarts: u64,
     // Last state that has been fully persisted. Restart restores the
-    // node from this snapshot, not from live `Node` state.
+    // node from this snapshot, not from live `noraft::Node` state.
     durable: DurableSnapshot,
     // In-flight storage transaction target. Set when a storage action
     // (`SaveCurrentTerm` / `SaveVotedFor` / `AppendLogEntries`) is added
@@ -521,8 +526,8 @@ pub struct TestNode {
 }
 
 impl TestNode {
-    pub fn new(id: NodeId) -> Self {
-        let inner = Node::start(id);
+    pub fn new(id: noraft::NodeId) -> Self {
+        let inner = noraft::Node::start(id);
         let durable = DurableSnapshot::from_node(&inner);
         Self {
             inner,
@@ -543,13 +548,13 @@ impl TestNode {
     }
 
     /// Monotonically increasing count of the times this node has been
-    /// restarted through `Node::restart` (excluding the initial `Node::start`
+    /// restarted through `noraft::Node::restart` (excluding the initial `noraft::Node::start`
     /// in `TestNode::new`).
     pub fn restarts(&self) -> u64 {
         self.restarts
     }
 
-    fn run_tick(&mut self, ctx: &mut TestCaseContext, now: Clock) {
+    fn run_tick(&mut self, ctx: &mut noprop::TestCaseContext, now: Clock) {
         if !self.voter {
             assert!(self.inner.role().is_follower());
         }
@@ -565,11 +570,11 @@ impl TestNode {
                     }
                 }
                 // Restore from the last committed durable snapshot, not
-                // from live `Node` state. This makes the harness respect
+                // from live `noraft::Node` state. This makes the harness respect
                 // the persistence contract: an unfinished write that was
                 // still in `pending_durable` at crash time is not
                 // resurrected.
-                self.inner = Node::restart(
+                self.inner = noraft::Node::restart(
                     self.inner.id(),
                     self.durable.current_term,
                     self.durable.voted_for,
@@ -621,8 +626,8 @@ impl TestNode {
             .snapshot_finish_time
             .take_if(|(time, _, _)| *time <= now)
         {
-            // `Node::handle_snapshot_installed` rejects snapshots whose
-            // term exceeds `current_term`. `Action::InstallSnapshot`
+            // `noraft::Node::handle_snapshot_installed` rejects snapshots whose
+            // term exceeds `current_term`. `noraft::Action::InstallSnapshot`
             // only fires from `handle_append_entries_reply`, which the
             // follower cannot reach before catching up to the leader's
             // term via a prior `AppendEntriesCall`. So by the time the
@@ -672,7 +677,7 @@ impl TestNode {
             generated_storage = true;
         }
         if generated_storage {
-            // Capture the current live `Node` state as the target of the
+            // Capture the current live `noraft::Node` state as the target of the
             // in-flight transaction. If more storage actions are added
             // in later ticks before `storage_finish_time` expires, the
             // target is refreshed each time so it always reflects the
@@ -681,16 +686,21 @@ impl TestNode {
         }
     }
 
-    fn reset_election_timeout(&mut self, ctx: &mut TestCaseContext, now: Clock) {
+    fn reset_election_timeout(&mut self, ctx: &mut noprop::TestCaseContext, now: Clock) {
         let timeout = match self.inner.role() {
-            Role::Leader => self.options.election_timeout_ticks.min,
-            Role::Candidate => self.options.election_timeout_ticks.sample(ctx),
-            Role::Follower => self.options.election_timeout_ticks.max,
+            noraft::Role::Leader => self.options.election_timeout_ticks.min,
+            noraft::Role::Candidate => self.options.election_timeout_ticks.sample(ctx),
+            noraft::Role::Follower => self.options.election_timeout_ticks.max,
         };
         self.timeout_expire_time = Some(now.after(timeout));
     }
 
-    fn extend_storage_finish_time(&mut self, ctx: &mut TestCaseContext, now: Clock, count: usize) {
+    fn extend_storage_finish_time(
+        &mut self,
+        ctx: &mut noprop::TestCaseContext,
+        now: Clock,
+        count: usize,
+    ) {
         let remaining_latency = self.storage_finish_time.map_or(0, |time| time.0 - now.0);
         let additional_latency = self.options.storage_latency_ticks.sample(ctx) * count;
         self.storage_finish_time = Some(now.after(remaining_latency + additional_latency));

@@ -1,10 +1,5 @@
 //! Stateful properties for valid single-node cluster transitions.
 
-use noraft::{
-    ClusterConfig, CommitStatus, LogIndex, LogPosition, Message, Node, NodeId, Role, Term,
-};
-use pbt::{run, sample_len};
-
 const MAX_STEPS: usize = 200;
 
 #[derive(Debug, Clone, Copy)]
@@ -24,19 +19,19 @@ fn sample_op(ctx: &mut noprop::TestCaseContext) -> Op {
     }
 }
 
-fn drain_actions(node: &mut Node) {
+fn drain_actions(node: &mut noraft::Node) {
     for _ in node.actions_mut() {}
 }
 
-fn advance_term(node: &mut Node) -> noprop::TestResult {
-    let requested_term = Term::new(node.current_term().get() + 1);
-    let request = Message::RequestVoteCall {
-        from: NodeId::new(1),
+fn advance_term(node: &mut noraft::Node) -> noprop::TestResult {
+    let requested_term = noraft::Term::new(node.current_term().get() + 1);
+    let request = noraft::Message::RequestVoteCall {
+        from: noraft::NodeId::new(1),
         term: requested_term,
         last_position: node.log().last_position(),
     };
     node.handle_message(&request)?;
-    if node.current_term() != requested_term || node.role() != Role::Follower {
+    if node.current_term() != requested_term || node.role() != noraft::Role::Follower {
         return Err(format!(
             "higher-term vote request did not produce a follower in {requested_term:?}: \
              term={:?}, role={:?}",
@@ -48,7 +43,7 @@ fn advance_term(node: &mut Node) -> noprop::TestResult {
     drain_actions(node);
 
     node.handle_election_timeout();
-    if node.current_term() <= requested_term || node.role() != Role::Leader {
+    if node.current_term() <= requested_term || node.role() != noraft::Role::Leader {
         return Err(format!(
             "solo follower did not win the next election: requested={requested_term:?}, \
              term={:?}, role={:?}",
@@ -61,10 +56,10 @@ fn advance_term(node: &mut Node) -> noprop::TestResult {
 }
 
 fn assert_monotonic_state(
-    node: &Node,
-    previous_term: Term,
-    previous_commit: LogIndex,
-    previous_last: LogIndex,
+    node: &noraft::Node,
+    previous_term: noraft::Term,
+    previous_commit: noraft::LogIndex,
+    previous_last: noraft::LogIndex,
     step: usize,
     op: Op,
 ) -> noprop::TestResult {
@@ -89,7 +84,7 @@ fn assert_monotonic_state(
         )
         .into());
     }
-    if node.role() != Role::Leader {
+    if node.role() != noraft::Role::Leader {
         return Err(format!("solo voter stopped being leader at step {step} after {op:?}").into());
     }
     Ok(())
@@ -100,11 +95,11 @@ fn assert_monotonic_state(
 /// and log position monotonically.
 #[test]
 fn solo_node_valid_transitions_preserve_invariants() -> noprop::TestResult {
-    run(512, |ctx| {
-        let id = NodeId::new(0);
-        let mut node = Node::start(id);
+    pbt::run(512, |ctx| {
+        let id = noraft::NodeId::new(0);
+        let mut node = noraft::Node::start(id);
         let cluster_position = node.create_cluster(&[id]);
-        if cluster_position == LogPosition::INVALID || node.role() != Role::Leader {
+        if cluster_position == noraft::LogPosition::INVALID || node.role() != noraft::Role::Leader {
             return Err("solo cluster creation did not produce a leader".into());
         }
         drain_actions(&mut node);
@@ -114,8 +109,8 @@ fn solo_node_valid_transitions_preserve_invariants() -> noprop::TestResult {
         // are deliberately not counted.
         let baseline_commit = node.commit_index();
         let position = node.propose_command();
-        if position == LogPosition::INVALID
-            || node.get_commit_status(position) != CommitStatus::Committed
+        if position == noraft::LogPosition::INVALID
+            || node.get_commit_status(position) != noraft::CommitStatus::Committed
             || node.commit_index() <= baseline_commit
         {
             return Err(format!(
@@ -133,7 +128,7 @@ fn solo_node_valid_transitions_preserve_invariants() -> noprop::TestResult {
         advance_term(&mut node)?;
         drain_actions(&mut node);
 
-        let steps = sample_len(ctx, MAX_STEPS);
+        let steps = pbt::sample_len(ctx, MAX_STEPS);
         let mut previous_term = node.current_term();
         let mut previous_commit = node.commit_index();
         let mut previous_last = node.log().last_position().index;
@@ -142,8 +137,8 @@ fn solo_node_valid_transitions_preserve_invariants() -> noprop::TestResult {
             match op {
                 Op::ProposeCommand => {
                     let position = node.propose_command();
-                    if position == LogPosition::INVALID
-                        || node.get_commit_status(position) != CommitStatus::Committed
+                    if position == noraft::LogPosition::INVALID
+                        || node.get_commit_status(position) != noraft::CommitStatus::Committed
                     {
                         return Err(format!(
                             "command proposal failed at step {step}: {position:?}, status={:?}",
@@ -153,10 +148,10 @@ fn solo_node_valid_transitions_preserve_invariants() -> noprop::TestResult {
                     }
                 }
                 Op::ProposeSameConfig => {
-                    let config: ClusterConfig = node.config().clone();
+                    let config: noraft::ClusterConfig = node.config().clone();
                     let position = node.propose_config(config);
-                    if position == LogPosition::INVALID
-                        || node.get_commit_status(position) != CommitStatus::Committed
+                    if position == noraft::LogPosition::INVALID
+                        || node.get_commit_status(position) != noraft::CommitStatus::Committed
                     {
                         return Err(format!(
                             "same-config proposal failed at step {step}: {position:?}, status={:?}",

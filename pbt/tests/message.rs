@@ -1,20 +1,19 @@
 //! Model-based PBTs for public message transport helpers.
 
-use noraft::{LogEntries, LogIndex, LogPosition, Message, NodeId, Term};
-use pbt::{run, sample_len, sample_log_entry};
-
 /// Stripping an AppendEntries prefix must preserve message metadata and
 /// produce the exact unsent suffix for every boundary-sized request.
 #[test]
 fn append_entries_prefix_stripping_matches_model() -> noprop::TestResult {
-    run(1024, |ctx| {
-        let count = sample_len(ctx, 64);
-        let prev_position = LogPosition {
-            term: Term::new(noprop::sample_u64(ctx)),
-            index: LogIndex::new(noprop::sample_usize_in(ctx, 0..=1024) as u64),
+    pbt::run(1024, |ctx| {
+        let count = pbt::sample_len(ctx, 64);
+        let prev_position = noraft::LogPosition {
+            term: noraft::Term::new(noprop::sample_u64(ctx)),
+            index: noraft::LogIndex::new(noprop::sample_usize_in(ctx, 0..=1024) as u64),
         };
-        let entries =
-            LogEntries::from_iter(prev_position, (0..count).map(|_| sample_log_entry(ctx)));
+        let entries = noraft::LogEntries::from_iter(
+            prev_position,
+            (0..count).map(|_| pbt::sample_log_entry(ctx)),
+        );
         let before: Vec<_> = entries.iter_with_positions().collect();
         let sent_count = noprop::sample_with_boundaries(
             ctx,
@@ -28,15 +27,15 @@ fn append_entries_prefix_stripping_matches_model() -> noprop::TestResult {
         } else {
             before[dropped - 1].0
         };
-        let expected_entries = LogEntries::from_iter(
+        let expected_entries = noraft::LogEntries::from_iter(
             expected_prev,
             before[dropped..].iter().map(|(_, entry)| entry.clone()),
         );
 
-        let from = NodeId::new(noprop::sample_u64(ctx));
-        let term = Term::new(noprop::sample_u64(ctx));
-        let commit_index = LogIndex::new(noprop::sample_u64(ctx));
-        let mut actual = Message::AppendEntriesCall {
+        let from = noraft::NodeId::new(noprop::sample_u64(ctx));
+        let term = noraft::Term::new(noprop::sample_u64(ctx));
+        let commit_index = noraft::LogIndex::new(noprop::sample_u64(ctx));
+        let mut actual = noraft::Message::AppendEntriesCall {
             from,
             term,
             commit_index,
@@ -45,7 +44,7 @@ fn append_entries_prefix_stripping_matches_model() -> noprop::TestResult {
         if !actual.strip_append_entries_prefix(sent_count) {
             return Err("AppendEntriesCall was not recognized".into());
         }
-        let expected = Message::AppendEntriesCall {
+        let expected = noraft::Message::AppendEntriesCall {
             from,
             term,
             commit_index,
@@ -59,7 +58,7 @@ fn append_entries_prefix_stripping_matches_model() -> noprop::TestResult {
             .into());
         }
 
-        let mut request_vote = Message::RequestVoteCall {
+        let mut request_vote = noraft::Message::RequestVoteCall {
             from,
             term,
             last_position: expected_prev,

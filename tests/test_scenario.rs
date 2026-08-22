@@ -1,7 +1,3 @@
-use noraft::{
-    Action, Actions, ClusterConfig, Error, Log, LogEntries, LogEntry, LogIndex, LogPosition,
-    Message, Node, NodeId, Role, Term,
-};
 use std::ops::{Deref, DerefMut};
 
 macro_rules! assert_no_action {
@@ -34,14 +30,14 @@ fn solo_voter_with_non_voter_yields_log_append_before_committed_broadcast() {
 
     let position = leader.propose_config(config);
 
-    assert_ne!(position, LogPosition::INVALID);
+    assert_ne!(position, noraft::LogPosition::INVALID);
     assert_eq!(leader.commit_index(), position.index);
 
     let actions: Vec<_> = leader.actions_mut().collect();
     let [
-        Action::SetElectionTimeout,
-        Action::AppendLogEntries(log_entries),
-        Action::BroadcastMessage(Message::AppendEntriesCall {
+        noraft::Action::SetElectionTimeout,
+        noraft::Action::AppendLogEntries(log_entries),
+        noraft::Action::BroadcastMessage(noraft::Message::AppendEntriesCall {
             commit_index,
             entries,
             ..
@@ -64,9 +60,9 @@ fn snapshot_preserves_pending_append_suffix_after_snapshot_position() {
     assert_eq!(leader.commit_index(), second_position.index);
     assert_eq!(
         leader.actions().append_log_entries.as_ref(),
-        Some(&LogEntries::from_iter(
+        Some(&noraft::LogEntries::from_iter(
             log_prev(first_position),
-            [LogEntry::Command, LogEntry::Command]
+            [noraft::LogEntry::Command, noraft::LogEntry::Command]
         ))
     );
 
@@ -80,7 +76,10 @@ fn snapshot_preserves_pending_append_suffix_after_snapshot_position() {
     assert_eq!(leader.log().entries().last_position(), second_position);
     assert_eq!(
         leader.actions().append_log_entries.as_ref(),
-        Some(&LogEntries::from_iter(first_position, [LogEntry::Command]))
+        Some(&noraft::LogEntries::from_iter(
+            first_position,
+            [noraft::LogEntry::Command]
+        ))
     );
 }
 
@@ -89,20 +88,23 @@ fn snapshot_discards_incompatible_pending_append_entries() {
     // `handle_snapshot_installed` rejects snapshots whose term exceeds
     // `current_term`, so mimic the caller precondition and restart the
     // node at the snapshot term.
-    let mut follower = Node::restart(
+    let mut follower = noraft::Node::restart(
         id(0),
         t(12),
         None,
-        Log::new(ClusterConfig::new(), LogEntries::new(LogPosition::ZERO)),
+        noraft::Log::new(
+            noraft::ClusterConfig::new(),
+            noraft::LogEntries::new(noraft::LogPosition::ZERO),
+        ),
     );
     while follower.actions_mut().next().is_some() {}
-    follower.actions_mut().append_log_entries = Some(LogEntries::from_iter(
+    follower.actions_mut().append_log_entries = Some(noraft::LogEntries::from_iter(
         log_pos(t(10), i(2)),
-        [LogEntry::Command],
+        [noraft::LogEntry::Command],
     ));
 
     let snapshot_position = log_pos(t(12), i(2));
-    assert!(follower.handle_snapshot_installed(snapshot_position, ClusterConfig::new()));
+    assert!(follower.handle_snapshot_installed(snapshot_position, noraft::ClusterConfig::new()));
 
     // A fresh follower starts at `commit_index == 0`; the install must
     // advance it to the snapshot boundary.
@@ -114,32 +116,32 @@ fn snapshot_discards_incompatible_pending_append_entries() {
 #[test]
 fn local_snapshot_mismatch_returns_error() {
     fn assert_error_trait<E: core::error::Error>() {}
-    assert_error_trait::<Error>();
+    assert_error_trait::<noraft::Error>();
     assert_eq!(
-        Error::LocalSnapshotMismatch.to_string(),
+        noraft::Error::LocalSnapshotMismatch.to_string(),
         "local snapshot position conflicts with leader log"
     );
 
     let snapshot_position = log_pos(t(1), i(5));
-    let log = Log::new(
-        ClusterConfig::new(),
-        LogEntries::from_iter(snapshot_position, [LogEntry::Command]),
+    let log = noraft::Log::new(
+        noraft::ClusterConfig::new(),
+        noraft::LogEntries::from_iter(snapshot_position, [noraft::LogEntry::Command]),
     );
-    let mut follower = Node::restart(id(0), t(2), Some(id(1)), log);
+    let mut follower = noraft::Node::restart(id(0), t(2), Some(id(1)), log);
     assert_action!(follower, set_election_timeout());
     assert_no_action!(follower);
 
     let original_log = follower.log().clone();
-    let call = Message::AppendEntriesCall {
+    let call = noraft::Message::AppendEntriesCall {
         from: id(1),
         term: t(2),
         commit_index: i(5),
-        entries: LogEntries::from_iter(log_pos(t(2), i(5)), [LogEntry::Command]),
+        entries: noraft::LogEntries::from_iter(log_pos(t(2), i(5)), [noraft::LogEntry::Command]),
     };
 
     assert_eq!(
         follower.handle_message(&call),
-        Err(Error::LocalSnapshotMismatch)
+        Err(noraft::Error::LocalSnapshotMismatch)
     );
     assert_eq!(follower.log(), &original_log);
     assert!(follower.actions().is_empty());
@@ -153,12 +155,12 @@ fn create_two_nodes_cluster() {
 
     // Setup cluster.
     node0.handle_election_timeout();
-    assert_eq!(node0.role(), Role::Candidate);
+    assert_eq!(node0.role(), noraft::Role::Candidate);
     assert_action!(node0, set_election_timeout());
     assert_action!(node0, save_current_term());
     assert_action!(node0, save_voted_for());
 
-    let Some(Action::BroadcastMessage(call @ Message::RequestVoteCall { .. })) =
+    let Some(noraft::Action::BroadcastMessage(call @ noraft::Message::RequestVoteCall { .. })) =
         node0.actions_mut().next()
     else {
         panic!("Expected RequestVoteCall message");
@@ -187,12 +189,12 @@ fn leader_commits_after_shrinking_to_self_only_voter() {
     let mut follower = TestNode::asserted_start(id(1), &[]);
 
     leader.handle_election_timeout();
-    assert_eq!(leader.role(), Role::Candidate);
+    assert_eq!(leader.role(), noraft::Role::Candidate);
     assert_action!(leader, set_election_timeout());
     assert_action!(leader, save_current_term());
     assert_action!(leader, save_voted_for());
 
-    let Some(Action::BroadcastMessage(call @ Message::RequestVoteCall { .. })) =
+    let Some(noraft::Action::BroadcastMessage(call @ noraft::Message::RequestVoteCall { .. })) =
         leader.actions_mut().next()
     else {
         panic!("Expected RequestVoteCall message");
@@ -233,7 +235,7 @@ fn leader_commits_after_shrinking_to_self_only_voter() {
     assert_eq!(leader.commit_index(), position.index);
     assert_action!(
         leader,
-        append_log_entry(log_prev(position), LogEntry::Command)
+        append_log_entry(log_prev(position), noraft::LogEntry::Command)
     );
     assert_action!(leader, set_election_timeout());
     assert_no_action!(leader);
@@ -252,7 +254,7 @@ fn create_three_nodes_cluster() {
 #[test]
 fn self_request_vote_call_is_ignored() {
     let mut node = TestNode::asserted_start(id(0), &[id(0), id(1)]);
-    assert_eq!(node.role(), Role::Candidate);
+    assert_eq!(node.role(), noraft::Role::Candidate);
 
     let prev_term = node.current_term();
     let prev_voted_for = node.voted_for();
@@ -274,8 +276,8 @@ fn self_request_vote_call_is_ignored() {
 
 #[test]
 fn could_be_disruptive_request_vote_true_when_high_term_request_vote_conflicts_with_voted_for() {
-    let base = Node::start(id(0));
-    let mut node = Node::restart(id(0), t(2), Some(id(1)), base.log().clone());
+    let base = noraft::Node::start(id(0));
+    let mut node = noraft::Node::restart(id(0), t(2), Some(id(1)), base.log().clone());
     assert_action!(node, set_election_timeout());
     assert_no_action!(node);
 
@@ -287,7 +289,7 @@ fn could_be_disruptive_request_vote_true_when_high_term_request_vote_conflicts_w
 #[test]
 fn could_be_disruptive_request_vote_false_for_candidate() {
     let node = TestNode::asserted_start(id(0), &[id(0), id(1), id(2)]);
-    assert_eq!(node.role(), Role::Candidate);
+    assert_eq!(node.role(), noraft::Role::Candidate);
 
     let msg = request_vote_call(
         next_term(node.current_term()),
@@ -299,16 +301,16 @@ fn could_be_disruptive_request_vote_false_for_candidate() {
 
 #[test]
 fn could_be_disruptive_request_vote_false_for_non_request_vote() {
-    let base = Node::start(id(0));
-    let mut node = Node::restart(id(0), t(2), Some(id(1)), base.log().clone());
+    let base = noraft::Node::start(id(0));
+    let mut node = noraft::Node::restart(id(0), t(2), Some(id(1)), base.log().clone());
     assert_action!(node, set_election_timeout());
     assert_no_action!(node);
 
-    let msg = Message::AppendEntriesCall {
+    let msg = noraft::Message::AppendEntriesCall {
         from: id(2),
         term: t(3),
         commit_index: node.commit_index(),
-        entries: LogEntries::new(node.log().entries().last_position()),
+        entries: noraft::LogEntries::new(node.log().entries().last_position()),
     };
     assert!(!node.could_be_disruptive_request_vote(&msg));
     assert_no_action!(node);
@@ -316,8 +318,8 @@ fn could_be_disruptive_request_vote_false_for_non_request_vote() {
 
 #[test]
 fn disruptive_request_vote_is_processed_without_prefilter() {
-    let base = Node::start(id(0));
-    let mut node = Node::restart(id(0), t(2), Some(id(1)), base.log().clone());
+    let base = noraft::Node::start(id(0));
+    let mut node = noraft::Node::restart(id(0), t(2), Some(id(1)), base.log().clone());
     assert_action!(node, set_election_timeout());
     assert_no_action!(node);
 
@@ -327,22 +329,30 @@ fn disruptive_request_vote_is_processed_without_prefilter() {
     node.handle_message(&msg)
         .expect("message handling should succeed");
 
-    assert_eq!(node.role(), Role::Follower);
+    assert_eq!(node.role(), noraft::Role::Follower);
     assert_eq!(node.current_term(), t(3));
     assert_eq!(node.voted_for(), Some(id(2)));
     let actions: Vec<_> = node.actions_mut().collect();
-    assert!(actions.iter().any(|a| matches!(a, Action::SaveCurrentTerm)));
-    assert!(actions.iter().any(|a| matches!(a, Action::SaveVotedFor)));
     assert!(
         actions
             .iter()
-            .any(|a| matches!(a, Action::SetElectionTimeout))
+            .any(|a| matches!(a, noraft::Action::SaveCurrentTerm))
+    );
+    assert!(
+        actions
+            .iter()
+            .any(|a| matches!(a, noraft::Action::SaveVotedFor))
+    );
+    assert!(
+        actions
+            .iter()
+            .any(|a| matches!(a, noraft::Action::SetElectionTimeout))
     );
     assert!(actions.iter().any(|a| matches!(
         a,
-        Action::SendMessage(
+        noraft::Action::SendMessage(
             destination,
-            Message::RequestVoteReply {
+            noraft::Message::RequestVoteReply {
                 term,
                 vote_granted: true,
                 ..
@@ -356,19 +366,19 @@ fn high_term_candidate_with_stale_log_is_rejected() {
     // Follower's log ends at (term=5, index=4): committed term-5 entries.
     // Candidate has a higher current term (7) but its last log is (term=3, index=100) —
     // longer by index but staler by term. Per Raft §5.4.1 the follower must reject.
-    let entries = LogEntries::from_iter(
-        LogPosition::ZERO,
+    let entries = noraft::LogEntries::from_iter(
+        noraft::LogPosition::ZERO,
         [
-            LogEntry::Term(t(1)),
-            LogEntry::Command,
-            LogEntry::Term(t(5)),
-            LogEntry::Command,
+            noraft::LogEntry::Term(t(1)),
+            noraft::LogEntry::Command,
+            noraft::LogEntry::Term(t(5)),
+            noraft::LogEntry::Command,
         ],
     );
     assert_eq!(entries.last_position(), log_pos(t(5), i(4)));
 
-    let log = Log::new(ClusterConfig::new(), entries);
-    let mut node = Node::restart(id(0), t(5), None, log);
+    let log = noraft::Log::new(noraft::ClusterConfig::new(), entries);
+    let mut node = noraft::Node::restart(id(0), t(5), None, log);
     assert_action!(node, set_election_timeout());
     assert_no_action!(node);
 
@@ -378,17 +388,17 @@ fn high_term_candidate_with_stale_log_is_rejected() {
     node.handle_message(&msg)
         .expect("message handling should succeed");
 
-    // Term must still bump (high term always wins that race), but the candidate
+    // noraft::Term must still bump (high term always wins that race), but the candidate
     // must NOT receive a vote because its log is staler by term.
     assert_eq!(node.current_term(), t(7));
-    assert_eq!(node.role(), Role::Follower);
+    assert_eq!(node.role(), noraft::Role::Follower);
     assert_eq!(node.voted_for(), None);
     let sent_vote = node.actions_mut().any(|a| {
         matches!(
             a,
-            Action::SendMessage(
+            noraft::Action::SendMessage(
                 _,
-                Message::RequestVoteReply {
+                noraft::Message::RequestVoteReply {
                     vote_granted: true,
                     ..
                 }
@@ -447,7 +457,7 @@ fn election() {
     cluster.node1.handle_election_timeout();
     let call = append_entries_call(
         &cluster.node1,
-        LogEntries::new(cluster.node1.log().entries().last_position()),
+        noraft::LogEntries::new(cluster.node1.log().entries().last_position()),
     );
     assert_action!(cluster.node1, set_election_timeout());
     assert_action!(cluster.node1, broadcast_message(&call));
@@ -466,23 +476,23 @@ fn election() {
 fn candidate_accepts_same_term_append_entries_from_leader() {
     let voters = [id(0), id(1), id(2)];
     let config = joint(&voters, &[]);
-    let prefix = LogEntries::from_iter(
-        LogPosition::ZERO,
+    let prefix = noraft::LogEntries::from_iter(
+        noraft::LogPosition::ZERO,
         [
             cluster_config_entry(config),
             term_entry(t(2)),
-            LogEntry::Command,
+            noraft::LogEntry::Command,
         ],
     );
 
     let mut leader = TestNode {
-        inner: Node::restart(
+        inner: noraft::Node::restart(
             id(0),
             t(3),
             None,
-            Log::new(ClusterConfig::new(), prefix.clone()),
+            noraft::Log::new(noraft::ClusterConfig::new(), prefix.clone()),
         ),
-        actions: Actions::default(),
+        actions: noraft::Actions::default(),
     };
     assert_action!(leader, set_election_timeout());
     assert_no_action!(leader);
@@ -491,22 +501,27 @@ fn candidate_accepts_same_term_append_entries_from_leader() {
     let vote_reply = request_vote_reply(leader.current_term(), id(2), true);
     let append_entries =
         leader.asserted_handle_request_vote_reply_majority_vote_granted(&vote_reply);
-    assert_eq!(leader.role(), Role::Leader);
+    assert_eq!(leader.role(), noraft::Role::Leader);
 
     let mut candidate = TestNode {
-        inner: Node::restart(id(1), t(3), None, Log::new(ClusterConfig::new(), prefix)),
-        actions: Actions::default(),
+        inner: noraft::Node::restart(
+            id(1),
+            t(3),
+            None,
+            noraft::Log::new(noraft::ClusterConfig::new(), prefix),
+        ),
+        actions: noraft::Actions::default(),
     };
     assert_action!(candidate, set_election_timeout());
     assert_no_action!(candidate);
 
     let _call = candidate.asserted_follower_election_timeout();
-    assert_eq!(candidate.role(), Role::Candidate);
+    assert_eq!(candidate.role(), noraft::Role::Candidate);
     assert_eq!(candidate.current_term(), leader.current_term());
 
     let _reply = candidate.asserted_handle_append_entries_call_success(&append_entries);
 
-    assert_eq!(candidate.role(), Role::Follower);
+    assert_eq!(candidate.role(), noraft::Role::Follower);
     assert_eq!(candidate.voted_for(), Some(leader.id()));
     assert_eq!(
         candidate.log().last_position(),
@@ -518,23 +533,23 @@ fn candidate_accepts_same_term_append_entries_from_leader() {
 fn follower_accepts_same_term_append_entries_after_voting_for_another_candidate() {
     let voters = [id(0), id(1), id(2), id(3), id(4)];
     let config = joint(&voters, &[]);
-    let prefix = LogEntries::from_iter(
-        LogPosition::ZERO,
+    let prefix = noraft::LogEntries::from_iter(
+        noraft::LogPosition::ZERO,
         [
             cluster_config_entry(config),
             term_entry(t(2)),
-            LogEntry::Command,
+            noraft::LogEntry::Command,
         ],
     );
 
     let mut leader = TestNode {
-        inner: Node::restart(
+        inner: noraft::Node::restart(
             id(0),
             t(3),
             None,
-            Log::new(ClusterConfig::new(), prefix.clone()),
+            noraft::Log::new(noraft::ClusterConfig::new(), prefix.clone()),
         ),
-        actions: Actions::default(),
+        actions: noraft::Actions::default(),
     };
     assert_action!(leader, set_election_timeout());
     assert_no_action!(leader);
@@ -544,31 +559,31 @@ fn follower_accepts_same_term_append_entries_after_voting_for_another_candidate(
     leader
         .handle_message(&first_vote_reply)
         .expect("message handling should succeed");
-    assert_eq!(leader.role(), Role::Candidate);
+    assert_eq!(leader.role(), noraft::Role::Candidate);
     assert_no_action!(leader);
 
     let vote_reply = request_vote_reply(leader.current_term(), id(2), true);
     let append_entries =
         leader.asserted_handle_request_vote_reply_majority_vote_granted(&vote_reply);
-    assert_eq!(leader.role(), Role::Leader);
+    assert_eq!(leader.role(), noraft::Role::Leader);
 
     let mut follower = TestNode {
-        inner: Node::restart(
+        inner: noraft::Node::restart(
             id(3),
             leader.current_term(),
             Some(id(4)),
-            Log::new(ClusterConfig::new(), prefix),
+            noraft::Log::new(noraft::ClusterConfig::new(), prefix),
         ),
-        actions: Actions::default(),
+        actions: noraft::Actions::default(),
     };
     assert_action!(follower, set_election_timeout());
     assert_no_action!(follower);
-    assert_eq!(follower.role(), Role::Follower);
+    assert_eq!(follower.role(), noraft::Role::Follower);
     assert_ne!(follower.voted_for(), Some(leader.id()));
 
     let _reply = follower.asserted_handle_append_entries_call_success(&append_entries);
 
-    assert_eq!(follower.role(), Role::Follower);
+    assert_eq!(follower.role(), noraft::Role::Follower);
     assert_eq!(follower.voted_for(), Some(leader.id()));
     assert_eq!(follower.log().last_position(), leader.log().last_position());
 }
@@ -580,8 +595,8 @@ fn restart() {
     cluster.propose_command();
 
     // Restart node1.
-    assert_eq!(cluster.node1.role(), Role::Follower);
-    cluster.node1.inner = Node::restart(
+    assert_eq!(cluster.node1.role(), noraft::Role::Follower);
+    cluster.node1.inner = noraft::Node::restart(
         cluster.node1.id(),
         cluster.node1.current_term(),
         cluster.node1.voted_for(),
@@ -598,7 +613,7 @@ fn truncate_log() {
     cluster.propose_command();
 
     // Propose a command, but not broadcast the message.
-    assert_eq!(cluster.node0.role(), Role::Leader);
+    assert_eq!(cluster.node0.role(), noraft::Role::Leader);
     let commit_position = cluster.node0.propose_command();
     assert_eq!(commit_position, cluster.node0.log().last_position(),);
     while let Some(_) = cluster.node0.actions_mut().next() {}
@@ -616,7 +631,7 @@ fn truncate_log() {
             .handle_message(&call)
             .expect("message handling should succeed");
     }
-    assert_eq!(cluster.node0.role(), Role::Leader);
+    assert_eq!(cluster.node0.role(), noraft::Role::Leader);
     assert_no_action!(cluster.node0);
 
     // The log index of node1 is equal to node2 => granted.
@@ -627,7 +642,7 @@ fn truncate_log() {
     let call = cluster
         .node2
         .asserted_handle_request_vote_reply_majority_vote_granted(&reply);
-    assert_eq!(cluster.node2.role(), Role::Leader);
+    assert_eq!(cluster.node2.role(), noraft::Role::Leader);
 
     // The uncommitted log entries on node0 are truncated.
     let reply = cluster
@@ -665,18 +680,18 @@ fn same_index_different_term_tail_is_truncated_before_replication() {
     let voters = [id(0), id(1), id(2)];
     let config = joint(&voters, &[]);
 
-    let leader_prefix = LogEntries::from_iter(
-        LogPosition::ZERO,
+    let leader_prefix = noraft::LogEntries::from_iter(
+        noraft::LogPosition::ZERO,
         [
             cluster_config_entry(config.clone()),
             term_entry(t(2)),
-            LogEntry::Command,
+            noraft::LogEntry::Command,
         ],
     );
-    let leader_log = Log::new(ClusterConfig::new(), leader_prefix);
+    let leader_log = noraft::Log::new(noraft::ClusterConfig::new(), leader_prefix);
     let mut leader = TestNode {
-        inner: Node::restart(id(0), t(3), None, leader_log),
-        actions: Actions::default(),
+        inner: noraft::Node::restart(id(0), t(3), None, leader_log),
+        actions: noraft::Actions::default(),
     };
     assert_action!(leader, set_election_timeout());
     assert_no_action!(leader);
@@ -686,36 +701,36 @@ fn same_index_different_term_tail_is_truncated_before_replication() {
     let vote_reply = request_vote_reply(leader.current_term(), id(2), true);
     let _initial_append =
         leader.asserted_handle_request_vote_reply_majority_vote_granted(&vote_reply);
-    assert_eq!(leader.role(), Role::Leader);
+    assert_eq!(leader.role(), noraft::Role::Leader);
     assert_eq!(leader.log().last_position(), log_pos(t(4), i(4)));
 
-    let divergent_log = Log::new(
-        ClusterConfig::new(),
-        LogEntries::from_iter(
-            LogPosition::ZERO,
+    let divergent_log = noraft::Log::new(
+        noraft::ClusterConfig::new(),
+        noraft::LogEntries::from_iter(
+            noraft::LogPosition::ZERO,
             [
                 cluster_config_entry(config),
                 term_entry(t(2)),
-                LogEntry::Command,
+                noraft::LogEntry::Command,
                 term_entry(t(3)),
             ],
         ),
     );
     let mut follower = TestNode {
-        inner: Node::restart(id(1), t(3), None, divergent_log),
-        actions: Actions::default(),
+        inner: noraft::Node::restart(id(1), t(3), None, divergent_log),
+        actions: noraft::Actions::default(),
     };
     assert_action!(follower, set_election_timeout());
     assert_no_action!(follower);
     assert_eq!(follower.log().last_position(), log_pos(t(3), i(4)));
 
-    let divergent_reply = Message::AppendEntriesReply {
+    let divergent_reply = noraft::Message::AppendEntriesReply {
         from: follower.id(),
         term: leader.current_term(),
         last_position: follower.log().last_position(),
     };
     let truncate_call = leader.asserted_handle_append_entries_reply_failure(&divergent_reply);
-    let Message::AppendEntriesCall { entries, .. } = &truncate_call else {
+    let noraft::Message::AppendEntriesCall { entries, .. } = &truncate_call else {
         panic!("Expected AppendEntriesCall");
     };
     assert!(entries.is_empty());
@@ -732,7 +747,7 @@ fn same_index_different_term_tail_is_truncated_before_replication() {
         panic!("Expected repair AppendEntriesCall");
     };
     assert_no_action!(leader);
-    let Message::AppendEntriesCall { entries, .. } = &repair_call else {
+    let noraft::Message::AppendEntriesCall { entries, .. } = &repair_call else {
         panic!("Expected AppendEntriesCall");
     };
     assert_eq!(entries.prev_position(), log_pos(t(2), i(3)));
@@ -749,30 +764,34 @@ fn same_index_different_term_tail_is_truncated_before_replication() {
 #[test]
 fn follower_rewrites_from_common_prefix_when_repair_term_is_outside_local_log() {
     let leader_term = t(4);
-    let follower_log = Log::new(
-        ClusterConfig::new(),
-        LogEntries::from_iter(
-            LogPosition::ZERO,
+    let follower_log = noraft::Log::new(
+        noraft::ClusterConfig::new(),
+        noraft::LogEntries::from_iter(
+            noraft::LogPosition::ZERO,
             [
                 term_entry(t(1)),
-                LogEntry::Command,
-                LogEntry::Command,
+                noraft::LogEntry::Command,
+                noraft::LogEntry::Command,
                 term_entry(t(3)),
             ],
         ),
     );
     let mut follower = TestNode {
-        inner: Node::restart(id(1), leader_term, Some(id(0)), follower_log),
-        actions: Actions::default(),
+        inner: noraft::Node::restart(id(1), leader_term, Some(id(0)), follower_log),
+        actions: noraft::Actions::default(),
     };
     assert_action!(follower, set_election_timeout());
     assert_no_action!(follower);
 
-    let repair_entries = LogEntries::from_iter(
+    let repair_entries = noraft::LogEntries::from_iter(
         log_pos(t(1), i(3)),
-        [LogEntry::Command, LogEntry::Command, term_entry(t(2))],
+        [
+            noraft::LogEntry::Command,
+            noraft::LogEntry::Command,
+            term_entry(t(2)),
+        ],
     );
-    let repair_call = Message::AppendEntriesCall {
+    let repair_call = noraft::Message::AppendEntriesCall {
         from: id(0),
         term: leader_term,
         commit_index: i(6),
@@ -793,10 +812,10 @@ fn follower_rewrites_from_common_prefix_when_repair_term_is_outside_local_log() 
             .collect::<Vec<_>>(),
         vec![
             (log_pos(t(1), i(1)), term_entry(t(1))),
-            (log_pos(t(1), i(2)), LogEntry::Command),
-            (log_pos(t(1), i(3)), LogEntry::Command),
-            (log_pos(t(1), i(4)), LogEntry::Command),
-            (log_pos(t(1), i(5)), LogEntry::Command),
+            (log_pos(t(1), i(2)), noraft::LogEntry::Command),
+            (log_pos(t(1), i(3)), noraft::LogEntry::Command),
+            (log_pos(t(1), i(4)), noraft::LogEntry::Command),
+            (log_pos(t(1), i(5)), noraft::LogEntry::Command),
             (log_pos(t(2), i(6)), term_entry(t(2))),
         ]
     );
@@ -811,15 +830,21 @@ fn snapshot() {
     let mut cluster = ThreeNodeCluster::new();
     cluster.init_cluster();
     cluster.propose_command();
-    assert_eq!(cluster.node0.role(), Role::Leader);
+    assert_eq!(cluster.node0.role(), noraft::Role::Leader);
 
     // Take a snapshot.
     for node in &mut [&mut cluster.node0, &mut cluster.node1, &mut cluster.node2] {
-        assert_eq!(node.log().entries().prev_position().index, LogIndex::new(0));
+        assert_eq!(
+            node.log().entries().prev_position().index,
+            noraft::LogIndex::new(0)
+        );
         let snapshot_config = node.log().latest_config().clone();
         let snapshot_position = node.log().entries().last_position();
         assert!(node.handle_snapshot_installed(snapshot_position, snapshot_config));
-        assert_ne!(node.log().entries().prev_position().index, LogIndex::new(0));
+        assert_ne!(
+            node.log().entries().prev_position().index,
+            noraft::LogIndex::new(0)
+        );
         // Every node had already committed the last position, so the
         // install keeps `commit_index` at the snapshot boundary.
         assert_eq!(node.commit_index(), snapshot_position.index);
@@ -882,7 +907,7 @@ impl ThreeNodeCluster {
     fn init_cluster(&mut self) {
         // Setup  cluster.
         self.node0.handle_election_timeout();
-        assert_eq!(self.node0.role(), Role::Candidate);
+        assert_eq!(self.node0.role(), noraft::Role::Candidate);
         assert_action!(self.node0, set_election_timeout());
         assert_action!(self.node0, save_current_term());
         assert_action!(self.node0, save_voted_for());
@@ -901,7 +926,7 @@ impl ThreeNodeCluster {
                     .asserted_handle_request_vote_reply_majority_vote_granted(&reply);
             }
         }
-        assert_eq!(self.node0.role(), Role::Leader);
+        assert_eq!(self.node0.role(), noraft::Role::Leader);
 
         let call = self.node0.take_broadcast_message();
         for node in &mut [&mut self.node1, &mut self.node2] {
@@ -923,7 +948,7 @@ impl ThreeNodeCluster {
         let mut commit_position = None;
         let mut call = None;
         for node in &mut [&mut self.node0, &mut self.node1, &mut self.node2] {
-            if node.role() != Role::Leader {
+            if node.role() != noraft::Role::Leader {
                 continue;
             }
             commit_position = Some(node.propose_command());
@@ -931,14 +956,14 @@ impl ThreeNodeCluster {
                 node.inner,
                 append_log_entry(
                     log_prev(node.log().entries().last_position()),
-                    LogEntry::Command
+                    noraft::LogEntry::Command
                 )
             );
             let msg = append_entries_call(
                 &node.inner,
-                LogEntries::from_iter(
+                noraft::LogEntries::from_iter(
                     log_prev(node.log().entries().last_position()),
-                    std::iter::once(LogEntry::Command),
+                    std::iter::once(noraft::LogEntry::Command),
                 ),
             );
             assert_action!(node, broadcast_message(&msg));
@@ -954,7 +979,7 @@ impl ThreeNodeCluster {
 
         let mut replies = Vec::new();
         for node in &mut [&mut self.node0, &mut self.node1, &mut self.node2] {
-            if node.role() == Role::Leader {
+            if node.role() == noraft::Role::Leader {
                 continue;
             }
 
@@ -963,7 +988,7 @@ impl ThreeNodeCluster {
 
         let mut first = true;
         for node in &mut [&mut self.node0, &mut self.node1, &mut self.node2] {
-            if node.role() != Role::Leader {
+            if node.role() != noraft::Role::Leader {
                 continue;
             }
 
@@ -979,37 +1004,40 @@ impl ThreeNodeCluster {
 
 #[derive(Debug)]
 struct TestNode {
-    inner: Node,
-    actions: Actions,
+    inner: noraft::Node,
+    actions: noraft::Actions,
 }
 
 impl TestNode {
-    fn take_broadcast_message(&mut self) -> Message {
+    fn take_broadcast_message(&mut self) -> noraft::Message {
         self.actions
             .broadcast_message
             .take()
             .expect("No broadcast message.")
     }
 
-    fn asserted_start(id: NodeId, initial_voters: &[NodeId]) -> Self {
-        let mut node = Node::start(id);
-        assert_eq!(node.role(), Role::Follower);
+    fn asserted_start(id: noraft::NodeId, initial_voters: &[noraft::NodeId]) -> Self {
+        let mut node = noraft::Node::start(id);
+        assert_eq!(node.role(), noraft::Role::Follower);
         assert_eq!(node.current_term(), t(0));
         assert_eq!(node.voted_for(), None);
         assert_no_action!(node);
 
         if !initial_voters.is_empty() {
-            assert_ne!(node.create_cluster(initial_voters), LogPosition::INVALID);
+            assert_ne!(
+                node.create_cluster(initial_voters),
+                noraft::LogPosition::INVALID
+            );
 
             assert_action!(node, set_election_timeout());
             assert_action!(node, save_current_term());
             assert_action!(node, save_voted_for());
 
             if initial_voters == [id] {
-                assert_eq!(node.role(), Role::Leader);
+                assert_eq!(node.role(), noraft::Role::Leader);
                 assert_action!(
                     node,
-                    append_log_entries(&LogEntries::from_iter(
+                    append_log_entries(&noraft::LogEntries::from_iter(
                         prev(t(0), i(0)),
                         [
                             cluster_config_entry(joint(initial_voters, &[])),
@@ -1018,35 +1046,40 @@ impl TestNode {
                     ))
                 );
             } else {
-                assert_eq!(node.role(), Role::Candidate);
+                assert_eq!(node.role(), noraft::Role::Candidate);
                 assert_action!(
                     node,
-                    append_log_entries(&LogEntries::from_iter(
+                    append_log_entries(&noraft::LogEntries::from_iter(
                         prev(t(0), i(0)),
                         [cluster_config_entry(joint(initial_voters, &[]))]
                     ))
                 );
                 assert!(matches!(
                     node.actions_mut().next(),
-                    Some(Action::BroadcastMessage(Message::RequestVoteCall { .. }))
+                    Some(noraft::Action::BroadcastMessage(
+                        noraft::Message::RequestVoteCall { .. }
+                    ))
                 ));
             }
             assert_no_action!(node);
         }
         Self {
             inner: node,
-            actions: Actions::default(),
+            actions: noraft::Actions::default(),
         }
     }
 
-    fn asserted_change_cluster_config(&mut self, new_config: ClusterConfig) -> Message {
+    fn asserted_change_cluster_config(
+        &mut self,
+        new_config: noraft::ClusterConfig,
+    ) -> noraft::Message {
         let prev_entry = self.log().entries().last_position();
         let next_index = next_index(self.log().entries().last_position().index);
         let next_position = log_pos(self.current_term(), next_index);
         assert_eq!(next_position, self.propose_config(new_config.clone()));
         let msg = append_entries_call(
             self,
-            LogEntries::from_iter(
+            noraft::LogEntries::from_iter(
                 prev_entry,
                 std::iter::once(cluster_config_entry(new_config.clone())),
             ),
@@ -1063,11 +1096,14 @@ impl TestNode {
         msg
     }
 
-    fn asserted_handle_append_entries_call_success(&mut self, msg: &Message) -> Message {
-        assert!(matches!(msg, Message::AppendEntriesCall { .. }));
+    fn asserted_handle_append_entries_call_success(
+        &mut self,
+        msg: &noraft::Message,
+    ) -> noraft::Message {
+        assert!(matches!(msg, noraft::Message::AppendEntriesCall { .. }));
         let old_role = self.role();
 
-        let Message::AppendEntriesCall {
+        let noraft::Message::AppendEntriesCall {
             entries,
             commit_index: leader_commit,
             ..
@@ -1116,10 +1152,13 @@ impl TestNode {
         reply
     }
 
-    fn asserted_handle_append_entries_call_failure(&mut self, msg: &Message) -> Message {
-        assert!(matches!(msg, Message::AppendEntriesCall { .. }));
+    fn asserted_handle_append_entries_call_failure(
+        &mut self,
+        msg: &noraft::Message,
+    ) -> noraft::Message {
+        assert!(matches!(msg, noraft::Message::AppendEntriesCall { .. }));
 
-        let Message::AppendEntriesCall { entries, .. } = msg else {
+        let noraft::Message::AppendEntriesCall { entries, .. } = msg else {
             unreachable!();
         };
 
@@ -1151,11 +1190,11 @@ impl TestNode {
 
     fn asserted_handle_append_entries_reply_failure_need_snapshot(
         &mut self,
-        msg: &Message,
-    ) -> (ClusterConfig, LogPosition) {
-        assert!(matches!(msg, Message::AppendEntriesReply { .. }));
+        msg: &noraft::Message,
+    ) -> (noraft::ClusterConfig, noraft::LogPosition) {
+        assert!(matches!(msg, noraft::Message::AppendEntriesReply { .. }));
 
-        let Message::AppendEntriesReply {
+        let noraft::Message::AppendEntriesReply {
             from,
             last_position,
             ..
@@ -1167,7 +1206,7 @@ impl TestNode {
 
         self.handle_message(msg)
             .expect("message handling should succeed");
-        assert_action!(self, Action::InstallSnapshot(*from));
+        assert_action!(self, noraft::Action::InstallSnapshot(*from));
         assert_no_action!(self);
 
         (
@@ -1178,16 +1217,16 @@ impl TestNode {
 
     fn asserted_handle_append_entries_reply_success_with_joint_config_committed(
         &mut self,
-        msg: &Message,
-    ) -> Message {
-        assert!(matches!(msg, Message::AppendEntriesReply { .. }));
+        msg: &noraft::Message,
+    ) -> noraft::Message {
+        assert!(matches!(msg, noraft::Message::AppendEntriesReply { .. }));
         assert!(self.config().is_joint_consensus());
 
         let prev_entry = self.log().entries().last_position();
         let mut new_config = self.config().clone();
         new_config.voters = std::mem::take(&mut new_config.new_voters);
 
-        let Message::AppendEntriesReply { last_position, .. } = msg else {
+        let noraft::Message::AppendEntriesReply { last_position, .. } = msg else {
             unreachable!();
         };
 
@@ -1195,7 +1234,7 @@ impl TestNode {
             .expect("message handling should succeed");
         let call = append_entries_call(
             self,
-            LogEntries::from_iter(
+            noraft::LogEntries::from_iter(
                 prev_entry,
                 std::iter::once(cluster_config_entry(new_config.clone())),
             ),
@@ -1214,18 +1253,18 @@ impl TestNode {
 
     fn asserted_handle_append_entries_reply_success(
         &mut self,
-        reply: &Message,
+        reply: &noraft::Message,
         commit_index_will_be_updated: bool,
         joint_consensus_will_be_finalized: bool,
     ) {
-        assert!(matches!(reply, Message::AppendEntriesReply { .. }));
+        assert!(matches!(reply, noraft::Message::AppendEntriesReply { .. }));
 
         let old_last_position = self.log().entries().last_position();
         self.handle_message(reply)
             .expect("message handling should succeed");
         self.actions = self.inner.actions().clone();
 
-        let Message::AppendEntriesReply { last_position, .. } = reply else {
+        let noraft::Message::AppendEntriesReply { last_position, .. } = reply else {
             unreachable!();
         };
         if commit_index_will_be_updated {
@@ -1243,7 +1282,7 @@ impl TestNode {
                 self,
                 broadcast_message(&append_entries_call(
                     self,
-                    LogEntries::from_iter(
+                    noraft::LogEntries::from_iter(
                         old_last_position,
                         std::iter::once(cluster_config_entry(config.clone()))
                     )
@@ -1253,8 +1292,11 @@ impl TestNode {
         assert_no_action!(self);
     }
 
-    fn asserted_handle_append_entries_reply_failure(&mut self, reply: &Message) -> Message {
-        assert!(matches!(reply, Message::AppendEntriesReply { .. }));
+    fn asserted_handle_append_entries_reply_failure(
+        &mut self,
+        reply: &noraft::Message,
+    ) -> noraft::Message {
+        assert!(matches!(reply, noraft::Message::AppendEntriesReply { .. }));
 
         self.handle_message(reply)
             .expect("message handling should succeed");
@@ -1266,12 +1308,12 @@ impl TestNode {
         call
     }
 
-    fn asserted_follower_election_timeout(&mut self) -> Message {
-        assert_eq!(self.role(), Role::Follower);
+    fn asserted_follower_election_timeout(&mut self) -> noraft::Message {
+        assert_eq!(self.role(), noraft::Role::Follower);
 
         let prev_term = self.current_term();
         self.handle_election_timeout();
-        assert_eq!(self.role(), Role::Candidate);
+        assert_eq!(self.role(), noraft::Role::Candidate);
         assert_eq!(self.current_term(), next_term(prev_term));
 
         let call = request_vote_call(
@@ -1290,12 +1332,12 @@ impl TestNode {
         call
     }
 
-    fn asserted_candidate_election_timeout(&mut self) -> Message {
-        assert_eq!(self.role(), Role::Candidate);
+    fn asserted_candidate_election_timeout(&mut self) -> noraft::Message {
+        assert_eq!(self.role(), noraft::Role::Candidate);
 
         let prev_term = self.current_term();
         self.handle_election_timeout();
-        assert_eq!(self.role(), Role::Candidate);
+        assert_eq!(self.role(), noraft::Role::Candidate);
         assert_eq!(self.current_term(), next_term(prev_term));
 
         let call = request_vote_call(
@@ -1314,8 +1356,11 @@ impl TestNode {
         call
     }
 
-    fn asserted_handle_request_vote_call_success(&mut self, msg: &Message) -> Message {
-        assert!(matches!(msg, Message::RequestVoteCall { .. }));
+    fn asserted_handle_request_vote_call_success(
+        &mut self,
+        msg: &noraft::Message,
+    ) -> noraft::Message {
+        assert!(matches!(msg, noraft::Message::RequestVoteCall { .. }));
 
         self.handle_message(msg)
             .expect("message handling should succeed");
@@ -1334,9 +1379,9 @@ impl TestNode {
 
     fn asserted_handle_request_vote_reply_majority_vote_granted(
         &mut self,
-        msg: &Message,
-    ) -> Message {
-        assert!(matches!(msg, Message::RequestVoteReply { .. }));
+        msg: &noraft::Message,
+    ) -> noraft::Message {
+        assert!(matches!(msg, noraft::Message::RequestVoteReply { .. }));
 
         let tail = self.log().entries().last_position();
         self.handle_message(msg)
@@ -1344,7 +1389,7 @@ impl TestNode {
         self.actions = self.inner.actions().clone();
         let call = append_entries_call(
             self,
-            LogEntries::from_iter(tail, std::iter::once(term_entry(self.current_term()))),
+            noraft::LogEntries::from_iter(tail, std::iter::once(term_entry(self.current_term()))),
         );
         assert_action!(
             self,
@@ -1357,8 +1402,11 @@ impl TestNode {
         call
     }
 
-    fn asserted_handle_append_entries_call_success_new_leader(&mut self, msg: &Message) -> Message {
-        assert!(matches!(msg, Message::AppendEntriesCall { .. }));
+    fn asserted_handle_append_entries_call_success_new_leader(
+        &mut self,
+        msg: &noraft::Message,
+    ) -> noraft::Message {
+        assert!(matches!(msg, noraft::Message::AppendEntriesCall { .. }));
 
         let tail = self.log().entries().last_position();
         self.handle_message(msg)
@@ -1376,9 +1424,12 @@ impl TestNode {
         reply
     }
 
-    fn asserted_heartbeat(&mut self) -> Message {
+    fn asserted_heartbeat(&mut self) -> noraft::Message {
         assert!(self.heartbeat());
-        let call = append_entries_call(self, LogEntries::new(self.log().entries().last_position()));
+        let call = append_entries_call(
+            self,
+            noraft::LogEntries::new(self.log().entries().last_position()),
+        );
         assert_action!(self, set_election_timeout());
         assert_action!(self, broadcast_message(&call));
         assert_no_action!(self);
@@ -1387,7 +1438,7 @@ impl TestNode {
 }
 
 impl Deref for TestNode {
-    type Target = Node;
+    type Target = noraft::Node;
 
     fn deref(&self) -> &Self::Target {
         &self.inner
@@ -1400,58 +1451,66 @@ impl DerefMut for TestNode {
     }
 }
 
-fn id(id: u64) -> NodeId {
-    NodeId::new(id)
+fn id(id: u64) -> noraft::NodeId {
+    noraft::NodeId::new(id)
 }
 
-fn t(term: u64) -> Term {
-    Term::new(term)
+fn t(term: u64) -> noraft::Term {
+    noraft::Term::new(term)
 }
 
-fn i(index: u64) -> LogIndex {
-    LogIndex::new(index)
+fn i(index: u64) -> noraft::LogIndex {
+    noraft::LogIndex::new(index)
 }
 
-fn prev(term: Term, index: LogIndex) -> LogPosition {
+fn prev(term: noraft::Term, index: noraft::LogIndex) -> noraft::LogPosition {
     log_pos(term, index)
 }
 
-fn joint(old: &[NodeId], new: &[NodeId]) -> ClusterConfig {
-    let mut config = ClusterConfig::new();
+fn joint(old: &[noraft::NodeId], new: &[noraft::NodeId]) -> noraft::ClusterConfig {
+    let mut config = noraft::ClusterConfig::new();
     config.voters.extend(old.iter().copied());
     config.new_voters.extend(new.iter().copied());
     config
 }
 
-fn term_entry(term: Term) -> LogEntry {
-    LogEntry::Term(term)
+fn term_entry(term: noraft::Term) -> noraft::LogEntry {
+    noraft::LogEntry::Term(term)
 }
 
-fn cluster_config_entry(config: ClusterConfig) -> LogEntry {
-    LogEntry::ClusterConfig(config)
+fn cluster_config_entry(config: noraft::ClusterConfig) -> noraft::LogEntry {
+    noraft::LogEntry::ClusterConfig(config)
 }
 
-fn request_vote_call(term: Term, from: NodeId, last_position: LogPosition) -> Message {
-    Message::RequestVoteCall {
+fn request_vote_call(
+    term: noraft::Term,
+    from: noraft::NodeId,
+    last_position: noraft::LogPosition,
+) -> noraft::Message {
+    noraft::Message::RequestVoteCall {
         from,
         term,
         last_position,
     }
 }
 
-fn request_vote_reply(term: Term, from: NodeId, vote_granted: bool) -> Message {
-    Message::RequestVoteReply {
+fn request_vote_reply(
+    term: noraft::Term,
+    from: noraft::NodeId,
+    vote_granted: bool,
+) -> noraft::Message {
+    noraft::Message::RequestVoteReply {
         from,
         term,
         vote_granted,
     }
 }
 
-fn append_entries_call(leader: &Node, entries: LogEntries) -> Message {
+fn append_entries_call(leader: &noraft::Node, entries: noraft::LogEntries) -> noraft::Message {
     let term = leader.current_term();
     let from = leader.id();
     let commit_index = leader.commit_index();
-    Message::AppendEntriesCall {
+    noraft::Message::AppendEntriesCall {
         from,
         term,
         commit_index,
@@ -1459,70 +1518,73 @@ fn append_entries_call(leader: &Node, entries: LogEntries) -> Message {
     }
 }
 
-fn append_entries_reply(call: &Message, node: &Node) -> Message {
-    let Message::AppendEntriesCall { .. } = call else {
+fn append_entries_reply(call: &noraft::Message, node: &noraft::Node) -> noraft::Message {
+    let noraft::Message::AppendEntriesCall { .. } = call else {
         panic!();
     };
 
     let term = node.current_term();
     let from = node.id();
     let last_position = node.log().entries().last_position();
-    Message::AppendEntriesReply {
+    noraft::Message::AppendEntriesReply {
         from,
         term,
         last_position,
     }
 }
 
-fn send_message(destination: NodeId, message: &Message) -> Action {
-    Action::SendMessage(destination, message.clone())
+fn send_message(destination: noraft::NodeId, message: &noraft::Message) -> noraft::Action {
+    noraft::Action::SendMessage(destination, message.clone())
 }
 
-fn broadcast_message(message: &Message) -> Action {
-    Action::BroadcastMessage(message.clone())
+fn broadcast_message(message: &noraft::Message) -> noraft::Action {
+    noraft::Action::BroadcastMessage(message.clone())
 }
 
-fn set_election_timeout() -> Action {
-    Action::SetElectionTimeout
+fn set_election_timeout() -> noraft::Action {
+    noraft::Action::SetElectionTimeout
 }
 
-fn append_log_entry(prev: LogPosition, entry: LogEntry) -> Action {
-    Action::AppendLogEntries(LogEntries::from_iter(prev, std::iter::once(entry)))
+fn append_log_entry(prev: noraft::LogPosition, entry: noraft::LogEntry) -> noraft::Action {
+    noraft::Action::AppendLogEntries(noraft::LogEntries::from_iter(prev, std::iter::once(entry)))
 }
 
-fn append_log_entries(entries: &LogEntries) -> Action {
-    Action::AppendLogEntries(entries.clone())
+fn append_log_entries(entries: &noraft::LogEntries) -> noraft::Action {
+    noraft::Action::AppendLogEntries(entries.clone())
 }
 
-fn save_current_term() -> Action {
-    Action::SaveCurrentTerm
+fn save_current_term() -> noraft::Action {
+    noraft::Action::SaveCurrentTerm
 }
 
-fn save_voted_for() -> Action {
-    Action::SaveVotedFor
+fn save_voted_for() -> noraft::Action {
+    noraft::Action::SaveVotedFor
 }
 
-fn next_term(term: Term) -> Term {
-    Term::new(term.get() + 1)
+fn next_term(term: noraft::Term) -> noraft::Term {
+    noraft::Term::new(term.get() + 1)
 }
 
-fn next_index(index: LogIndex) -> LogIndex {
-    LogIndex::new(index.get() + 1)
+fn next_index(index: noraft::LogIndex) -> noraft::LogIndex {
+    noraft::LogIndex::new(index.get() + 1)
 }
 
-fn log_pos(term: Term, index: LogIndex) -> LogPosition {
-    LogPosition { term, index }
+fn log_pos(term: noraft::Term, index: noraft::LogIndex) -> noraft::LogPosition {
+    noraft::LogPosition { term, index }
 }
 
-fn log_prev(entry: LogPosition) -> LogPosition {
-    log_pos(entry.term, LogIndex::new(entry.index.get() - 1))
+fn log_prev(entry: noraft::LogPosition) -> noraft::LogPosition {
+    log_pos(entry.term, noraft::LogIndex::new(entry.index.get() - 1))
 }
 
-fn since(entries: &LogEntries, position: LogPosition) -> Option<LogEntries> {
+fn since(
+    entries: &noraft::LogEntries,
+    position: noraft::LogPosition,
+) -> Option<noraft::LogEntries> {
     if !entries.contains(position) {
         return None;
     }
-    Some(LogEntries::from_iter(
+    Some(noraft::LogEntries::from_iter(
         position,
         entries
             .iter()
@@ -1530,36 +1592,39 @@ fn since(entries: &LogEntries, position: LogPosition) -> Option<LogEntries> {
     ))
 }
 
-fn next_same_kind_action(actions: &mut Actions, expected: &Action) -> Option<Action> {
+fn next_same_kind_action(
+    actions: &mut noraft::Actions,
+    expected: &noraft::Action,
+) -> Option<noraft::Action> {
     match expected {
-        Action::SetElectionTimeout if actions.set_election_timeout => {
+        noraft::Action::SetElectionTimeout if actions.set_election_timeout => {
             actions.set_election_timeout = false;
-            Some(Action::SetElectionTimeout)
+            Some(noraft::Action::SetElectionTimeout)
         }
-        Action::SaveCurrentTerm if actions.save_current_term => {
+        noraft::Action::SaveCurrentTerm if actions.save_current_term => {
             actions.save_current_term = false;
-            Some(Action::SaveCurrentTerm)
+            Some(noraft::Action::SaveCurrentTerm)
         }
-        Action::SaveVotedFor if actions.save_voted_for => {
+        noraft::Action::SaveVotedFor if actions.save_voted_for => {
             actions.save_voted_for = false;
-            Some(Action::SaveVotedFor)
+            Some(noraft::Action::SaveVotedFor)
         }
-        Action::AppendLogEntries(_) => actions
+        noraft::Action::AppendLogEntries(_) => actions
             .append_log_entries
             .take()
-            .map(Action::AppendLogEntries),
-        Action::BroadcastMessage(_) => actions
+            .map(noraft::Action::AppendLogEntries),
+        noraft::Action::BroadcastMessage(_) => actions
             .broadcast_message
             .take()
-            .map(Action::BroadcastMessage),
-        Action::SendMessage(node_id, _) => actions
+            .map(noraft::Action::BroadcastMessage),
+        noraft::Action::SendMessage(node_id, _) => actions
             .send_messages
             .remove(node_id)
-            .map(|msg| Action::SendMessage(*node_id, msg)),
-        Action::InstallSnapshot(node_id) => actions
+            .map(|msg| noraft::Action::SendMessage(*node_id, msg)),
+        noraft::Action::InstallSnapshot(node_id) => actions
             .install_snapshots
             .remove(node_id)
-            .then_some(Action::InstallSnapshot(*node_id)),
+            .then_some(noraft::Action::InstallSnapshot(*node_id)),
         _ => None,
     }
 }
